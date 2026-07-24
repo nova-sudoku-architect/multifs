@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
+    extract::Request as AxumRequest,
     body::Body,
     extract::{Path, State},
     http::{Method, StatusCode},
@@ -61,6 +62,7 @@ async fn webdav_handler(
     State(state): State<WebDAVState>,
     method: Method,
     Path(path): Path<String>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
     tracing::debug!("WebDAV {} /{}", method, path);
@@ -81,7 +83,7 @@ async fn webdav_handler(
         }
         "PROPFIND" => handle_propfind(&state, &path).await,
         "MKCOL" => handle_mkcol(&state, &path).await,
-        "GET" | "HEAD" => handle_get(&state, &path, method).await,
+        "GET" | "HEAD" => handle_get(&state, &path, method, Some(&headers)).await,
         "PUT" => handle_put(&state, &path, body).await,
         "DELETE" => handle_delete(&state, &path).await,
         "COPY" => handle_copy(&state, &path, "").await,
@@ -228,32 +230,80 @@ async fn handle_mkcol(state: &WebDAVState, path: &str) -> Response {
     }
 }
 
-/// WebDAV GET — download object
-async fn handle_get(state: &WebDAVState, path: &str, method: Method) -> Response {
+/// WebDAV GET — download object with Range support
+async fn handle_get(state: &WebDAVState, path: &str, method: Method, headers: Option<&axum::http::HeaderMap>) -> Response {
     let parts: Vec<&str> = path.splitn(2, '/').collect();
     if parts.len() < 2 || parts[1].is_empty() {
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    match state.engine.get_object(parts[0], parts[1]).await {
-        Ok(data) => {
-            let content_type =
-                mime_guess::from_path(parts[1]).first_or_octet_stream().to_string();
-            let builder = Response::builder()
-                .header(header::CONTENT_TYPE, content_type)
-                .header(header::CONTENT_LENGTH, data.len().to_string());
+    let bucket = parts[0];
+    let key = parts[1];
 
-            if method == Method::HEAD {
-                builder.body(Body::empty()).unwrap()
-            } else {
-                builder.body(Body::from(data)).unwrap()
-            }
+    // Get object info first for size and content type
+    let info = match state.engine.head_object(bucket, key).await {
+        Ok(info) => info,
+        Err(e) => {
+            tracing::error!("WebDAV HEAD error: {}", e);
+            return StatusCode::NOT_FOUND.into_response();
         }
+    };
+
+    let content_type = info.content_type.unwrap_or_else(||
+        mime_guess::from_path(key).first_or_octet_stream().to_string()
+    );
+    let total_len = info.size as usize;
+
+    // For HEAD, return metadata without body
+    if method == Method::HEAD {
+        return Response::builder()
+            .header(header::CONTENT_TYPE, &content_type)
+            .header(header::CONTENT_LENGTH, total_len.to_string())
+            .header("Accept-Ranges", "bytes")
+            .body(Body::empty())
+            .unwrap();
+    }
+
+    // Download full content
+    let data = match state.engine.get_object(bucket, key).await {
+        Ok(d) => d,
         Err(e) => {
             tracing::error!("WebDAV GET error: {}", e);
-            StatusCode::NOT_FOUND.into_response()
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+
+    // Check for Range header
+    if let Some(hdrs) = headers {
+        if let Some(range_val) = hdrs.get(http::header::RANGE) {
+            if let Ok(range_str) = range_val.to_str() {
+                if let Some((start, end)) = parse_range(range_str, total_len) {
+                    if start < total_len {
+                        let actual_end = end.min(total_len);
+                        let chunk = &data[start..actual_end];
+                        let chunk_len = chunk.len();
+
+                        return Response::builder()
+                            .status(StatusCode::PARTIAL_CONTENT)
+                            .header(header::CONTENT_TYPE, &content_type)
+                            .header(header::CONTENT_LENGTH, chunk_len.to_string())
+                            .header("Content-Range", format!("bytes {}-{}/{}", start, actual_end - 1, total_len))
+                            .header("Accept-Ranges", "bytes")
+                            .body(Body::from(chunk.to_vec()))
+                            .unwrap();
+                    }
+                }
+            }
         }
     }
+
+    // Full content
+    Response::builder()
+        .header(header::CONTENT_TYPE, &content_type)
+        .header(header::CONTENT_LENGTH, total_len.to_string())
+        .header("Accept-Ranges", "bytes")
+        .body(Body::from(data))
+        .unwrap()
 }
 
 /// WebDAV PUT — upload object
@@ -440,4 +490,37 @@ fn webdav_bucket_multistatus(parent_path: &str, entries: &[(String, String, i64)
 </D:multistatus>"#,
         parent_path, display_name, now, entries_xml
     )
+}
+
+/// Parse HTTP Range header like "bytes=0-1023" or "bytes=100-"
+/// Returns Some((start, end)) where end is exclusive and <= total_len
+fn parse_range(range: &str, total_len: usize) -> Option<(usize, usize)> {
+    let range = range.strip_prefix("bytes=")?;
+    if let Some(dash_pos) = range.find('-') {
+        let start_str = &range[..dash_pos];
+        let end_str = &range[dash_pos + 1..];
+
+        let start: usize = if start_str.is_empty() {
+            // Suffix range: bytes=-500 → last 500 bytes
+            let suffix: usize = end_str.parse().ok()?;
+            if suffix >= total_len {
+                return Some((0, total_len));
+            }
+            return Some((total_len - suffix, total_len));
+        } else {
+            start_str.parse().ok()?
+        };
+
+        let end: usize = if end_str.is_empty() {
+            total_len
+        } else {
+            // End is inclusive in HTTP range, convert to exclusive
+            let inclusive_end: usize = end_str.parse().ok()?;
+            inclusive_end + 1
+        };
+
+        Some((start, end))
+    } else {
+        None
+    }
 }

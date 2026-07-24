@@ -18,10 +18,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let engine = std::sync::Arc::new(engine);
 
+    // Request body size limit: 2 GB for large file uploads
+    let body_limit = tower_http::limit::RequestBodyLimitLayer::new(2_147_483_648);
+
     // Build S3 app
     let mut s3_handle = None;
     if cfg.server.enable_s3 {
-        let s3_app = s3::build_router(engine.clone());
+        let s3_app = s3::build_router(engine.clone()).layer(body_limit.clone());
         let s3_addr = format!("{}:{}", cfg.server.bind, cfg.server.s3_port);
         let listener = tokio::net::TcpListener::bind(&s3_addr).await?;
         s3_handle = Some(tokio::spawn(async move {
@@ -33,7 +36,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // Build WebDAV app
     let mut webdav_handle = None;
     if cfg.server.enable_webdav {
-        let webdav_app = webdav::build_router(engine.clone());
+        let webdav_app = webdav::build_router(engine.clone()).layer(body_limit.clone());
         let webdav_addr = format!("{}:{}", cfg.server.bind, cfg.server.webdav_port);
         let listener = tokio::net::TcpListener::bind(&webdav_addr).await?;
         webdav_handle = Some(tokio::spawn(async move {
