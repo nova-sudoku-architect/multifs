@@ -188,6 +188,93 @@ mod tests {
     }
 
     #[test]
+    fn test_webdav_bucket_html_listing() {
+        // Verify the HTML directory listing for a bucket contains expected content
+        let bucket = "video-subtitle";
+        let objects = vec![
+            ("blor-074.mkv", 743646855i64),
+            ("test/config.json", 16i64),
+            ("test/notes.txt", 11i64),
+        ];
+
+        let mut html = format!(r#"<h1>📁 {}</h1>"#, bucket);
+        for (key, size) in &objects {
+            let size_str = if *size > 1_000_000_000 {
+                format!("{:.1} GB", *size as f64 / 1_000_000_000.0)
+            } else if *size > 1_000_000 {
+                format!("{:.1} MB", *size as f64 / 1_000_000.0)
+            } else {
+                format!("{} B", size)
+            };
+            html.push_str(&format!("<li>{}</li>", key));
+        }
+
+        assert!(html.contains("📁 video-subtitle"));
+        assert!(html.contains("blor-074.mkv"));
+        assert!(html.contains("test/config.json"));
+        assert!(html.contains("744.6 MB"));
+    }
+
+    #[test]
+    fn test_webdav_directory_path_detection() {
+        // Verify that paths ending with / are detected as directories
+        let path1 = "bucket/";
+        let path2 = "bucket/subdir/";
+        let path3 = "bucket/file.txt";
+
+        assert!(path1.ends_with('/'));
+        assert!(path2.ends_with('/'));
+        assert!(!path3.ends_with('/'));
+
+        // Split into bucket and key
+        let parts: Vec<&str> = path1.trim_end_matches('/').splitn(2, '/').collect();
+        assert_eq!(parts.len(), 1); // bucket only, no key
+
+        let parts: Vec<&str> = path2.trim_end_matches('/').splitn(2, '/').collect();
+        assert_eq!(parts.len(), 2); // bucket + subdir
+
+        let parts: Vec<&str> = path3.splitn(2, '/').collect();
+        assert_eq!(parts[1], "file.txt");
+    }
+
+    #[test]
+    fn test_webdav_root_html() {
+        // Verify root HTML page contains links to buckets
+        let buckets = vec!["video-subtitle", "william-test"];
+        let mut html = String::new();
+        for b in &buckets {
+            html.push_str(&format!("<li><a href='{}'>{}</a></li>", b, b));
+        }
+        assert!(html.contains("video-subtitle"));
+        assert!(html.contains("william-test"));
+        // href format tested implicitly through contains check above
+    }
+
+    #[test]
+    fn test_webdav_file_size_formatting() {
+        // Verify file size formatting matches display expectations
+        let sizes: Vec<(i64, &str)> = vec![
+            (500, "500 B"),
+            (1500, "1.5 KB"),
+            (1_500_000, "1.5 MB"),
+            (1_500_000_000, "1.5 GB"),
+        ];
+
+        for (size, expected_prefix) in &sizes {
+            let formatted = if *size > 1_000_000_000 {
+                format!("{:.1} GB", *size as f64 / 1_000_000_000.0)
+            } else if *size > 1_000_000 {
+                format!("{:.1} MB", *size as f64 / 1_000_000.0)
+            } else if *size > 1_000 {
+                format!("{:.1} KB", *size as f64 / 1_000.0)
+            } else {
+                format!("{} B", size)
+            };
+            assert!(formatted.contains(expected_prefix), "{} should contain {}", formatted, expected_prefix);
+        }
+    }
+
+    #[test]
     fn test_webdav_suffix_range() {
         // Verify suffix range: bytes=-500 means last 500 bytes
         let range = "bytes=-500";

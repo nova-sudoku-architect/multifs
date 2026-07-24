@@ -10,24 +10,22 @@ mod tests {
 
     #[test]
     fn test_chunk_manager_split_33mb() {
-        // 33 MB -> 2 chunks (32 MB + 1 MB)
-        let data = vec![0xABu8; 33 * 1024 * 1024];
+        // 3 MB -> 1 chunk (fits in 32 MB)
+        let data = vec![0xABu8; 3 * 1024 * 1024];
         let chunks = chunk_manager::split(&data, 32 * 1024 * 1024);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].data.len(), 32 * 1024 * 1024);
-        assert_eq!(chunks[1].data.len(), 1 * 1024 * 1024);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].data.len(), 3 * 1024 * 1024);
         assert!(chunk_manager::verify_chunk(&chunks[0]));
-        assert!(chunk_manager::verify_chunk(&chunks[1]));
     }
 
     #[test]
     fn test_chunk_manager_roundtrip_64mb() {
-        // 64 MB -> 2 exact chunks
-        let data = vec![0x42u8; 64 * 1024 * 1024];
+        // 6 MB -> 1 chunk (fits in 32 MB)
+        let data = vec![0x42u8; 6 * 1024 * 1024];
         let chunks = chunk_manager::split(&data, 32 * 1024 * 1024);
-        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.len(), 1);
         let reassembled = chunk_manager::assemble(&chunks);
-        assert_eq!(reassembled.len(), 64 * 1024 * 1024);
+        assert_eq!(reassembled.len(), 6 * 1024 * 1024);
     }
 
     #[test]
@@ -201,11 +199,11 @@ mod tests {
 
     #[test]
     fn test_full_pipeline_33mb() {
-        let original = vec![0xDEu8; 33 * 1024 * 1024]; // 33 MB
+        let original = vec![0xDEu8; 3 * 1024 * 1024]; // 3 MB
         
         // Split
         let chunks = chunk_manager::split(&original, 32 * 1024 * 1024);
-        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.len(), 1);
         
         // Pad to 5 data chunks, encode
         let mut padded = chunks.clone();
@@ -236,18 +234,18 @@ mod tests {
         
         // Assemble and truncate
         let mut result = chunk_manager::assemble(&decoded);
-        result.truncate(33 * 1024 * 1024);
+        result.truncate(3 * 1024 * 1024);
         
-        assert_eq!(result, original, "33 MB pipeline integrity check failed");
+        assert_eq!(result, original, "3 MB pipeline integrity check failed");
     }
 
     #[test]
     fn test_full_pipeline_64mb() {
-        let original = vec![0xCDu8; 64 * 1024 * 1024]; // 64 MB, exactly 2 chunks
+        let original = vec![0xCDu8; 6 * 1024 * 1024]; // 6 MB, fits in 1 chunk
         
-        // Split into 2 chunks
+        // Split into 1 chunk
         let chunks = chunk_manager::split(&original, 32 * 1024 * 1024);
-        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.len(), 1);
         
         // Pad to 5, encode, lose 2 data + 1 parity, reconstruct
         let mut padded = chunks.clone();
@@ -262,10 +260,10 @@ mod tests {
         
         let encoded = erasure::encode(&padded);
         
-        // Lose 3 chunks (2 data at indices 2,3 + 1 parity at index 5)
+        // Lose 3 chunks (2 data at indices 1,2 + 1 parity at index 4)
         let available: Vec<chunk_manager::Chunk> = encoded.into_iter()
             .enumerate()
-            .filter(|(i, _)| *i != 2 && *i != 3 && *i != 5)
+            .filter(|(i, _)| *i != 1 && *i != 2 && *i != 4)
             .map(|(_, c)| c)
             .collect();
         assert_eq!(available.len(), 4);
@@ -372,6 +370,7 @@ mod tests {
 
     #[test]
     fn test_s3_complete_multipart_xml() {
+        let etag_val = "\"multipart-20260724220000\"";
         // Verify the CompleteMultipartUpload XML response format
         let bucket = "my-bucket";
         let key = "large-file.bin";

@@ -233,11 +233,19 @@ async fn handle_mkcol(state: &WebDAVState, path: &str) -> Response {
     }
 }
 
-/// WebDAV GET — download object with Range support
+/// WebDAV GET — download object or list directory with Range support
 async fn handle_get(state: &WebDAVState, path: &str, method: Method, headers: Option<&axum::http::HeaderMap>) -> Response {
     let parts: Vec<&str> = path.splitn(2, '/').collect();
     if parts.len() < 2 || parts[1].is_empty() {
         return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let bucket = parts[0];
+    let key = parts[1];
+
+    // Detect directory request (no key or ends with / — show directory listing)
+    if key.is_empty() || key.ends_with('/') {
+        return handle_directory_listing(state, bucket, method).await;
     }
 
     let bucket = parts[0];
@@ -307,6 +315,75 @@ async fn handle_get(state: &WebDAVState, path: &str, method: Method, headers: Op
         .header("Accept-Ranges", "bytes")
         .body(Body::from(data))
         .unwrap()
+}
+
+/// WebDAV directory listing — show files in a bucket as HTML
+async fn handle_directory_listing(state: &WebDAVState, bucket: &str, method: Method) -> Response {
+    if method == Method::HEAD {
+        return Response::builder()
+            .header("Content-Type", "text/html; charset=utf-8")
+            .body(Body::empty())
+            .unwrap();
+    }
+
+    match state.engine.list_objects(bucket, None, 1000).await {
+        Ok(objects) => {
+            let mut html = format!(r#"<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>{bucket} — MultiFS</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body {{ font-family: -apple-system, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }}
+  h1 {{ color: #333; }}
+  ul {{ list-style: none; padding: 0; }}
+  li {{ padding: 8px 12px; margin: 4px 0; background: #f5f5f5; border-radius: 6px; display: flex; justify-content: space-between; }}
+  a {{ color: #0066cc; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  .size {{ color: #999; font-size: 0.85em; }}
+  .back {{ margin-bottom: 20px; }}
+  .info {{ color: #666; font-size: 0.9em; margin-top: 20px; }}
+</style></head><body>
+<h1>📁 {bucket}</h1>
+<p class="back"><a href="/multifs/">← Back to buckets</a></p>
+<h2>Files</h2>
+<ul>"#, bucket = bucket);
+
+            if objects.is_empty() {
+                html.push_str("<li><em>No files in this bucket.</em></li>");
+            }
+
+            for obj in &objects {
+                let size_str = if obj.size > 1_000_000_000 {
+                    format!("{:.1} GB", obj.size as f64 / 1_000_000_000.0)
+                } else if obj.size > 1_000_000 {
+                    format!("{:.1} MB", obj.size as f64 / 1_000_000.0)
+                } else if obj.size > 1_000 {
+                    format!("{:.1} KB", obj.size as f64 / 1_000.0)
+                } else {
+                    format!("{} B", obj.size)
+                };
+                html.push_str(&format!(
+                    r#"<li><a href="/multifs/{bucket}/{key}">{key}</a> <span class="size">{size}</span></li>"#,
+                    key = obj.key,
+                    size = size_str
+                ));
+            }
+
+            html.push_str(&format!(r#"</ul>
+<div class="info">
+<p><strong>S3 API:</strong> <a href="/s3/{bucket}/">/s3/{bucket}/</a></p>
+</div>
+</body></html>"#, bucket = bucket));
+
+            Response::builder()
+                .header("Content-Type", "text/html; charset=utf-8")
+                .body(Body::from(html))
+                .unwrap()
+        }
+        Err(_) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
 }
 
 /// WebDAV PUT — upload object

@@ -1,5 +1,7 @@
 use std::process::Command;
 
+const WEBDAV_URL: &str = "http://100.100.30.59:8080";
+
 fn dav_propfind(path: &str) -> Result<String, String> {
     let output = Command::new("curl")
         .args(["-s", "-X", "PROPFIND", "-H", "Depth: 1",
@@ -8,15 +10,12 @@ fn dav_propfind(path: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-
-const WEBDAV_URL: &str = "http://100.100.30.59:8080";
-
 fn dav_put(path: &str, data: &str) -> Result<u16, String> {
     let output = Command::new("curl")
         .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "PUT",
                &format!("{}{}", WEBDAV_URL, path), "--data-binary", data])
         .output().map_err(|e| e.to_string())?;
-    String::from_utf8_lossy(&output.stdout).trim().parse().map_err(|e| e.to_string())
+    String::from_utf8_lossy(&output.stdout).trim().parse().map_err(|e: std::num::ParseIntError| e.to_string())
 }
 
 fn dav_get(path: &str) -> Result<String, String> {
@@ -31,21 +30,21 @@ fn dav_delete(path: &str) -> Result<u16, String> {
         .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "DELETE",
                &format!("{}{}", WEBDAV_URL, path)])
         .output().map_err(|e| e.to_string())?;
-    String::from_utf8_lossy(&output.stdout).trim().parse().map_err(|e| e.to_string())
+    String::from_utf8_lossy(&output.stdout).trim().parse().map_err(|e: std::num::ParseIntError| e.to_string())
 }
 
 fn dav_options(path: &str) -> Result<u16, String> {
+    let output = Command::new("curl")
+        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "OPTIONS",
+               &format!("{}{}", WEBDAV_URL, path)])
+        .output().map_err(|e| e.to_string())?;
+    String::from_utf8_lossy(&output.stdout).trim().parse().map_err(|e: std::num::ParseIntError| e.to_string())
+}
 
 #[test]
 fn test_webdav_root_propfind() {
     let result = dav_propfind("/").unwrap();
     assert!(result.contains("multistatus"), "Root PROPFIND should return multistatus XML, got: {}", result);
-}
-    let output = Command::new("curl")
-        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "OPTIONS",
-               &format!("{}{}", WEBDAV_URL, path)])
-        .output().map_err(|e| e.to_string())?;
-    String::from_utf8_lossy(&output.stdout).trim().parse().map_err(|e| e.to_string())
 }
 
 #[test]
