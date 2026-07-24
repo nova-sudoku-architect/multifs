@@ -76,6 +76,17 @@ impl StorageEngine {
         key: &str,
         data: &[u8],
     ) -> anyhow::Result<ObjectInfo> {
+        self.put_object_with_content_type(bucket, key, data, None).await
+    }
+
+    /// Put an object with explicit content type
+    pub async fn put_object_with_content_type(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        content_type: Option<&str>,
+    ) -> anyhow::Result<ObjectInfo> {
         // Ensure bucket exists
         self.ensure_bucket(bucket)?;
 
@@ -112,7 +123,7 @@ impl StorageEngine {
             size: data.len() as i64,
             etag,
             last_modified: now,
-            content_type: None,
+            content_type: content_type.map(|s| s.to_string()),
             account_email: backend.label.clone(),
             remote_path: remote_path_actual,
         })

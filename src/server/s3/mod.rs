@@ -235,10 +235,19 @@ async fn list_objects(
 async fn put_object(
     State(state): State<S3State>,
     Path((bucket, key)): Path<(String, String)>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match state.engine.put_object(&bucket, &key, &body).await {
+    // Detect content-type: prefer client-supplied, fall back to extension
+    let content_type = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            mime_guess::from_path(&key).first().map(|m| m.to_string())
+        });
+
+    match state.engine.put_object_with_content_type(&bucket, &key, &body, content_type.as_deref()).await {
         Ok(info) => {
             let etag_header = format!("\"{}\"", info.etag);
             Response::builder()
@@ -258,25 +267,100 @@ async fn put_object(
     }
 }
 
-/// GET /{bucket}/{key} — Download object
+/// GET /{bucket}/{key} — Download object with optional Range support
 async fn get_object(
     State(state): State<S3State>,
     Path((bucket, key)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
-    match state.engine.get_object(&bucket, &key).await {
-        Ok(data) => Response::builder()
-            .header("Content-Type", "application/octet-stream")
-            .header("Content-Length", data.len().to_string())
-            .body(Body::from(data))
-            .unwrap(),
+    let obj_info = match state.engine.head_object(&bucket, &key).await {
+        Ok(info) => info,
         Err(e) => {
             let xml = s3_error_xml("NoSuchKey", &e.to_string(), &format!("{}/{}", bucket, key));
-            Response::builder()
+            return Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .header("Content-Type", "application/xml")
                 .body(Body::from(xml))
-                .unwrap()
+                .unwrap();
         }
+    };
+
+    let data = match state.engine.get_object(&bucket, &key).await {
+        Ok(d) => d,
+        Err(e) => {
+            let xml = s3_error_xml("NoSuchKey", &e.to_string(), &format!("{}/{}", bucket, key));
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap();
+        }
+    };
+
+    let total_len = data.len();
+    let content_type = obj_info.content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+
+    // Handle Range header
+    if let Some(range_val) = headers.get(http::header::RANGE) {
+        if let Ok(range_str) = range_val.to_str() {
+            if let Some((start, end)) = parse_range(range_str, total_len) {
+                if start < total_len {
+                    let end = end.min(total_len);
+                    let chunk = &data[start..end];
+                    let chunk_len = chunk.len();
+
+                    return Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header("Content-Type", &content_type)
+                        .header("Content-Length", chunk_len.to_string())
+                        .header("Content-Range", format!("bytes {}-{}/{}", start, end - 1, total_len))
+                        .header("Accept-Ranges", "bytes")
+                        .body(Body::from(chunk.to_vec()))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    // Full content
+    Response::builder()
+        .header("Content-Type", &content_type)
+        .header("Content-Length", total_len.to_string())
+        .header("Accept-Ranges", "bytes")
+        .body(Body::from(data))
+        .unwrap()
+}
+
+/// Parse HTTP Range header like "bytes=0-1023" or "bytes=100-"
+/// Returns Some((start, end)) where end is exclusive and <= total_len
+fn parse_range(range: &str, total_len: usize) -> Option<(usize, usize)> {
+    let range = range.strip_prefix("bytes=")?;
+    if let Some(dash_pos) = range.find('-') {
+        let start_str = &range[..dash_pos];
+        let end_str = &range[dash_pos + 1..];
+
+        let start: usize = if start_str.is_empty() {
+            // Suffix range: bytes=-500 → last 500 bytes
+            let suffix: usize = end_str.parse().ok()?;
+            if suffix >= total_len {
+                return Some((0, total_len));
+            }
+            return Some((total_len - suffix, total_len));
+        } else {
+            start_str.parse().ok()?
+        };
+
+        let end: usize = if end_str.is_empty() {
+            total_len
+        } else {
+            // End is inclusive in HTTP range, convert to exclusive
+            let inclusive_end: usize = end_str.parse().ok()?;
+            inclusive_end + 1
+        };
+
+        Some((start, end))
+    } else {
+        None
     }
 }
 
