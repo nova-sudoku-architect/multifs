@@ -1,6 +1,6 @@
-# pCloudFS — Multi-Cloud Object Storage
+# MultiFS — Multi-Cloud Storage Pool
 
-An object storage service (like MinIO) written in Rust. Objects are stored on **pCloud** accounts accessed via OAuth tokens, distributed across multiple accounts for capacity. The service exposes **S3-compatible**, **WebDAV**, and **NFS** interfaces.
+A MinIO-compatible object storage service written in Rust that aggregates multiple cloud storage backends (pCloud, Box.net, etc.) into a single S3 + WebDAV endpoint. Objects are stored on **pCloud** accounts accessed via OAuth tokens, distributed across multiple accounts for capacity. The service exposes **S3-compatible**, **WebDAV**, and **NFS** interfaces.
 
 ## Quick Start
 
@@ -97,7 +97,7 @@ aws s3 cp s3://my-bucket/file.txt ./downloaded.txt
                        │
                        ▼
 ┌─────────────────────────────────────────────┐
-│        pCloud Accounts (OAuth 2.0)          │
+│        Cloud Storage Backends (pCloud, Box, etc)          │
 │  ┌────────┐ ┌────────┐ ┌────────┐ ┌──────┐│
 │  │Acct #0 │ │Acct #1 │ │Acct #2 │ │...   ││
 │  │ 10 GB  │ │ 10 GB  │ │ 6 GB   │ │      ││

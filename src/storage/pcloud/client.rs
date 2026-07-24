@@ -94,7 +94,7 @@ impl PCloudClient {
             let body: serde_json::Value = resp.json().await?;
             let result = body["result"].as_i64().unwrap_or(-1);
             // Ignore "already exists" errors
-            if result != 0 && result != 2005 {
+            if result != 0 && result != 2004 && result != 2005 {
                 anyhow::bail!("Failed to create folder '{}': {}", current, body["error"]);
             }
         }
