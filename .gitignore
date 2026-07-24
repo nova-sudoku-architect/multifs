@@ -1,0 +1,8 @@
+/target
+*.swp
+*.swo
+*.bak
+.idea/
+.vscode/
+*.env
+config.toml

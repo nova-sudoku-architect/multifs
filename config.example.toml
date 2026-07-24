@@ -1,0 +1,43 @@
+# MultiFS Configuration
+#
+# MultiFS is a multi-cloud storage pool that aggregates backends (pCloud, Box, etc.)
+# and exposes S3-compatible, WebDAV, and NFS interfaces.
+
+[server]
+bind = "0.0.0.0"
+s3_port = 9000
+webdav_port = 8080
+enable_nfs = false
+enable_webdav = true
+enable_s3 = true
+
+[tls]
+enabled = false
+
+[storage]
+meta_db_path = "/var/lib/multifs/meta.db"
+cache_path = "/var/cache/multifs"
+cache_size_mb = 1024
+shard_strategy = "fill-level"
+
+# Backends — add one [[storage.accounts]] per backend instance
+[[storage.accounts]]
+backend_type = "pcloud"
+email = "nova-video-00@agentmail.to"
+token_env = "PCLOUD_TOKEN"
+mount_prefix = "/multifs/00"
+quota_gb = 10
+
+[[storage.accounts]]
+backend_type = "pcloud"
+email = "nova-video-01@agentmail.to"
+token_env = "PCLOUD_TOKEN_VIDEO_01"
+mount_prefix = "/multifs/01"
+quota_gb = 10
+
+[[storage.accounts]]
+backend_type = "pcloud"
+email = "nova-video-02@agentmail.to"
+token_env = "PCLOUD_TOKEN_VIDEO_02"
+mount_prefix = "/multifs/02"
+quota_gb = 6

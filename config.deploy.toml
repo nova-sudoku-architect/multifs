@@ -1,0 +1,40 @@
+[server]
+bind = "100.100.30.59"
+s3_port = 9000
+webdav_port = 8080
+enable_nfs = false
+enable_webdav = true
+enable_s3 = true
+
+[tls]
+enabled = true
+cert_path = "/etc/pcloudfs/ssl/vmi3137694.tailb9bfd3.ts.net.crt"
+key_path = "/etc/pcloudfs/ssl/vmi3137694.tailb9bfd3.ts.net.key"
+domain = "vmi3137694.tailb9bfd3.ts.net"
+
+[storage]
+meta_db_path = "/var/lib/multifs/meta.db"
+cache_path = "/var/cache/multifs"
+cache_size_mb = 512
+shard_strategy = "fill-level"
+
+[[storage.accounts]]
+backend_type = "pcloud"
+email = "nova-video-20@agentmail.to"
+token_env = "PCLOUD_TOKEN_VIDEO_10"
+mount_prefix = "/multifs/20"
+quota_gb = 4
+
+[[storage.accounts]]
+backend_type = "pcloud"
+email = "nova-video-21@agentmail.to"
+token_env = "PCLOUD_TOKEN_VIDEO_11"
+mount_prefix = "/multifs/21"
+quota_gb = 4
+
+[[storage.accounts]]
+backend_type = "pcloud"
+email = "nova-video-22@agentmail.to"
+token_env = "PCLOUD_TOKEN_VIDEO_12"
+mount_prefix = "/multifs/22"
+quota_gb = 4
