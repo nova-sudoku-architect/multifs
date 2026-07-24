@@ -31,5 +31,14 @@ pub trait StorageBackend: Send + Sync {
 
     /// List files under a prefix (directory).
     async fn list(&self, prefix: &str) -> anyhow::Result<Vec<StorageFile>>;
+
+    /// Server-side copy (optional). Returns the new remote path if supported.
+    /// Returns `None` if the backend doesn't support server-side copy.
+    /// `source_path` is the backend's remote path to copy FROM.
+    /// Returns the destination remote path on success.
+    async fn server_side_copy(&self, source_path: &str, dest_path: &str) -> anyhow::Result<Option<String>> {
+        // Default: not supported
+        Ok(None)
+    }
 }
 pub mod pcloud;

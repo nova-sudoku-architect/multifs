@@ -194,6 +194,30 @@ impl PCloudClient {
         Ok(data.to_vec())
     }
 
+    /// Copy a file server-side using pCloud's copyfile API
+    pub async fn copy_file(&self, source_path: &str, dest_parent: &str, new_name: &str) -> anyhow::Result<()> {
+        let resp = self
+            .client
+            .get(format!("{}/copyfile", self.base_url))
+            .query(&[
+                ("access_token", self.token.as_str()),
+                ("path", source_path),
+                ("topath", dest_parent),
+                ("toname", new_name),
+            ])
+            .send()
+            .await?;
+
+        let body: serde_json::Value = resp.json().await?;
+        let result = body["result"].as_i64().unwrap_or(-1);
+
+        if result != 0 && result != 2004 {
+            anyhow::bail!("pCloud copyfile error {}: {}", result, body["error"]);
+        }
+
+        Ok(())
+    }
+
     /// Delete a file from pCloud
     pub async fn delete(&self, remote_path: &str) -> anyhow::Result<()> {
         let resp = self

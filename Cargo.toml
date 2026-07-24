@@ -11,6 +11,8 @@ name = "multifs"
 path = "src/main.rs"
 
 [dependencies]
+sha2 = "0.10"
+hex = "0.4"
 async-trait = "0.1"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -49,8 +51,6 @@ url = "2"
 walkdir = "2"
 bytes = "1"
 mime_guess = "2"
-hex = "0.4"
-sha2 = "0.10"
 
 # WebDAV
 http = "1"

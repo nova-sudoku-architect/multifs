@@ -8,6 +8,31 @@ pub struct BucketRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct FileRecord {
+    pub bucket_name: String,
+    pub key: String,
+    pub size: i64,
+    pub etag: String,
+    pub last_modified: String,
+    pub content_type: Option<String>,
+    pub created_at: String,
+    pub owner: Option<String>,
+    pub storage_type: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChunkRecord {
+    pub bucket_name: String,
+    pub key: String,
+    pub chunk_index: i32,
+    pub size: i64,
+    pub checksum: String,
+    pub is_parity: bool,
+    pub account_email: String,
+    pub remote_path: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ObjectRecord {
     pub key: String,
     pub size: i64,
@@ -54,6 +79,35 @@ impl MetadataDb {
             CREATE INDEX IF NOT EXISTS idx_objects_bucket ON objects(bucket_name);
             CREATE INDEX IF NOT EXISTS idx_objects_account ON objects(account_email);
             CREATE INDEX IF NOT EXISTS idx_objects_prefix ON objects(bucket_name, key);
+
+            CREATE TABLE IF NOT EXISTS files (
+                bucket_name TEXT NOT NULL,
+                key TEXT NOT NULL,
+                size INTEGER NOT NULL DEFAULT 0,
+                etag TEXT NOT NULL,
+                last_modified TEXT NOT NULL,
+                content_type TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                owner TEXT,
+                storage_type TEXT NOT NULL DEFAULT 'whole',
+                PRIMARY KEY (bucket_name, key)
+            );
+
+            CREATE TABLE IF NOT EXISTS chunks (
+                bucket_name TEXT NOT NULL,
+                key TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                size INTEGER NOT NULL DEFAULT 0,
+                checksum TEXT NOT NULL,
+                is_parity INTEGER NOT NULL DEFAULT 0,
+                account_email TEXT NOT NULL,
+                remote_path TEXT NOT NULL,
+                PRIMARY KEY (bucket_name, key, chunk_index)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chunks_account ON chunks(account_email);
+            CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(bucket_name, key);
+            CREATE INDEX IF NOT EXISTS idx_files_bucket ON files(bucket_name);
             ",
         )?;
         Ok(Self { path: path.to_string() })

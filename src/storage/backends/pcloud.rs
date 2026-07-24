@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+
 use super::{StorageBackend, StorageFile};
 use crate::config::AccountConfig;
 
@@ -50,5 +51,23 @@ impl StorageBackend for PCloudBackend {
             modified: f.modified,
             is_folder: f.is_folder,
         }).collect())
+    }
+
+    /// Server-side copy using pCloud's copyfile API (instant for same account)
+    async fn server_side_copy(&self, source_path: &str, dest_parent: &str) -> anyhow::Result<Option<String>> {
+        // Extract filename from source path
+        let filename = std::path::Path::new(source_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+
+        // Ensure destination directory exists
+        self.client.ensure_path(dest_parent).await?;
+
+        // Perform server-side copy
+        self.client.copy_file(source_path, dest_parent, filename).await?;
+
+        let dest_path = format!("{}/{}", dest_parent.trim_end_matches('/'), filename);
+        Ok(Some(dest_path))
     }
 }
