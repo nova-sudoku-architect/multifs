@@ -49,6 +49,7 @@ async fn webdav_root_handler(
                 .body(Body::empty())
                 .unwrap()
         }
+        "GET" | "HEAD" => handle_root_get(&state).await,
         "PROPFIND" => handle_propfind(&state, "").await,
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
@@ -86,6 +87,61 @@ async fn webdav_handler(
         "COPY" => handle_copy(&state, &path, "").await,
         "MOVE" => handle_move(&state, &path, "").await,
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    }
+}
+
+/// WebDAV root GET — returns an HTML index page for browsers
+async fn handle_root_get(state: &WebDAVState) -> Response {
+    match state.engine.list_all_buckets().await {
+        Ok(buckets) => {
+            let mut html = String::from(r#"<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>MultiFS</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
+  h1 { color: #333; }
+  ul { list-style: none; padding: 0; }
+  li { padding: 8px 12px; margin: 4px 0; background: #f5f5f5; border-radius: 6px; }
+  a { color: #0066cc; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .info { color: #666; font-size: 0.9em; margin-top: 20px; }
+</style></head><body>
+<h1>📦 MultiFS</h1>
+<p>Your multi-cloud storage pool</p>
+<h2>Buckets</h2>
+<ul>"#);
+
+            if buckets.is_empty() {
+                html.push_str("<li><em>No buckets yet. Create one with:</em> <code>curl -X PUT https://vmi3137694.tailb9bfd3.ts.net/s3/my-bucket</code></li>");
+            }
+
+            for b in &buckets {
+                html.push_str(&format!(
+                    r#"<li><a href="{href}/">{name}</a> <span style="color:#999;font-size:0.85em">({created})</span></li>"#,
+                    href = b.name,
+                    name = b.name,
+                    created = &b.created_at[..10]
+                ));
+            }
+
+            html.push_str(r#"</ul>
+<div class="info">
+<p><strong>S3 API:</strong> <a href="https://vmi3137694.tailb9bfd3.ts.net/s3/">https://vmi3137694.tailb9bfd3.ts.net/s3/</a></p>
+<p><strong>WebDAV:</strong> <a href="/">https://vmi3137694.tailb9bfd3.ts.net/multifs/</a></p>
+<p><strong>Storage:</strong> 3 × pCloud accounts (~12 GB total)</p>
+</div>
+</body></html>"#);
+
+            Response::builder()
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(Body::from(html))
+                .unwrap()
+        }
+        Err(e) => {
+            tracing::error!("Root GET error: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
