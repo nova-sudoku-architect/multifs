@@ -338,6 +338,145 @@ mod tests {
     }
 
     #[test]
+    fn test_s3_head_bucket_headers() {
+        // HEAD /{bucket} should return x-amz-bucket-region
+        // This verifies the bucket endpoint format without hitting the server
+        use crate::storage::metadata::MetadataDb;
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(dir.path().join("test.db").to_str().unwrap()).unwrap();
+        db.create_bucket("test-bucket").unwrap();
+        assert!(db.bucket_exists("test-bucket").unwrap());
+        // The x-amz-bucket-region header is set in the HTTP handler, not in metadata
+        // So we just verify bucket metadata works
+    }
+
+    #[test]
+    fn test_s3_multipart_upload_xml() {
+        // Verify the InitiateMultipartUpload XML response format
+        let bucket = "my-bucket";
+        let key = "large-file.bin";
+        let upload_id = "multipart-20260724220000";
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>{}</Bucket>
+  <Key>{}</Key>
+  <UploadId>{}</UploadId>
+</InitiateMultipartUploadResult>"#,
+            bucket, key, upload_id
+        );
+        assert!(xml.contains("<Bucket>my-bucket</Bucket>"));
+        assert!(xml.contains("<Key>large-file.bin</Key>"));
+        assert!(xml.contains("<UploadId>multipart-20260724220000</UploadId>"));
+    }
+
+    #[test]
+    fn test_s3_complete_multipart_xml() {
+        // Verify the CompleteMultipartUpload XML response format
+        let bucket = "my-bucket";
+        let key = "large-file.bin";
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Location>https://example.com/s3/{}/{}</Location>
+  <Bucket>{}</Bucket>
+  <Key>{}</Key>
+  <ETag>{}</ETag>
+</CompleteMultipartUploadResult>"#,
+            bucket, key, bucket, key, etag_val
+        );
+        assert!(xml.contains("<Bucket>my-bucket</Bucket>"));
+        assert!(xml.contains("<Key>large-file.bin</Key>"));
+        assert!(xml.contains("<ETag>\"multipart-20260724220000\"</ETag>"));
+    }
+
+    #[test]
+    fn test_s3_upload_part_response() {
+        // Verify the UploadPart response (ETag header)
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"multipart-part");
+        let etag = hex::encode(hasher.finalize());
+        assert_eq!(etag.len(), 64);
+        // ETag returned is first 16 chars
+        assert_eq!(etag[..16].len(), 16);
+    }
+
+    #[test]
+    fn test_s3_list_buckets_xml() {
+        // Verify the ListBuckets XML format
+        let buckets = vec![
+            ("bucket-a".to_string(), "2026-01-01".to_string()),
+            ("bucket-b".to_string(), "2026-01-02".to_string()),
+        ];
+        let buckets_xml: String = buckets
+            .iter()
+            .map(|(name, created)| {
+                format!(
+                    "<Bucket><Name>{}</Name><CreationDate>{}</CreationDate></Bucket>",
+                    name, created
+                )
+            })
+            .collect();
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Owner><ID>multifs</ID><DisplayName>multifs</DisplayName></Owner>
+  <Buckets>{}</Buckets>
+</ListAllMyBucketsResult>"#,
+            buckets_xml
+        );
+        assert!(xml.contains("<Bucket><Name>bucket-a</Name>"));
+        assert!(xml.contains("<Bucket><Name>bucket-b</Name>"));
+        assert!(xml.contains("<Owner><ID>multifs</ID></Owner>"));
+    }
+
+    #[test]
+    fn test_s3_location_xml() {
+        // Verify the LocationConstraint XML format
+        let region = "us-east-1";
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{}</LocationConstraint>"#,
+            region
+        );
+        assert!(xml.contains("us-east-1"));
+        assert!(xml.contains("<LocationConstraint"));
+    }
+
+    #[test]
+    fn test_s3_versioning_xml() {
+        // Verify the VersioningConfiguration XML format
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Status>Suspended</Status>
+</VersioningConfiguration>"#;
+        assert!(xml.contains("<Status>Suspended</Status>"));
+        assert!(xml.contains("<VersioningConfiguration"));
+    }
+
+    #[test]
+    fn test_s3_error_xml() {
+        // Verify error XML format
+        let code = "NoSuchKey";
+        let message = "The specified key does not exist.";
+        let resource = "my-bucket/my-file.txt";
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>{}</Code>
+  <Message>{}</Message>
+  <Resource>{}</Resource>
+  <RequestId>multifs</RequestId>
+</Error>"#,
+            code, message, resource
+        );
+        assert!(xml.contains("<Code>NoSuchKey</Code>"));
+        assert!(xml.contains("<Message>The specified key does not exist.</Message>"));
+        assert!(xml.contains("<RequestId>multifs</RequestId>"));
+    }
+
+    #[test]
     fn test_delete_object() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");

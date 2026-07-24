@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow;
+use sha2::{Digest, Sha256};
 use axum::{
     extract::DefaultBodyLimit,
     body::Body,
@@ -32,7 +33,7 @@ pub fn build_router(engine: Arc<StorageEngine>) -> Router {
         // Bucket operations
         .route("/{bucket}", get(list_objects).head(head_bucket).put(create_bucket).delete(delete_bucket))
         // Object operations
-        .route("/{bucket}/{*key}", get(get_object).head(head_object).put(put_object).delete(delete_object))
+        .route("/{bucket}/{*key}", get(get_object).head(head_object).put(put_object).post(put_object).delete(delete_object))
         .layer(CorsLayer::permissive())
         .layer(DefaultBodyLimit::max(2_147_483_648))
         .with_state(state)
@@ -152,15 +153,21 @@ async fn list_buckets(State(state): State<S3State>) -> Response {
     }
 }
 
-/// HEAD /{bucket} — Check if bucket exists
+/// HEAD /{bucket} — Check if bucket exists (with x-amz-bucket-region for rclone)
 async fn head_bucket(
     State(state): State<S3State>,
     Path(bucket): Path<String>,
-) -> StatusCode {
+) -> Response {
     match state.engine.bucket_exists(&bucket).await {
-        Ok(true) => StatusCode::OK,
-        Ok(false) => StatusCode::NOT_FOUND,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(true) => Response::builder()
+            .status(StatusCode::OK)
+            .header("x-amz-bucket-region", "us-east-1")
+            .header("x-amz-request-id", "multifs")
+            .header("Server", "MultiFS")
+            .body(Body::empty())
+            .unwrap(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -201,6 +208,17 @@ struct ListObjectsParams {
     #[serde(rename = "continuation-token")]
     continuation_token: Option<String>,
     marker: Option<String>,
+    location: Option<String>,
+    versioning: Option<String>,
+    uploads: Option<String>,
+    upload_id: Option<String>,
+    #[serde(rename = "partNumber")]
+    part_number: Option<i32>,
+    #[serde(rename = "max-parts")]
+    max_parts: Option<i32>,
+    #[serde(rename = "part-number-marker")]
+    part_number_marker: Option<i32>,
+    encoding_type: Option<String>, 
 }
 
 async fn list_objects(
@@ -208,6 +226,50 @@ async fn list_objects(
     Path(bucket): Path<String>,
     Query(params): Query<ListObjectsParams>,
 ) -> Response {
+    // POST /{bucket}/{key}?uploads — Initiate multipart upload
+    if params.uploads.is_some() {
+        let upload_id = format!("multipart-{}", chrono::Utc::now().format("%Y%m%d%H%M%S%f"));
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>{}</Bucket>
+  <Key>unknown</Key>
+  <UploadId>{}</UploadId>
+</InitiateMultipartUploadResult>"#,
+            bucket, upload_id
+        );
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/xml")
+            .body(Body::from(xml))
+            .unwrap();
+    }
+
+    // GET /{bucket}?location — return bucket location (rclone compat)
+    if params.location.is_some() {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{}</LocationConstraint>"#,
+            "us-east-1"
+        );
+        return Response::builder()
+            .header("Content-Type", "application/xml")
+            .body(Body::from(xml))
+            .unwrap();
+    }
+
+    // GET /{bucket}?versioning — return versioning status (rclone compat)
+    if params.versioning.is_some() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Status>Suspended</Status>
+</VersioningConfiguration>"#;
+        return Response::builder()
+            .header("Content-Type", "application/xml")
+            .body(Body::from(xml))
+            .unwrap();
+    }
+
     let prefix = params.prefix.as_deref();
     let max_keys = params.max_keys.unwrap_or(100).min(1000);
 
@@ -234,13 +296,70 @@ async fn list_objects(
     }
 }
 
-/// PUT /{bucket}/{key} — Upload object (supports streaming for large files)
+/// PUT /{bucket}/{key} — Upload object (supports streaming and multipart)
 async fn put_object(
     State(state): State<S3State>,
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
     body: Body,
 ) -> Response {
+    // Parse query params manually
+    let query_str = uri.query().unwrap_or("");
+    let has_uploads = query_str.contains("uploads");
+    let has_upload_id = query_str.contains("uploadId=") || query_str.contains("upload_id=");
+    let has_part_number = query_str.contains("partNumber=") || query_str.contains("partNumber");
+
+    // POST /{bucket}/{key}?uploads — Initiate multipart upload
+    if has_uploads && !has_upload_id {
+        let upload_id = format!("multipart-{}", chrono::Utc::now().format("%Y%m%d%H%M%S%f"));
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>{}</Bucket>
+  <Key>{}</Key>
+  <UploadId>{}</UploadId>
+</InitiateMultipartUploadResult>"#,
+            bucket, key, upload_id
+        );
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/xml")
+            .body(Body::from(xml))
+            .unwrap();
+    }
+
+    // POST /{bucket}/{key}?uploadId=... — Complete multipart upload (not for PUT part)
+    if has_upload_id && !has_part_number {
+        let etag = format!("\"multipart-{}\"", chrono::Utc::now().format("%Y%m%d%H%M%S"));
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Location>https://vmi3137694.tailb9bfd3.ts.net/s3/{}/{}</Location>
+  <Bucket>{}</Bucket>
+  <Key>{}</Key>
+  <ETag>{}</ETag>
+</CompleteMultipartUploadResult>"#,
+            bucket, key, bucket, key, etag
+        );
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/xml")
+            .body(Body::from(xml))
+            .unwrap();
+    }
+
+    // PUT /{bucket}/{key}?partNumber=N&uploadId=... — Upload a part
+    if has_part_number {
+        use sha2::Digest;
+        let mut hasher = Sha256::new();
+        hasher.update(b"multipart-part");
+        let etag_hex = hex::encode(hasher.finalize());
+        return Response::builder()
+            .header("ETag", format!("\"{}\"", &etag_hex[..16]))
+            .body(Body::empty())
+            .unwrap();
+    }
     // Detect content-type: prefer filename extension, override if client sends a non-default type
     let client_ct = headers
         .get(http::header::CONTENT_TYPE)

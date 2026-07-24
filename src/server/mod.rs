@@ -1,5 +1,6 @@
 pub mod s3;
 pub mod webdav;
+pub mod webdav_tests;
 pub mod nfs;
 
 use crate::config::Config;

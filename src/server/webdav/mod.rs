@@ -46,13 +46,14 @@ async fn webdav_root_handler(
         "OPTIONS" => {
             Response::builder()
                 .header("DAV", "1, 2")
-                .header("Allow", "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, MKCOL, COPY, MOVE")
+                .header("Allow", "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE")
                 .status(StatusCode::OK)
                 .body(Body::empty())
                 .unwrap()
         }
         "GET" | "HEAD" => handle_root_get(&state).await,
         "PROPFIND" => handle_propfind(&state, "").await,
+        "PROPPATCH" => StatusCode::OK.into_response(),
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
 }
@@ -76,13 +77,14 @@ async fn webdav_handler(
                 .header("DAV", "1, 2")
                 .header(
                     "Allow",
-                    "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, MKCOL, COPY, MOVE",
+                    "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE",
                 )
                 .status(StatusCode::OK)
                 .body(Body::empty())
                 .unwrap()
         }
         "PROPFIND" => handle_propfind(&state, &path).await,
+        "PROPPATCH" => StatusCode::OK.into_response(),
         "MKCOL" => handle_mkcol(&state, &path).await,
         "GET" | "HEAD" => handle_get(&state, &path, method, Some(&headers)).await,
         "PUT" => handle_put(&state, &path, body).await,
