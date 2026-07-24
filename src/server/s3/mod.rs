@@ -238,14 +238,33 @@ async fn put_object(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // Detect content-type: prefer client-supplied, fall back to extension
-    let content_type = headers
+    // Detect content-type: prefer filename extension, override if client sends a non-default type
+    let client_ct = headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            mime_guess::from_path(&key).first().map(|m| m.to_string())
-        });
+        .map(|s| s.to_string());
+
+    let ext_ct = mime_guess::from_path(&key).first().map(|m| m.to_string());
+
+    let content_type = if ext_ct.is_some() {
+        // Use extension detection unless client overrides with something meaningful
+        match client_ct.as_deref() {
+            // curl's default --data-binary sends this — ignore it
+            Some("application/x-www-form-urlencoded") => ext_ct,
+            Some(other) => {
+                // If it's a generic octet-stream and we have a better guess, use ours
+                if other == "application/octet-stream" && ext_ct.is_some() {
+                    ext_ct
+                } else {
+                    client_ct
+                }
+            }
+            // Explicit override from client, or no header at all
+            None => ext_ct,
+        }
+    } else {
+        client_ct
+    };
 
     match state.engine.put_object_with_content_type(&bucket, &key, &body, content_type.as_deref()).await {
         Ok(info) => {

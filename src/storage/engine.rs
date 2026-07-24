@@ -115,7 +115,7 @@ impl StorageEngine {
             &now,
             &backend.label,
             &remote_path_actual,
-            None,
+            content_type,
         )?;
 
         Ok(ObjectInfo {
