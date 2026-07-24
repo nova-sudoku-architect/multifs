@@ -113,7 +113,7 @@ impl MetadataDb {
         Ok(Self { path: path.to_string() })
     }
 
-    fn with_conn<F, T>(&self, f: F) -> anyhow::Result<T>
+    pub fn with_conn<F, T>(&self, f: F) -> anyhow::Result<T>
     where
         F: FnOnce(&Connection) -> anyhow::Result<T>,
     {
