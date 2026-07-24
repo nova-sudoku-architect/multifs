@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
+    extract::DefaultBodyLimit,
     extract::Request as AxumRequest,
     body::Body,
     extract::{Path, State},

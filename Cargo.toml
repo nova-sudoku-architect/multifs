@@ -25,7 +25,7 @@ clap = { version = "4", features = ["derive", "env"] }
 axum = { version = "0.8", features = ["macros"] }
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -73,3 +73,5 @@ directories = "6"
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
+bytes = "1"
+futures = "0.3"

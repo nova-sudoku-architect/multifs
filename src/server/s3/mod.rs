@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
+use anyhow;
 use axum::{
+    extract::DefaultBodyLimit,
     body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -32,6 +34,7 @@ pub fn build_router(engine: Arc<StorageEngine>) -> Router {
         // Object operations
         .route("/{bucket}/{*key}", get(get_object).head(head_object).put(put_object).delete(delete_object))
         .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(2_147_483_648))
         .with_state(state)
 }
 
@@ -231,12 +234,12 @@ async fn list_objects(
     }
 }
 
-/// PUT /{bucket}/{key} — Upload object
+/// PUT /{bucket}/{key} — Upload object (supports streaming for large files)
 async fn put_object(
     State(state): State<S3State>,
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     // Detect content-type: prefer filename extension, override if client sends a non-default type
     let client_ct = headers
@@ -266,7 +269,52 @@ async fn put_object(
         client_ct
     };
 
-    match state.engine.put_object_with_content_type(&bucket, &key, &body, content_type.as_deref()).await {
+    // Check Content-Length to decide streaming vs buffered
+    let content_length = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    const CHUNK_SIZE_LIMIT: u64 = 32 * 1024 * 1024; // 32 MB — same as engine's chunk size
+
+    let result = if let Some(len) = content_length {
+        // If we know the full size and it's small, use buffered path
+        if len <= CHUNK_SIZE_LIMIT {
+            // Buffer the full body
+            let full_body = match axum::body::to_bytes(body, len as usize).await {
+                Ok(b) => b,
+                Err(e) => {
+                    let xml = s3_error_xml("InternalError", &format!("Failed to buffer body: {}", e), &format!("{}/{}", bucket, key));
+                    return Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
+                }
+            };
+            state.engine.put_object_with_content_type(&bucket, &key, &full_body, content_type.as_deref()).await
+        } else {
+            // Large file (>32 MB): use streaming path
+            let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+            let etag = format!("streaming-{}", now);
+            
+            // Convert axum Body to a stream
+            use futures::stream::StreamExt;
+            let stream = body.into_data_stream().map(|r| r.map_err(|e| anyhow::anyhow!("Stream error: {}", e)));
+            
+            state.engine.put_chunked_file_stream(
+                &bucket, &key, content_type.as_deref(), &etag, &now, stream
+            ).await
+        }
+    } else {
+        // No Content-Length: buffer entirely (handles chunked transfer encoding) up to 2GB
+        let full_body = match axum::body::to_bytes(body, 2_147_483_648).await {
+            Ok(b) => b,
+            Err(e) => {
+                let xml = s3_error_xml("InternalError", &format!("Failed to buffer body: {}", e), &format!("{}/{}", bucket, key));
+                return Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
+            }
+        };
+        state.engine.put_object_with_content_type(&bucket, &key, &full_body, content_type.as_deref()).await
+    };
+
+    match result {
         Ok(info) => {
             let etag_header = format!("\"{}\"", info.etag);
             Response::builder()
