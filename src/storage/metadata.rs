@@ -1,5 +1,5 @@
-use rusqlite::{params, Connection, Result as SqlResult};
-use std::sync::Mutex;
+use rusqlite::{params, Connection};
+
 
 #[derive(Debug, Clone)]
 pub struct BucketRecord {

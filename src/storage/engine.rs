@@ -1,14 +1,13 @@
 use std::sync::Arc;
-
-use chrono::Utc;
-use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+use sha2::{Digest, Sha256};
+use chrono::Utc;
+
 
 use crate::config::Config;
 
-use super::backends::{StorageBackend, StorageFile};
+use super::backends::StorageBackend;
 use super::metadata::{MetadataDb, BucketRecord};
-use super::pcloud::shard::ShardManager;
 
 /// Object metadata returned by head_object
 #[derive(Debug, Clone)]

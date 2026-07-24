@@ -10,23 +10,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let engine = crate::storage::engine::StorageEngine::new(&cfg, meta)?;
 
     tracing::info!(
-        "Starting pCloudFS on {} (S3:{}, WebDAV:{}, NFS:{})",
+        "Starting MultiFS on {} (S3:{}, WebDAV:{}, NFS:disabled)",
         cfg.server.bind,
-        if cfg.server.enable_s3 {
-            cfg.server.s3_port.to_string()
-        } else {
-            "disabled".to_string()
-        },
-        if cfg.server.enable_webdav {
-            cfg.server.webdav_port.to_string()
-        } else {
-            "disabled".to_string()
-        },
-        if cfg.server.enable_nfs {
-            cfg.server.nfs_port.to_string()
-        } else {
-            "disabled".to_string()
-        },
+        cfg.server.s3_port,
+        cfg.server.webdav_port,
     );
 
     let engine = std::sync::Arc::new(engine);
@@ -55,24 +42,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         tracing::info!("WebDAV listening on {}", webdav_addr);
     }
 
-    // Build NFS server
-    let mut nfs_handle = None;
-    if cfg.server.enable_nfs {
-        let nfs_addr = format!("{}:{}", cfg.server.bind, cfg.server.nfs_port);
-        nfs_handle = Some(nfs::run(engine.clone(), &nfs_addr).await?);
-        tracing::info!("NFS server listening on {}", nfs_addr);
-    }
-
     // Wait for any server to exit
-    if let Some(h) = s3_handle {
-        h.await??;
-    }
-    if let Some(h) = webdav_handle {
-        h.await??;
-    }
-    if let Some(h) = nfs_handle {
-        h.await?;
-    }
+    if let Some(h) = s3_handle { h.await?; }
+    if let Some(h) = webdav_handle { h.await?; }
 
     Ok(())
 }
