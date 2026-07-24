@@ -25,10 +25,35 @@ pub fn build_router(engine: Arc<StorageEngine>) -> Router {
     let state = WebDAVState { engine };
 
     Router::new()
+        .route("/", any(webdav_root_handler))
         .route("/{*path}", any(webdav_handler))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
+
+
+/// WebDAV root handler — handles PROPFIND / directly
+async fn webdav_root_handler(
+    State(state): State<WebDAVState>,
+    method: Method,
+    body: Bytes,
+) -> Response {
+    tracing::debug!("WebDAV root {} /", method);
+    let method_str = method.as_str();
+    match method_str {
+        "OPTIONS" => {
+            Response::builder()
+                .header("DAV", "1, 2")
+                .header("Allow", "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, MKCOL, COPY, MOVE")
+                .status(StatusCode::OK)
+                .body(Body::empty())
+                .unwrap()
+        }
+        "PROPFIND" => handle_propfind(&state, "").await,
+        _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    }
+}
+
 
 /// Universal WebDAV handler
 async fn webdav_handler(

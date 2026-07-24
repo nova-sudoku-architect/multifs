@@ -71,3 +71,26 @@ mod tests {
         assert_eq!(db.account_total_size("a1").unwrap(), 300);
     }
 }
+
+#[test]
+fn test_list_buckets_when_empty() {
+    use crate::storage::metadata::MetadataDb;
+    let dir = tempfile::tempdir().unwrap();
+    let db = MetadataDb::open(dir.path().join("test.db").to_str().unwrap()).unwrap();
+    let buckets = db.list_buckets().unwrap();
+    assert!(buckets.is_empty(), "New DB should have no buckets");
+}
+
+#[test]
+fn test_create_and_list_bucket() {
+    use crate::storage::metadata::MetadataDb;
+    let dir = tempfile::tempdir().unwrap();
+    let db = MetadataDb::open(dir.path().join("test.db").to_str().unwrap()).unwrap();
+    db.create_bucket("my-bucket").unwrap();
+    db.create_bucket("other-bucket").unwrap();
+    let buckets = db.list_buckets().unwrap();
+    assert_eq!(buckets.len(), 2);
+    // Should be sorted by name
+    assert_eq!(buckets[0].name, "my-bucket");
+    assert_eq!(buckets[1].name, "other-bucket");
+}
