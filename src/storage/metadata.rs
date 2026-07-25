@@ -449,30 +449,42 @@ impl MetadataDb {
 
     pub fn list_objects(&self, bucket: &str, prefix: Option<&str>, max_keys: i64) -> anyhow::Result<Vec<ObjectRecord>> {
         self.with_conn(|conn| {
-            if let Some(p) = prefix {
-                let mut stmt = conn.prepare(
-                    "SELECT key, size, etag, last_modified, content_type, account_email, remote_path, bucket_name
-                     FROM objects WHERE bucket_name = ?1 AND key LIKE ?2 ORDER BY key LIMIT ?3",
-                )?;
+            // Query both objects (whole-file) and files (chunked) tables
+            let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(p) = prefix {
                 let pattern = format!("{}%", p);
-                let rows = stmt.query_map(params![bucket, pattern, max_keys], |row| {
-                    Ok(ObjectRecord { key: row.get(0)?, size: row.get(1)?, etag: row.get(2)?, last_modified: row.get(3)?, content_type: row.get(4)?, account_email: row.get(5)?, remote_path: row.get(6)?, bucket_name: row.get(7)? })
-                })?;
-                let mut objects = Vec::new();
-                for row in rows { objects.push(row?); }
-                Ok(objects)
+                ("SELECT key, size, etag, last_modified, content_type, '' AS account_email, 'chunked://' || bucket_name || '/' || key AS remote_path, bucket_name
+                  FROM files WHERE bucket_name = ?1 AND key LIKE ?2 AND storage_type = 'chunked'
+                  UNION ALL
+                  SELECT key, size, etag, last_modified, content_type, account_email, remote_path, bucket_name
+                  FROM objects WHERE bucket_name = ?1 AND key LIKE ?2
+                  ORDER BY key LIMIT ?3",
+                 vec![Box::new(bucket.to_string()), Box::new(pattern), Box::new(max_keys)])
             } else {
-                let mut stmt = conn.prepare(
-                    "SELECT key, size, etag, last_modified, content_type, account_email, remote_path, bucket_name
-                     FROM objects WHERE bucket_name = ?1 ORDER BY key LIMIT ?2",
-                )?;
-                let rows = stmt.query_map(params![bucket, max_keys], |row| {
-                    Ok(ObjectRecord { key: row.get(0)?, size: row.get(1)?, etag: row.get(2)?, last_modified: row.get(3)?, content_type: row.get(4)?, account_email: row.get(5)?, remote_path: row.get(6)?, bucket_name: row.get(7)? })
-                })?;
-                let mut objects = Vec::new();
-                for row in rows { objects.push(row?); }
-                Ok(objects)
-            }
+                ("SELECT key, size, etag, last_modified, content_type, '' AS account_email, 'chunked://' || bucket_name || '/' || key AS remote_path, bucket_name
+                  FROM files WHERE bucket_name = ?1 AND storage_type = 'chunked'
+                  UNION ALL
+                  SELECT key, size, etag, last_modified, content_type, account_email, remote_path, bucket_name
+                  FROM objects WHERE bucket_name = ?1
+                  ORDER BY key LIMIT ?2",
+                 vec![Box::new(bucket.to_string()), Box::new(max_keys)])
+            };
+            let mut stmt = conn.prepare(sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok(ObjectRecord {
+                    key: row.get(0)?,
+                    size: row.get(1)?,
+                    etag: row.get(2)?,
+                    last_modified: row.get(3)?,
+                    content_type: row.get(4)?,
+                    account_email: row.get::<_, String>(5).unwrap_or_default(),
+                    remote_path: row.get::<_, String>(6).unwrap_or_default(),
+                    bucket_name: row.get(7)?,
+                })
+            })?;
+            let mut objects = Vec::new();
+            for row in rows { objects.push(row?); }
+            Ok(objects)
         })
     }
 

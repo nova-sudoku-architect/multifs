@@ -323,6 +323,49 @@ mod tests {
     }
 
     #[test]
+    fn test_list_objects_includes_chunked() {
+        // Ensure list_objects includes both whole-file (objects table) and chunked (files table) entries
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
+        db.create_bucket("test").unwrap();
+
+        // Whole-file entries go into objects table
+        db.put_object("test", "small.txt", 100, "etag1", "2026-01-01", "a1", "/r/small.txt", None).unwrap();
+        db.put_object("test", "tiny.txt", 10, "etag2", "2026-01-01", "a1", "/r/tiny.txt", None).unwrap();
+
+        // Chunked entries go into files table (as inserted by engine's put_chunked_file)
+        db.with_conn(|conn| {
+            use rusqlite::params;
+            conn.execute(
+                "INSERT INTO files (bucket_name, key, size, etag, last_modified, content_type, storage_type)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'chunked')",
+                params!["test", "large-video.mp4", 100_000_000, "etag3", "2026-01-01", "video/mp4"],
+            )?;
+            // Also insert a chunk record so the file is properly tracked
+            conn.execute(
+                "INSERT INTO chunks (bucket_name, key, chunk_index, size, checksum, is_parity, account_email, remote_path)
+                 VALUES (?1, ?2, 0, 100_000_000, 'abc123', 0, 'a1', '/r/large-video.ck.0')",
+                params!["test", "large-video.mp4"],
+            )?;
+            Ok(())
+        }).unwrap();
+
+        // list_objects should return all 3 entries (2 whole + 1 chunked)
+        let objects = db.list_objects("test", None, 100).unwrap();
+        let keys: Vec<&str> = objects.iter().map(|o| o.key.as_str()).collect();
+        assert!(keys.contains(&"small.txt"), "Should list whole-file small.txt");
+        assert!(keys.contains(&"tiny.txt"), "Should list whole-file tiny.txt");
+        assert!(keys.contains(&"large-video.mp4"), "Should list chunked large-video.mp4");
+        assert_eq!(objects.len(), 3, "Should return 3 items total (2 whole + 1 chunked)");
+
+        // Prefix filter should also match chunked files
+        let filtered = db.list_objects("test", Some("large"), 100).unwrap();
+        assert_eq!(filtered.len(), 1, "Prefix 'large' should match chunked file");
+        assert_eq!(filtered[0].key, "large-video.mp4");
+    }
+
+    #[test]
     fn test_count_and_size() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
