@@ -95,6 +95,12 @@ async fn webdav_handler(
     }
 }
 
+/// Detect whether a path refers to a directory.
+/// Preserves the original path (not trimmed) so trailing-slash info is available.
+fn is_directory_request(original_path: &str, bucket: &str, key: &str) -> bool {
+    key.is_empty() || original_path.ends_with('/') || key.ends_with('/')
+}
+
 /// WebDAV root GET — returns an HTML index page for browsers
 async fn handle_root_get(state: &WebDAVState) -> Response {
     match state.engine.list_all_buckets().await {
@@ -235,18 +241,19 @@ async fn handle_mkcol(state: &WebDAVState, path: &str) -> Response {
 
 /// WebDAV GET — download object or list directory with Range support
 async fn handle_get(state: &WebDAVState, path: &str, method: Method, headers: Option<&axum::http::HeaderMap>) -> Response {
-    let path = path.trim_end_matches('/');
-    if path.is_empty() {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
         return handle_root_get(state).await;
     }
 
-    let parts: Vec<&str> = path.splitn(2, '/').collect();
+    let parts: Vec<&str> = trimmed.splitn(2, '/').collect();
     let bucket = parts[0];
     let key = parts.get(1).copied().unwrap_or("");
 
-    // Detect directory request (no key → show directory listing)
-    if key.is_empty() || key.ends_with('/') {
-        return handle_directory_listing(state, bucket, method).await;
+    // Detect directory request (key empty or path ends with /)
+    if key.is_empty() || path.ends_with('/') {
+        let prefix = if key.is_empty() { None } else { Some(key.to_string() + "/") };
+        return handle_directory_listing(state, bucket, method, prefix.as_deref()).await;
     }
 
     // Get object info first for size and content type
@@ -315,8 +322,8 @@ async fn handle_get(state: &WebDAVState, path: &str, method: Method, headers: Op
         .unwrap()
 }
 
-/// WebDAV directory listing — show files in a bucket as HTML
-async fn handle_directory_listing(state: &WebDAVState, bucket: &str, method: Method) -> Response {
+/// WebDAV directory listing — show files in a bucket (or subdirectory) as HTML
+async fn handle_directory_listing(state: &WebDAVState, bucket: &str, method: Method, prefix: Option<&str>) -> Response {
     if method == Method::HEAD {
         return Response::builder()
             .header("Content-Type", "text/html; charset=utf-8")
@@ -324,7 +331,8 @@ async fn handle_directory_listing(state: &WebDAVState, bucket: &str, method: Met
             .unwrap();
     }
 
-    match state.engine.list_objects(bucket, None, 1000).await {
+    // If prefix is set, only list objects with that prefix (subdirectory navigation)
+    match state.engine.list_objects(bucket, prefix, 1000).await {
         Ok(objects) => {
             let mut html = format!(r#"<!DOCTYPE html>
 <html lang="en">
