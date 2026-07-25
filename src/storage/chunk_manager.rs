@@ -6,7 +6,6 @@ pub struct Chunk {
     pub index: u32,
     pub data: Vec<u8>,
     pub checksum: String,
-    pub is_parity: bool,
 }
 
 /// Split data into fixed-size chunks with checksums
@@ -24,7 +23,6 @@ pub fn split(data: &[u8], chunk_size: usize) -> Vec<Chunk> {
             index,
             data: chunk_data,
             checksum,
-            is_parity: false,
         });
 
         offset = end;
@@ -63,7 +61,7 @@ mod tests {
         let chunks = split(data, 32 * 1024 * 1024);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].index, 0);
-        assert!(!chunks[0].is_parity);
+
         assert_eq!(chunks[0].data, data);
         assert!(verify_chunk(&chunks[0]));
     }

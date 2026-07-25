@@ -1,24 +1,15 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use sha2::{Digest, Sha256};
 use chrono::Utc;
-use futures::future::join_all;
-
 
 use crate::config::Config;
 
 use super::backends::StorageBackend;
 use super::metadata::{MetadataDb, BucketRecord};
 use super::chunk_manager;
-use super::erasure;
-use super::placement;
 
 /// Chunk size: 32 MB
 const CHUNK_SIZE: usize = 32 * 1024 * 1024;
-/// Erasure coding: 5 data + 2 parity = 7 chunks per stripe
-const DATA_CHUNKS: usize = 5;
-const PARITY_CHUNKS: usize = 2;
-const STRIPE_TOTAL: usize = DATA_CHUNKS + PARITY_CHUNKS;
 
 /// Object metadata returned by head_object
 #[derive(Debug, Clone)]
@@ -57,7 +48,6 @@ pub struct StorageEngine {
 
 impl StorageEngine {
     pub fn new(cfg: &Config, meta: MetadataDb) -> anyhow::Result<Self> {
-        // Build backend handles from config accounts
         let mut handles = Vec::new();
         for acct in &cfg.storage.accounts {
             let backend: Box<dyn StorageBackend> = match acct.backend_type.as_deref() {
@@ -80,7 +70,6 @@ impl StorageEngine {
         })
     }
 
-    /// Put an object into the storage
     pub async fn put_object(
         &self,
         bucket: &str,
@@ -90,7 +79,6 @@ impl StorageEngine {
         self.put_object_with_content_type(bucket, key, data, None).await
     }
 
-    /// Put an object with explicit content type
     pub async fn put_object_with_content_type(
         &self,
         bucket: &str,
@@ -98,25 +86,18 @@ impl StorageEngine {
         data: &[u8],
         content_type: Option<&str>,
     ) -> anyhow::Result<ObjectInfo> {
-        // Ensure bucket exists
         self.ensure_bucket(bucket)?;
 
-        // Compute ETag (SHA256 of content)
         let etag = hex::encode(Sha256::digest(data));
-
         let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
-        // Decide: chunked for files > 32MB, whole-file for small files
         if data.len() <= CHUNK_SIZE {
-            // Small file: store as whole file (backward compat)
             return self.put_whole_file(bucket, key, data, content_type, &etag, &now).await;
         }
 
-        // Large file: chunk + erasure code + upload to multiple accounts
         self.put_chunked_file(bucket, key, data, content_type, &etag, &now).await
     }
 
-    /// Store a small file as a whole object on a single backend
     pub async fn put_whole_file(
         &self,
         bucket: &str,
@@ -151,185 +132,7 @@ impl StorageEngine {
         })
     }
 
-    /// Stream a large file: process chunks as they arrive from the stream.
-    /// Never buffers more than the current stripe in RAM.
-    pub async fn put_chunked_file_stream(
-        &self,
-        bucket: &str,
-        key: &str,
-        content_type: Option<&str>,
-        etag: &str,
-        now: &str,
-        data_stream: impl futures::stream::Stream<Item = Result<bytes::Bytes, anyhow::Error>> + Send + 'static,
-    ) -> anyhow::Result<ObjectInfo> {
-        use futures::stream::StreamExt;
-        use tokio::sync::Semaphore;
-        
-        let backends = &*self.backends;
-        if backends.is_empty() {
-            anyhow::bail!("No storage backends configured");
-        }
-
-        let accounts: Vec<String> = backends.iter().map(|b| b.label.clone()).collect();
-        let mut total_size: i64 = 0;
-        let mut current_stripe: Vec<u8> = Vec::new();
-        let mut stripe_index: u32 = 0;
-        let mut results: Vec<(u32, String, Vec<u8>, String, bool, String, String, String)> = Vec::new();
-        
-        // Limit concurrent uploads to avoid overwhelming pCloud
-        let upload_permits = std::sync::Arc::new(Semaphore::new(7));
-
-        // Process the stream
-        let mut current_chunk: Vec<u8> = Vec::new();
-        
-        tokio::pin!(data_stream);
-        
-        while let Some(chunk) = data_stream.next().await {
-            let chunk = chunk?;
-            total_size += chunk.len() as i64;
-            
-            // Accumulate chunk data
-            current_chunk.extend_from_slice(&chunk);
-            
-            // When we have DATA_CHUNKS * CHUNK_SIZE bytes, process a stripe
-            while current_chunk.len() >= DATA_CHUNKS * CHUNK_SIZE {
-                let mut stripe_data: Vec<chunk_manager::Chunk> = Vec::new();
-                for _ in 0..DATA_CHUNKS {
-                    let chunk_bytes: Vec<u8> = current_chunk.drain(..CHUNK_SIZE).collect();
-                    let checksum = hex::encode(sha2::Sha256::digest(&chunk_bytes));
-                    stripe_data.push(chunk_manager::Chunk {
-                        index: stripe_index,
-                        data: chunk_bytes,
-                        checksum,
-                        is_parity: false,
-                    });
-                    stripe_index += 1;
-                }
-                
-                // Erasure-code the stripe
-                if stripe_data.len() == DATA_CHUNKS {
-                    let encoded = erasure::encode(&stripe_data);
-                    // Upload each chunk in the stripe
-                    let permit = upload_permits.clone().acquire_owned().await?;
-                    let backends_ref = &*self.backends;
-                    let accounts_ref = &accounts;
-                    
-                    for (local_idx, chunk_obj) in encoded.iter().enumerate() {
-                        let global_idx = stripe_index + local_idx as u32;
-                        let assignment = placement::get_account_for_chunk(accounts_ref, global_idx);
-                        if let Some(backend) = backends_ref.iter().find(|b| b.label == assignment) {
-                            let chunk_path = format!("{}/{}/{}.ck.{}", backend.mount_prefix, bucket, key, global_idx);
-                            let chunk_data = chunk_obj.data.clone();
-                            let chk_checksum = chunk_obj.checksum.clone();
-                            let is_parity = chunk_obj.is_parity;
-                            let local_bucket = bucket.to_string();
-                            let local_key = key.to_string();
-                            let local_label = backend.label.clone();
-                            let local_path = chunk_path.clone();
-                            
-                            // Upload to pCloud
-                            match backend.backend.upload(&local_path, &chunk_data).await {
-                                Ok((actual_path, _)) => {
-                                    results.push((global_idx, actual_path, chunk_data, chk_checksum, is_parity, local_bucket, local_key, local_label));
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to upload chunk {}: {}", global_idx, e);
-                                }
-                            }
-                        }
-                    }
-                    drop(permit);
-                }
-            }
-        }
-
-        // Handle remaining data (partial last stripe)
-        if !current_chunk.is_empty() {
-            let mut stripe_data: Vec<chunk_manager::Chunk> = Vec::new();
-            let start_idx = stripe_index;
-            let chunk_bytes = std::mem::take(&mut current_chunk);
-            let checksum = hex::encode(sha2::Sha256::digest(&chunk_bytes));
-            stripe_data.push(chunk_manager::Chunk {
-                index: start_idx,
-                data: chunk_bytes,
-                checksum,
-                is_parity: false,
-            });
-            stripe_index += 1;
-            
-            // Pad to DATA_CHUNKS
-            while stripe_data.len() < DATA_CHUNKS {
-                stripe_data.push(chunk_manager::Chunk {
-                    index: stripe_index,
-                    data: Vec::new(),
-                    checksum: String::new(),
-                    is_parity: false,
-                });
-                stripe_index += 1;
-            }
-            
-            let encoded = erasure::encode(&stripe_data);
-            for (local_idx, chunk_obj) in encoded.iter().enumerate() {
-                let global_idx = results.len() as u32 + local_idx as u32;
-                let assignment = placement::get_account_for_chunk(&accounts, global_idx);
-                if let Some(backend) = backends.iter().find(|b| b.label == assignment) {
-                    let chunk_path = format!("{}/{}/{}.ck.{}", backend.mount_prefix, bucket, key, global_idx);
-                    let chunk_data = chunk_obj.data.clone();
-                    let chk_checksum = chunk_obj.checksum.clone();
-                    let is_parity = chunk_obj.is_parity;
-                    let local_bucket = bucket.to_string();
-                    let local_key = key.to_string();
-                    let local_label = backend.label.clone();
-                    let local_path = chunk_path.clone();
-                    
-                    match backend.backend.upload(&local_path, &chunk_data).await {
-                        Ok((actual_path, _)) => {
-                            results.push((global_idx, actual_path, chunk_data, chk_checksum, is_parity, local_bucket, local_key, local_label));
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to upload chunk {}: {}", global_idx, e);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Register in metadata
-        let final_etag = if total_size == 0 {
-            "empty".to_string() 
-        } else {
-            etag.to_string()
-        };
-        
-        self.meta.with_conn(|conn| -> anyhow::Result<()> {
-            conn.execute(
-                "INSERT OR REPLACE INTO files (bucket_name, key, size, etag, last_modified, content_type, storage_type)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'chunked')",
-                rusqlite::params![bucket, key, total_size, &final_etag, now, content_type],
-            )?;
-            
-            for (gi, path, _chk_data, chk_checksum, is_p, ref bk, ref ky, ref acct) in &results {
-                conn.execute(
-                    "INSERT OR REPLACE INTO chunks (bucket_name, key, chunk_index, size, checksum, is_parity, account_email, remote_path)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    rusqlite::params![bk, ky, *gi as i32, 0i64, chk_checksum, if *is_p { 1 } else { 0 }, acct, path],
-                )?;
-            }
-            Ok(())
-        })?;
-
-        Ok(ObjectInfo {
-            key: key.to_string(),
-            size: total_size,
-            etag: final_etag,
-            last_modified: now.to_string(),
-            content_type: content_type.map(|s| s.to_string()),
-            account_email: accounts[0].clone(),
-            remote_path: format!("chunked://{}/{}", bucket, key),
-        })
-    }
-
-    /// Store a large file as chunks across multiple backends with erasure coding
+    /// Store a large file as chunks distributed round-robin across backends (no erasure coding).
     pub async fn put_chunked_file(
         &self,
         bucket: &str,
@@ -344,66 +147,37 @@ impl StorageEngine {
             anyhow::bail!("No storage backends configured");
         }
 
-        let accounts: Vec<String> = backends.iter().map(|b| b.label.clone()).collect();
-
         // Step 1: Split into 32MB chunks
         let data_chunks = chunk_manager::split(data, CHUNK_SIZE);
 
-        // Step 2: Erasure code in stripes of DATA_CHUNKS
-        let padded_count = ((data_chunks.len() + DATA_CHUNKS - 1) / DATA_CHUNKS) * DATA_CHUNKS;
-        let mut all_encoded: Vec<chunk_manager::Chunk> = Vec::new();
-
-        for stripe_start in (0..padded_count).step_by(DATA_CHUNKS) {
-            let mut stripe_data: Vec<chunk_manager::Chunk> = Vec::new();
-            for i in stripe_start..stripe_start + DATA_CHUNKS {
-                if i < data_chunks.len() {
-                    stripe_data.push(data_chunks[i].clone());
-                } else {
-                    stripe_data.push(chunk_manager::Chunk {
-                        index: i as u32,
-                        data: Vec::new(),
-                        checksum: String::new(),
-                        is_parity: false,
-                    });
-                }
-            }
-            let encoded = erasure::encode(&stripe_data);
-            all_encoded.extend(encoded);
+        // Step 2: Upload each chunk to a backend via round-robin
+        #[derive(Debug)]
+        struct ChunkUploadResult {
+            global_index: u32,
+            remote_path: String,
+            checksum: String,
+            size: i64,
+            bucket: String,
+            key: String,
+            account: String,
         }
 
-        // Step 3: Collect upload targets (owned data)
-        let mut upload_targets: Vec<(u32, Vec<u8>, String, bool, String, String, String, String, usize)> = Vec::new();
-        for (global_idx, chunk) in all_encoded.iter().enumerate() {
-            let assignment = placement::get_account_for_chunk(&accounts, global_idx as u32);
-            let bi = backends.iter().position(|b| b.label == assignment).unwrap_or(0);
-            let chunk_path = format!("{}/{}/{}.ck.{}", backends[bi].mount_prefix, bucket, key, global_idx);
-            upload_targets.push((
-                global_idx as u32,
-                chunk.data.clone(),
-                chunk.checksum.clone(),
-                chunk.is_parity,
-                chunk_path,
-                bucket.to_string(),
-                key.to_string(),
-                backends[bi].label.clone(),
-                bi,
-            ));
-        }
-
-        // Upload sequentially (simplified v1 — parallel is future optimization)
         let mut results = Vec::new();
-        for (global_idx, chunk_data, checksum, is_parity, chunk_path, ref local_bucket, ref local_key, ref local_label, bi) in &upload_targets {
-            match backends[*bi].backend.upload(chunk_path, chunk_data).await {
+        for (local_idx, chunk) in data_chunks.iter().enumerate() {
+            let global_idx = local_idx as u32;
+            let bi = global_idx as usize % backends.len();
+            let chunk_path = format!("{}/{}/{}.ck.{}", backends[bi].mount_prefix, bucket, key, global_idx);
+
+            match backends[bi].backend.upload(&chunk_path, &chunk.data).await {
                 Ok((actual_path, _)) => {
                     results.push(ChunkUploadResult {
-                        global_index: *global_idx,
+                        global_index: global_idx,
                         remote_path: actual_path,
-                        checksum: checksum.clone(),
-                        is_parity: *is_parity,
-                        size: chunk_data.len() as i64,
-                        bucket: local_bucket.clone(),
-                        key: local_key.clone(),
-                        account: local_label.clone(),
+                        checksum: chunk.checksum.clone(),
+                        size: chunk.data.len() as i64,
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        account: backends[bi].label.clone(),
                     });
                 }
                 Err(e) => {
@@ -412,34 +186,19 @@ impl StorageEngine {
             }
         }
 
-        #[derive(Debug)]
-        struct ChunkUploadResult {
-            global_index: u32,
-            remote_path: String,
-            checksum: String,
-            is_parity: bool,
-            size: i64,
-            bucket: String,
-            key: String,
-            account: String,
-        }
-
-        let results: Vec<ChunkUploadResult> = results;
-
-        // Step 4: Register file and chunks in metadata
+        // Step 3: Register file and chunks in metadata
         self.meta.with_conn(|conn| -> anyhow::Result<()> {
             conn.execute(
                 "INSERT OR REPLACE INTO files (bucket_name, key, size, etag, last_modified, content_type, storage_type)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'chunked')",
                 rusqlite::params![bucket, key, data.len() as i64, etag, now, content_type],
             )?;
-            
+
             for r in &results {
                 conn.execute(
                     "INSERT OR REPLACE INTO chunks (bucket_name, key, chunk_index, size, checksum, is_parity, account_email, remote_path)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    rusqlite::params![r.bucket, r.key, r.global_index as i32, r.size, r.checksum, 
-                        if r.is_parity { 1 } else { 0 }, r.account, r.remote_path],
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
+                    rusqlite::params![r.bucket, r.key, r.global_index as i32, r.size, r.checksum, r.account, r.remote_path],
                 )?;
             }
             Ok(())
@@ -451,14 +210,12 @@ impl StorageEngine {
             etag: etag.to_string(),
             last_modified: now.to_string(),
             content_type: content_type.map(|s| s.to_string()),
-            account_email: accounts[0].clone(),
+            account_email: backends[0].label.clone(),
             remote_path: format!("chunked://{}/{}", bucket, key),
         })
     }
 
-    /// Get an object's data (supports both whole-file and chunked)
     pub async fn get_object(&self, bucket: &str, key: &str) -> anyhow::Result<Vec<u8>> {
-        // Check if this is a chunked file
         let storage_type: Option<String> = self.meta.with_conn(|conn| {
             let mut stmt = conn.prepare("SELECT storage_type FROM files WHERE bucket_name = ?1 AND key = ?2")?;
             let mut rows = stmt.query(rusqlite::params![bucket, key])?;
@@ -472,7 +229,6 @@ impl StorageEngine {
         match storage_type.as_deref() {
             Some("chunked") => self.get_chunked_file(bucket, key).await,
             _ => {
-                // Legacy whole-file path
                 let obj = self
                     .meta
                     .get_object(bucket, key)?
@@ -484,24 +240,22 @@ impl StorageEngine {
         }
     }
 
-    /// Get a chunked file: download chunks in parallel and reconstruct
+    /// Get a chunked file: download chunks in parallel and assemble (no erasure decode needed).
     async fn get_chunked_file(&self, bucket: &str, key: &str) -> anyhow::Result<Vec<u8>> {
         let backends = &*self.backends;
 
-        // Get all chunks from metadata
         #[derive(Debug)]
         struct ChunkInfo {
             index: i32,
             _size: i64,
             checksum: String,
-            is_parity: bool,
             account_email: String,
             remote_path: String,
         }
 
         let chunks_info: Vec<ChunkInfo> = self.meta.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT chunk_index, size, checksum, is_parity, account_email, remote_path
+                "SELECT chunk_index, size, checksum, account_email, remote_path
                  FROM chunks WHERE bucket_name = ?1 AND key = ?2 ORDER BY chunk_index"
             )?;
             let rows = stmt.query_map(rusqlite::params![bucket, key], |row| {
@@ -509,9 +263,8 @@ impl StorageEngine {
                     index: row.get(0)?,
                     _size: row.get(1)?,
                     checksum: row.get(2)?,
-                    is_parity: row.get::<_, i32>(3)? != 0,
-                    account_email: row.get(4)?,
-                    remote_path: row.get(5)?,
+                    account_email: row.get(3)?,
+                    remote_path: row.get(4)?,
                 })
             })?;
             let mut infos = Vec::new();
@@ -532,8 +285,7 @@ impl StorageEngine {
                 } else {
                     ci.remote_path.clone()
                 };
-                let path = owned_path;
-                download_handles.push(async move { backend.backend.download(&path).await });
+                download_handles.push(async move { backend.backend.download(&owned_path).await });
             }
         }
 
@@ -547,7 +299,7 @@ impl StorageEngine {
             anyhow::bail!("Failed to download any chunks for {}/{}", bucket, key);
         }
 
-        // Build chunk objects from what we downloaded
+        // Build chunks in order and assemble (no erasure decoding)
         let mut chunk_objects = Vec::new();
         for (i, data) in downloaded.iter().enumerate() {
             if i < chunks_info.len() {
@@ -555,21 +307,13 @@ impl StorageEngine {
                     index: chunks_info[i].index as u32,
                     data: data.clone(),
                     checksum: chunks_info[i].checksum.clone(),
-                    is_parity: chunks_info[i].is_parity,
                 });
             }
         }
 
-        // Verify we can reconstruct
-        if !erasure::can_reconstruct(&chunk_objects, DATA_CHUNKS) {
-            anyhow::bail!("Not enough chunks to reconstruct {}/{}", bucket, key);
-        }
+        let result = chunk_manager::assemble(&chunk_objects);
 
-        // Decode erasure coding
-        let data_chunks = erasure::decode(&chunk_objects, DATA_CHUNKS)?;
-        let mut result = chunk_manager::assemble(&data_chunks);
-
-        // Truncate to original file size (removes padding from erasure coding)
+        // Truncate to original file size
         let original_size: i64 = self.meta.with_conn(|conn| {
             let mut stmt = conn.prepare("SELECT size FROM files WHERE bucket_name = ?1 AND key = ?2")?;
             let mut rows = stmt.query(rusqlite::params![bucket, key])?;
@@ -580,14 +324,12 @@ impl StorageEngine {
             }
         })?;
 
+        let mut result = result;
         result.truncate(original_size as usize);
         Ok(result)
     }
 
-    /// Head an object (get metadata without data)
-    /// Supports both whole-file (objects table) and chunked (files table)
     pub async fn head_object(&self, bucket: &str, key: &str) -> anyhow::Result<ObjectInfo> {
-        // First check files table for chunked objects
         let chunked_meta: Option<(i64, String, String, Option<String>)> = self.meta.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT size, etag, last_modified, content_type FROM files WHERE bucket_name = ?1 AND key = ?2 AND storage_type = 'chunked'"
@@ -617,7 +359,6 @@ impl StorageEngine {
             });
         }
 
-        // Fall back to legacy whole-file objects table
         let obj = self
             .meta
             .get_object(bucket, key)?
@@ -633,7 +374,6 @@ impl StorageEngine {
         })
     }
 
-    /// Delete an object
     pub async fn delete_object(&self, bucket: &str, key: &str) -> anyhow::Result<()> {
         let obj = self
             .meta
@@ -646,7 +386,6 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// List objects in a bucket with optional prefix filter
     pub async fn list_objects(
         &self,
         bucket: &str,
@@ -694,14 +433,12 @@ impl StorageEngine {
         self.meta.list_buckets()
     }
 
-    /// Get shard status for all backends
     pub async fn shard_status(&self) -> anyhow::Result<Vec<ShardStatus>> {
         let mut statuses = Vec::new();
         for handle in self.backends.iter() {
             let obj_count = self.meta.count_objects_for_account(&handle.label)?;
             let total_size = self.meta.account_total_size(&handle.label)?;
             let quota = handle.quota_gb as i64 * 1_073_741_824;
-            // Also try to get live quota from backend
             if let Ok((used, total)) = handle.backend.check_quota().await {
                 statuses.push(ShardStatus {
                     email: handle.label.clone(),

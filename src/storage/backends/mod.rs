@@ -36,7 +36,7 @@ pub trait StorageBackend: Send + Sync {
     /// Returns `None` if the backend doesn't support server-side copy.
     /// `source_path` is the backend's remote path to copy FROM.
     /// Returns the destination remote path on success.
-    async fn server_side_copy(&self, source_path: &str, dest_path: &str) -> anyhow::Result<Option<String>> {
+    async fn server_side_copy(&self, _source_path: &str, _dest_path: &str) -> anyhow::Result<Option<String>> {
         // Default: not supported
         Ok(None)
     }

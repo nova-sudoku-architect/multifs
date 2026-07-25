@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::DefaultBodyLimit,
-    extract::Request as AxumRequest,
     body::Body,
     extract::{Path, State},
     http::{Method, StatusCode},
@@ -10,6 +8,7 @@ use axum::{
     routing::any,
     Router,
 };
+use axum::extract::DefaultBodyLimit;
 use bytes::Bytes;
 use hyper::header;
 use tower_http::cors::CorsLayer;
@@ -30,6 +29,7 @@ pub fn build_router(engine: Arc<StorageEngine>) -> Router {
         .route("/", any(webdav_root_handler))
         .route("/{*path}", any(webdav_handler))
         .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(2_147_483_648))
         .with_state(state)
 }
 
@@ -38,7 +38,7 @@ pub fn build_router(engine: Arc<StorageEngine>) -> Router {
 async fn webdav_root_handler(
     State(state): State<WebDAVState>,
     method: Method,
-    body: Bytes,
+    _body: Bytes,
 ) -> Response {
     tracing::debug!("WebDAV root {} /", method);
     let method_str = method.as_str();
@@ -235,21 +235,19 @@ async fn handle_mkcol(state: &WebDAVState, path: &str) -> Response {
 
 /// WebDAV GET — download object or list directory with Range support
 async fn handle_get(state: &WebDAVState, path: &str, method: Method, headers: Option<&axum::http::HeaderMap>) -> Response {
-    let parts: Vec<&str> = path.splitn(2, '/').collect();
-    if parts.len() < 2 || parts[1].is_empty() {
-        return StatusCode::NOT_FOUND.into_response();
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        return handle_root_get(state).await;
     }
 
+    let parts: Vec<&str> = path.splitn(2, '/').collect();
     let bucket = parts[0];
-    let key = parts[1];
+    let key = parts.get(1).copied().unwrap_or("");
 
-    // Detect directory request (no key or ends with / — show directory listing)
+    // Detect directory request (no key → show directory listing)
     if key.is_empty() || key.ends_with('/') {
         return handle_directory_listing(state, bucket, method).await;
     }
-
-    let bucket = parts[0];
-    let key = parts[1];
 
     // Get object info first for size and content type
     let info = match state.engine.head_object(bucket, key).await {

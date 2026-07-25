@@ -10,7 +10,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get, Router,
 };
-use bytes::Bytes;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
@@ -409,17 +408,15 @@ async fn put_object(
             };
             state.engine.put_object_with_content_type(&bucket, &key, &full_body, content_type.as_deref()).await
         } else {
-            // Large file (>32 MB): use streaming path
-            let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-            let etag = format!("streaming-{}", now);
-            
-            // Convert axum Body to a stream
-            use futures::stream::StreamExt;
-            let stream = body.into_data_stream().map(|r| r.map_err(|e| anyhow::anyhow!("Stream error: {}", e)));
-            
-            state.engine.put_chunked_file_stream(
-                &bucket, &key, content_type.as_deref(), &etag, &now, stream
-            ).await
+            // Large file (>32 MB): buffer the full body and use chunked storage
+            let full_body = match axum::body::to_bytes(body, len as usize).await {
+                Ok(b) => b,
+                Err(e) => {
+                    let xml = s3_error_xml("InternalError", &format!("Failed to buffer body: {}", e), &format!("{}/{}", bucket, key));
+                    return Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
+                }
+            };
+            state.engine.put_object_with_content_type(&bucket, &key, &full_body, content_type.as_deref()).await
         }
     } else {
         // No Content-Length: buffer entirely (handles chunked transfer encoding) up to 2GB

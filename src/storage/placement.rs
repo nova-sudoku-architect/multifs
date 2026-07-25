@@ -1,6 +1,6 @@
 /// Placement Strategy: Round-robin across available pCloud accounts.
 ///
-/// For 5+2 erasure (7 chunks per stripe) across 6 accounts, accounts wrap around:
+/// For 7 chunks across 6 accounts, accounts wrap around:
 ///   chunk 0 → account[0]
 ///   chunk 1 → account[1]
 ///   ...

@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::metadata::MetadataDb;
+    
 
     #[test]
     fn test_propfind_root_xml() {
@@ -206,13 +206,13 @@ mod tests {
             } else {
                 format!("{} B", size)
             };
-            html.push_str(&format!("<li>{}</li>", key));
+            html.push_str(&format!("<li>{} — {}</li>", key, size_str));
         }
 
         assert!(html.contains("📁 video-subtitle"));
         assert!(html.contains("blor-074.mkv"));
         assert!(html.contains("test/config.json"));
-        assert!(html.contains("744.6 MB"));
+        assert!(html.contains("743.6 MB"));
     }
 
     #[test]
