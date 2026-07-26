@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use chrono::Utc;
@@ -40,6 +41,7 @@ struct BackendHandle {
 pub struct StorageEngine {
     meta: MetadataDb,
     backends: Arc<Vec<BackendHandle>>,
+    next_whole_file_idx: Arc<AtomicUsize>,
 }
 
 impl StorageEngine {
@@ -63,6 +65,7 @@ impl StorageEngine {
         Ok(Self {
             meta,
             backends: Arc::new(handles),
+            next_whole_file_idx: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -104,7 +107,8 @@ impl StorageEngine {
         if backends.is_empty() {
             anyhow::bail!("No storage backends configured");
         }
-        let backend = &backends[0];
+        let idx = self.next_whole_file_idx.fetch_add(1, Ordering::Relaxed) % backends.len();
+        let backend = &backends[idx];
         let remote_path = format!("{}/{}/{}", backend.mount_prefix, bucket, key);
         let (remote_path_actual, _) = backend.backend.upload(&remote_path, data).await?;
         self.meta.put_object(
