@@ -45,9 +45,54 @@ pub async fn run(args: ShardArgs) -> Result<()> {
             }
         }
         ShardSubcommand::Rebalance => {
-            println!("Starting rebalance...");
-            // TODO: implement object migration between accounts
-            println!("✅ Rebalance complete.");
+            println!("Analyzing object distribution...");
+            // Show current distribution with fill percentage for each account
+            let statuses = engine.shard_status().await?;
+            println!("");
+            println!("{:<30} {:<15} {:<15} {:<15}", "Email", "Objects", "Used", "Fill");
+            println!("{:-<30} {:-<15} {:-<15} {:-<15}", "", "", "", "");
+            for s in &statuses {
+                let used_str = if s.used_bytes > 1_073_741_824 {
+                    format!("{:.1} GiB", s.used_bytes as f64 / 1_073_741_824.0)
+                } else {
+                    format!("{:.1} MiB", s.used_bytes as f64 / 1_048_576.0)
+                };
+                let fill_pct = if s.total_bytes > 0 {
+                    s.used_bytes as f64 / s.total_bytes as f64 * 100.0
+                } else {
+                    0.0
+                };
+                println!("{:<30} {:<15} {:<15} {:.1}%",
+                    s.email, s.object_count, used_str, fill_pct);
+            }
+
+            // Check for clear imbalance
+            let fills: Vec<f64> = statuses.iter()
+                .filter(|s| s.total_bytes > 0)
+                .map(|s| s.used_bytes as f64 / s.total_bytes as f64)
+                .collect();
+
+            if fills.len() >= 2 {
+                let max_fill = fills.iter().cloned().fold(0.0_f64, f64::max);
+                let min_fill = fills.iter().cloned().fold(1.0_f64, f64::min);
+                let ratio = if min_fill > 0.0 { max_fill / min_fill } else { 999.0 };
+
+                if ratio > 1.5 {
+                    println!("");
+                    println!("⚠️  Distribution imbalance detected: fill ratio {:.1}x between most and least full accounts.", ratio);
+                    println!("   Object migration between accounts is not yet automated.");
+                    println!("   New uploads use round-robin placement across all accounts.");
+                } else {
+                    println!("");
+                    println!("✅ Distribution is balanced (fill ratio {:.2}x).", ratio);
+                    println!("   Round-robin placement is working as expected for new uploads.");
+                }
+            }
+            println!("");
+            println!("ℹ️  To migrate objects between accounts manually:");
+            println!("   1. Download: multifs object cp multifs://<bucket>/<key> /tmp/<file>");
+            println!("   2. Upload:   multifs object cp /tmp/<file> multifs://<bucket>/<key>");
+            println!("   3. Cleanup:  multifs object rm multifs://<bucket>/<key>");
         }
     }
 

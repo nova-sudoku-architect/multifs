@@ -37,6 +37,9 @@ pub async fn run(args: BucketArgs) -> Result<()> {
     let cfg = crate::config::load(&cfg_path)?;
     let meta = crate::storage::metadata::MetadataDb::open(&cfg.storage.meta_db_path)?;
 
+    // Engine is needed for operations that interact with backends (delete, info)
+    let engine = crate::storage::engine::StorageEngine::new(&cfg, meta.clone())?;
+
     match args.command {
         BucketSubcommand::List => {
             let buckets = meta.list_buckets()?;
@@ -79,8 +82,7 @@ pub async fn run(args: BucketArgs) -> Result<()> {
                 );
             }
             if force {
-                // TODO: also delete objects from pCloud
-                meta.delete_all_objects(&name)?;
+                engine.delete_bucket(&name).await?;
             }
             meta.delete_bucket(&name)?;
             println!("✅ Deleted bucket: {}", name);
