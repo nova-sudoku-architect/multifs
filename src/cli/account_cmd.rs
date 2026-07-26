@@ -36,6 +36,23 @@ pub enum AccountSubcommand {
     },
 }
 
+/// Generate the environment variable name for a pCloud token.
+/// Example: "nova-video@agentmail.to" → "PCLOUD_TOKEN_NOVA_VIDEO_AT_AGENTMAIL_TO"
+pub fn token_env_name(email: &str) -> String {
+    let suffix = email
+        .to_uppercase()
+        .replace('@', "_AT_")
+        .replace('.', "_")
+        .replace('-', "_");
+    format!("PCLOUD_TOKEN_{}", suffix)
+}
+
+/// Generate a mount prefix for the n-th account.
+/// Example: index 0 → "/multifs/00", index 5 → "/multifs/05"
+pub fn mount_prefix_for_index(index: usize) -> String {
+    format!("/multifs/{:02}", index)
+}
+
 pub async fn run(args: AccountArgs) -> Result<()> {
     match args.command {
         AccountSubcommand::List => {
@@ -96,15 +113,10 @@ pub async fn run(args: AccountArgs) -> Result<()> {
                 let cfg = crate::config::load(&cfg_path)?;
                 cfg.storage.accounts.len()
             };
-            let mount_prefix = format!("/multifs/{:02}", existing_count);
+            let mount_prefix = mount_prefix_for_index(existing_count);
 
             // 3. Generate token env name
-            let env_suffix = email
-                .to_uppercase()
-                .replace('@', "_AT_")
-                .replace('.', "_")
-                .replace('-', "_");
-            let token_env = format!("PCLOUD_TOKEN_{}", env_suffix);
+            let token_env = token_env_name(&email);
 
             println!("Mount prefix: {}", mount_prefix);
             println!("Token env:    {}", token_env);
@@ -192,12 +204,7 @@ pub async fn run(args: AccountArgs) -> Result<()> {
 
             let new_token = crate::storage::pcloud::auth::run_oauth_flow(&email).await?;
 
-            let env_suffix = email
-                .to_uppercase()
-                .replace('@', "_AT_")
-                .replace('.', "_")
-                .replace('-', "_");
-            let token_env = format!("PCLOUD_TOKEN_{}", env_suffix);
+            let token_env = token_env_name(&email);
 
             println!("✅ Token refreshed for {}.", email);
             println!();
@@ -206,4 +213,157 @@ pub async fn run(args: AccountArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_token_env_name_simple() {
+        assert_eq!(
+            token_env_name("nova-video@agentmail.to"),
+            "PCLOUD_TOKEN_NOVA_VIDEO_AT_AGENTMAIL_TO"
+        );
+    }
+
+    #[test]
+    fn test_token_env_name_with_dots() {
+        assert_eq!(
+            token_env_name("user.name@example.com"),
+            "PCLOUD_TOKEN_USER_NAME_AT_EXAMPLE_COM"
+        );
+    }
+
+    #[test]
+    fn test_token_env_name_with_hyphens() {
+        assert_eq!(
+            token_env_name("my-account@my-domain.io"),
+            "PCLOUD_TOKEN_MY_ACCOUNT_AT_MY_DOMAIN_IO"
+        );
+    }
+
+    #[test]
+    fn test_token_env_name_all_caps_input() {
+        assert_eq!(
+            token_env_name("NOVA@EXAMPLE.COM"),
+            "PCLOUD_TOKEN_NOVA_AT_EXAMPLE_COM"
+        );
+    }
+
+    #[test]
+    fn test_mount_prefix_first() {
+        assert_eq!(mount_prefix_for_index(0), "/multifs/00");
+    }
+
+    #[test]
+    fn test_mount_prefix_second() {
+        assert_eq!(mount_prefix_for_index(1), "/multifs/01");
+    }
+
+    #[test]
+    fn test_mount_prefix_tenth() {
+        assert_eq!(mount_prefix_for_index(9), "/multifs/09");
+    }
+
+    #[test]
+    fn test_mount_prefix_large() {
+        assert_eq!(mount_prefix_for_index(99), "/multifs/99");
+    }
+
+    // ---- Config-based tests ----
+
+    fn make_test_config(dir: &tempfile::TempDir, accounts: Vec<crate::config::AccountConfig>) -> String {
+        let cfg = crate::config::Config {
+            storage: crate::config::StorageConfig {
+                accounts,
+                meta_db_path: dir.path().join("meta.db").to_string_lossy().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let path = dir.path().join("config.toml");
+        let path_str = path.to_string_lossy().to_string();
+        crate::config::save(&path_str, &cfg).unwrap();
+        path_str
+    }
+
+    fn test_account(email: &str) -> crate::config::AccountConfig {
+        crate::config::AccountConfig {
+            email: email.to_string(),
+            backend_type: Some("pcloud".to_string()),
+            token_env: Some(token_env_name(email)),
+            mount_prefix: "/mnt/test".to_string(),
+            quota_gb: Some(10),
+            token_override: None,
+        }
+    }
+
+    #[test]
+    fn test_list_empty_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = make_test_config(&dir, vec![]);
+        let cfg = crate::config::load(&cfg_path).unwrap();
+        assert!(cfg.storage.accounts.is_empty());
+    }
+
+    #[test]
+    fn test_list_with_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let accounts = vec![
+            test_account("a@example.com"),
+            test_account("b@example.com"),
+        ];
+        let cfg_path = make_test_config(&dir, accounts);
+        let cfg = crate::config::load(&cfg_path).unwrap();
+        assert_eq!(cfg.storage.accounts.len(), 2);
+        assert_eq!(cfg.storage.accounts[0].email, "a@example.com");
+        assert_eq!(cfg.storage.accounts[1].email, "b@example.com");
+    }
+
+    #[test]
+    fn test_remove_existing_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let accounts = vec![
+            test_account("keep@example.com"),
+            test_account("remove@example.com"),
+        ];
+        let cfg_path = make_test_config(&dir, accounts);
+        let mut cfg = crate::config::load(&cfg_path).unwrap();
+        let before = cfg.storage.accounts.len();
+        cfg.storage.accounts.retain(|a| a.email != "remove@example.com");
+        assert_eq!(cfg.storage.accounts.len(), before - 1);
+        assert_eq!(cfg.storage.accounts[0].email, "keep@example.com");
+    }
+
+    #[test]
+    fn test_remove_nonexistent_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let accounts = vec![test_account("only@example.com")];
+        let cfg_path = make_test_config(&dir, accounts);
+        let mut cfg = crate::config::load(&cfg_path).unwrap();
+        let before = cfg.storage.accounts.len();
+        cfg.storage.accounts.retain(|a| a.email != "notfound@example.com");
+        assert_eq!(cfg.storage.accounts.len(), before, "Should not remove anything");
+    }
+
+    #[test]
+    fn test_mount_prefix_sequence() {
+        let prefixes: Vec<String> = (0..6).map(mount_prefix_for_index).collect();
+        assert_eq!(prefixes, vec![
+            "/multifs/00",
+            "/multifs/01",
+            "/multifs/02",
+            "/multifs/03",
+            "/multifs/04",
+            "/multifs/05",
+        ]);
+    }
+
+    #[test]
+    fn test_token_env_name_idempotent() {
+        let first = token_env_name("my.Account-email@domain.com");
+        let second = token_env_name("my.Account-email@domain.com");
+        assert_eq!(first, second);
+    }
 }
