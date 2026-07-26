@@ -46,6 +46,38 @@ pub fn parse_range(range: &str, total_len: usize) -> Option<(usize, usize)> {
 /// names (with trailing /) and files are objects at the current level.
 ///
 /// Used by both S3 (CommonPrefixes) and WebDAV (folder listing).
+/// Guess content type from file extension using mime_guess.
+pub fn content_type_from_path(key: &str) -> String {
+    mime_guess::from_path(key)
+        .first_or_octet_stream()
+        .to_string()
+}
+
+/// Resolve content type for an upload, combining client-provided Content-Type
+/// header with extension-based detection. The S3 handler uses this to handle
+/// curl's default `application/x-www-form-urlencoded` that it sends with --data-binary.
+pub fn resolve_content_type(key: &str, client_ct: Option<&str>) -> Option<String> {
+    let ext_ct = mime_guess::from_path(key).first().map(|m| m.to_string());
+
+    match ext_ct {
+        Some(_) => {
+            // Use extension detection unless client overrides with something meaningful
+            match client_ct {
+                Some("application/x-www-form-urlencoded") => ext_ct,
+                Some(other) => {
+                    if other == "application/octet-stream" {
+                        ext_ct
+                    } else {
+                        Some(other.to_string())
+                    }
+                }
+                None => ext_ct,
+            }
+        }
+        None => client_ct.map(|s| s.to_string()),
+    }
+}
+
 pub fn group_objects_by_prefix<'a>(
     objects: &'a [crate::storage::engine::ObjectInfo],
     prefix: Option<&str>,

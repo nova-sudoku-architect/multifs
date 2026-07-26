@@ -267,7 +267,7 @@ async fn handle_get(state: &WebDAVState, path: &str, method: Method, headers: Op
     };
 
     let content_type = info.content_type.unwrap_or_else(||
-        mime_guess::from_path(key).first_or_octet_stream().to_string()
+        crate::server::content_type_from_path(key)
     );
     let total_len = info.size as usize;
 

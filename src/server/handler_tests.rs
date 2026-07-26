@@ -431,4 +431,63 @@ mod handler_tests {
         assert_eq!(pfx, vec!["d/"]);
         assert!(files.is_empty());
     }
+
+    // ---- content_type tests ----
+
+    #[test]
+    fn test_ct_from_path_mp4() {
+        let ct = crate::server::content_type_from_path("video.mp4");
+        assert_eq!(ct, "video/mp4");
+    }
+
+    #[test]
+    fn test_ct_from_path_html() {
+        let ct = crate::server::content_type_from_path("index.html");
+        assert!(ct.contains("html"), "Got: {}", ct);
+    }
+
+    #[test]
+    fn test_ct_from_path_no_ext() {
+        let ct = crate::server::content_type_from_path("file");
+        assert_eq!(ct, "application/octet-stream");
+    }
+
+    #[test]
+    fn test_resolve_ct_client_override() {
+        // Client explicitly sends application/json — use it
+        let ct = crate::server::resolve_content_type("file.mp4", Some("application/json"));
+        assert_eq!(ct, Some("application/json".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_ct_curl_default() {
+        // curl sends x-www-form-urlencoded by default — ignore, use extension
+        let ct = crate::server::resolve_content_type("file.mp4", Some("application/x-www-form-urlencoded"));
+        assert_eq!(ct, Some("video/mp4".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_ct_octet_stream_fallback_to_ext() {
+        // Generic octet-stream → prefer extension detection
+        let ct = crate::server::resolve_content_type("file.mp4", Some("application/octet-stream"));
+        assert_eq!(ct, Some("video/mp4".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_ct_no_client_ct() {
+        let ct = crate::server::resolve_content_type("file.mp4", None);
+        assert_eq!(ct, Some("video/mp4".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_ct_no_ext_with_client_ct() {
+        let ct = crate::server::resolve_content_type("file", Some("text/plain"));
+        assert_eq!(ct, Some("text/plain".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_ct_no_ext_no_client() {
+        let ct = crate::server::resolve_content_type("file", None);
+        assert_eq!(ct, None);
+    }
 }
