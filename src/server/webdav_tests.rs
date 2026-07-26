@@ -293,6 +293,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Requires running server at 100.100.30.59:8080 with deployed binary — not suitable for CI"]
     fn test_webdav_full_pipeline() {
         let bucket = "integration-test-int-074";
         let folder = "test-folder";
