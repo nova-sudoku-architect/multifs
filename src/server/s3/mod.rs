@@ -270,19 +270,92 @@ async fn list_objects(
     }
 
     let prefix = params.prefix.as_deref();
+    let delimiter = params.delimiter.as_deref();
     let max_keys = params.max_keys.unwrap_or(100).min(1000);
 
     match state.engine.list_objects(&bucket, prefix, max_keys).await {
         Ok(objects) => {
-            let obj_tuples: Vec<(String, i64, String, String)> = objects
-                .into_iter()
-                .map(|o| (o.key, o.size, o.etag, o.last_modified))
-                .collect();
-            let xml = s3_list_objects_xml(&bucket, prefix, &obj_tuples, false);
-            Response::builder()
-                .header("Content-Type", "application/xml")
-                .body(Body::from(xml))
-                .unwrap()
+            // If delimiter=/ is requested, group objects into CommonPrefixes
+            let has_delimiter = delimiter == Some("/");
+
+            if has_delimiter {
+                // Collect unique prefixes (directory names before first / after the given prefix)
+                let mut common_prefixes: Vec<String> = Vec::new();
+                let mut contents: Vec<(String, i64, String, String)> = Vec::new();
+
+                for obj in &objects {
+                    let relative = if let Some(p) = prefix {
+                        obj.key.strip_prefix(p).unwrap_or(&obj.key)
+                    } else {
+                        &obj.key
+                    };
+
+                    if let Some(slash_pos) = relative.find('/') {
+                        // This object belongs to a subdirectory
+                        let subdir = &relative[..slash_pos+1];
+                        let dir_name = if let Some(p) = prefix {
+                            // prefix already ends with /, so just append the subdir
+                            format!("{}{}", p, subdir)
+                        } else {
+                            format!("{}", subdir)
+                        };
+                        if !common_prefixes.contains(&dir_name) {
+                            common_prefixes.push(dir_name);
+                        }
+                    } else {
+                        // This object is at the current level (no subdirectory)
+                        contents.push((obj.key.clone(), obj.size, obj.etag.clone(), obj.last_modified.clone()));
+                    }
+                }
+
+                // Build XML response with CommonPrefixes
+                let contents_xml: String = contents
+                    .iter()
+                    .map(|(key, size, etag, modified)| {
+                        format!(
+                            "<Contents>\n    <Key>{}</Key>\n    <LastModified>{}</LastModified>\n    <ETag>&quot;{}&quot;</ETag>\n    <Size>{}</Size>\n    <StorageClass>STANDARD</StorageClass>\n</Contents>",
+                            key, modified, etag, size
+                        )
+                    })
+                    .collect();
+
+                let prefixes_xml: String = common_prefixes
+                    .iter()
+                    .map(|p| format!("<CommonPrefixes>\n    <Prefix>{}</Prefix>\n</CommonPrefixes>", p))
+                    .collect();
+
+                let xml = format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>{}</Name>
+  <Prefix>{}</Prefix>
+  <Delimiter>/</Delimiter>
+  <MaxKeys>1000</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+  {}{}
+</ListBucketResult>"#,
+                    bucket,
+                    prefix.unwrap_or(""),
+                    prefixes_xml,
+                    contents_xml
+                );
+
+                Response::builder()
+                    .header("Content-Type", "application/xml")
+                    .body(Body::from(xml))
+                    .unwrap()
+            } else {
+                // No delimiter: return flat list (original behavior)
+                let obj_tuples: Vec<(String, i64, String, String)> = objects
+                    .into_iter()
+                    .map(|o| (o.key, o.size, o.etag, o.last_modified))
+                    .collect();
+                let xml = s3_list_objects_xml(&bucket, prefix, &obj_tuples, false);
+                Response::builder()
+                    .header("Content-Type", "application/xml")
+                    .body(Body::from(xml))
+                    .unwrap()
+            }
         }
         Err(e) => {
             let xml = s3_error_xml("NoSuchBucket", &e.to_string(), &bucket);

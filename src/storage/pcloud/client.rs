@@ -190,8 +190,15 @@ impl PCloudClient {
             .ok_or_else(|| anyhow::anyhow!("No path in response"))?;
 
         let download_url = format!("https://{}{}", host, link_path);
-        let data = self.client.get(&download_url).send().await?.bytes().await?;
-        Ok(data.to_vec())
+        
+        // Stream from pCloud: read chunks sequentially and append to result
+        // This way we start returning data without waiting for the entire file.
+        let mut response = self.client.get(&download_url).send().await?;
+        let mut result_bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            result_bytes.extend_from_slice(&chunk);
+        }
+        Ok(result_bytes)
     }
 
     /// Copy a file server-side using pCloud's copyfile API

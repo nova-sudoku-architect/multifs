@@ -280,49 +280,41 @@ async fn handle_get(state: &WebDAVState, path: &str, method: Method, headers: Op
             .unwrap();
     }
 
-    // Download full content
-    let data = match state.engine.get_object(bucket, key).await {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!("WebDAV GET error: {}", e);
-            return StatusCode::NOT_FOUND.into_response();
+    // Streaming: pipe pCloud chunks directly to response body using channel.
+    // Client receives first bytes as soon as they arrive from pCloud.
+    use tokio::sync::mpsc;
+    use bytes::Bytes;
+    use futures::stream::StreamExt;
+
+    let (tx, rx) = mpsc::channel::<Result<Bytes, anyhow::Error>>(16);
+    let engine_clone = state.engine.clone();
+    let b = bucket.to_string();
+    let k = key.to_string();
+
+    tokio::task::spawn(async move {
+        if let Err(e) = engine_clone.get_object_stream(&b, &k, tx).await {
+            tracing::error!("Stream error: {}", e);
         }
-    };
+    });
 
-    // Check for Range header
-    if let Some(hdrs) = headers {
-        if let Some(range_val) = hdrs.get(http::header::RANGE) {
-            if let Ok(range_str) = range_val.to_str() {
-                if let Some((start, end)) = parse_range(range_str, total_len) {
-                    if start < total_len {
-                        let actual_end = end.min(total_len);
-                        let chunk = &data[start..actual_end];
-                        let chunk_len = chunk.len();
-
-                        return Response::builder()
-                            .status(StatusCode::PARTIAL_CONTENT)
-                            .header(header::CONTENT_TYPE, &content_type)
-                            .header(header::CONTENT_LENGTH, chunk_len.to_string())
-                            .header("Content-Range", format!("bytes {}-{}/{}", start, actual_end - 1, total_len))
-                            .header("Accept-Ranges", "bytes")
-                            .body(Body::from(chunk.to_vec()))
-                            .unwrap();
-                    }
-                }
-            }
+    // Convert channel receiver to a Stream, dropping errors
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Some(Ok(chunk)) => Some((Ok::<Bytes, std::convert::Infallible>(chunk), rx)),
+            _ => None,
         }
-    }
+    });
 
-    // Full content
     Response::builder()
         .header(header::CONTENT_TYPE, &content_type)
         .header(header::CONTENT_LENGTH, total_len.to_string())
         .header("Accept-Ranges", "bytes")
-        .body(Body::from(data))
+        .body(Body::from_stream(stream))
         .unwrap()
 }
 
 /// WebDAV directory listing — show files in a bucket (or subdirectory) as HTML
+/// Groups objects by their first path segment to create a folder-style view.
 async fn handle_directory_listing(state: &WebDAVState, bucket: &str, method: Method, prefix: Option<&str>) -> Response {
     if method == Method::HEAD {
         return Response::builder()
@@ -346,19 +338,70 @@ async fn handle_directory_listing(state: &WebDAVState, bucket: &str, method: Met
   a {{ color: #0066cc; text-decoration: none; }}
   a:hover {{ text-decoration: underline; }}
   .size {{ color: #999; font-size: 0.85em; }}
+  .folder {{ color: #0066cc; font-weight: 500; }}
   .back {{ margin-bottom: 20px; }}
   .info {{ color: #666; font-size: 0.9em; margin-top: 20px; }}
 </style></head><body>
 <h1>📁 {bucket}</h1>
-<p class="back"><a href="/multifs/">← Back to buckets</a></p>
+<p class="back"><a href="../">← Back to buckets</a></p>
 <h2>Files</h2>
 <ul>"#, bucket = bucket);
 
             if objects.is_empty() {
                 html.push_str("<li><em>No files in this bucket.</em></li>");
+                html.push_str(&format!(r#"</ul>
+<div class="info">
+<p><strong>S3 API:</strong> <a href="/s3/{bucket}/">/s3/{bucket}/</a></p>
+</div>
+</body></html>"#, bucket = bucket));
+                return Response::builder()
+                    .header("Content-Type", "text/html; charset=utf-8")
+                    .body(Body::from(html))
+                    .unwrap();
             }
 
+            // Determine the depth: base prefix depth (number of segments before the first /)
+            // We split each object key into first-segment (folder) and remainder (file)
+            use std::collections::BTreeMap;
+            let mut folders: BTreeMap<String, bool> = BTreeMap::new();
+            let mut files: Vec<&crate::storage::engine::ObjectInfo> = Vec::new();
+
+            let strip_prefix = prefix.map(|p| {
+                if p.ends_with('/') { p.to_string() } else { format!("{}/", p) }
+            });
+
             for obj in &objects {
+                let relative = if let Some(ref sp) = strip_prefix {
+                    obj.key.strip_prefix(sp.as_str()).unwrap_or(&obj.key)
+                } else {
+                    &obj.key
+                };
+
+                if let Some(slash_pos) = relative.find('/') {
+                    // This object is inside a subfolder
+                    let folder_name = &relative[..slash_pos];
+                    folders.entry(folder_name.to_string()).or_insert(true);
+                } else if !relative.is_empty() {
+                    files.push(obj);
+                }
+            }
+
+            // Render folders first
+            for (folder_name, _) in &folders {
+                let href = if let Some(ref sp) = strip_prefix {
+                    format!("{}{}/", sp, folder_name)
+                } else {
+                    format!("{}/", folder_name)
+                };
+                html.push_str(&format!(
+                    r#"<li><a href="{href}" class="folder">📁 {name}/</a> <span class="size">folder</span></li>"#,
+                    href = href,
+                    name = folder_name
+                ));
+            }
+
+            // Render files without a folder prefix
+            for obj in &files {
                 let size_str = if obj.size > 1_000_000_000 {
                     format!("{:.1} GB", obj.size as f64 / 1_000_000_000.0)
                 } else if obj.size > 1_000_000 {
@@ -368,9 +411,14 @@ async fn handle_directory_listing(state: &WebDAVState, bucket: &str, method: Met
                 } else {
                     format!("{} B", obj.size)
                 };
+                let display_name = if let Some(ref sp) = strip_prefix {
+                    obj.key.strip_prefix(sp.as_str()).unwrap_or(&obj.key)
+                } else {
+                    &obj.key
+                };
                 html.push_str(&format!(
-                    r#"<li><a href="/multifs/{bucket}/{key}">{key}</a> <span class="size">{size}</span></li>"#,
-                    key = obj.key,
+                    r#"<li><a href="{key}">{key}</a> <span class="size">{size}</span></li>"#,
+                    key = display_name,
                     size = size_str
                 ));
             }

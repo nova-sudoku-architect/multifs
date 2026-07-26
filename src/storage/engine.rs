@@ -8,10 +8,8 @@ use super::backends::StorageBackend;
 use super::metadata::{MetadataDb, BucketRecord};
 use super::chunk_manager;
 
-/// Chunk size: 32 MB
 const CHUNK_SIZE: usize = 32 * 1024 * 1024;
 
-/// Object metadata returned by head_object
 #[derive(Debug, Clone)]
 pub struct ObjectInfo {
     pub key: String,
@@ -23,7 +21,6 @@ pub struct ObjectInfo {
     pub remote_path: String,
 }
 
-/// Shard status info
 #[derive(Debug, Clone)]
 pub struct ShardStatus {
     pub email: String,
@@ -39,7 +36,6 @@ struct BackendHandle {
     quota_gb: u64,
 }
 
-/// The core storage engine
 #[derive(Clone)]
 pub struct StorageEngine {
     meta: MetadataDb,
@@ -87,14 +83,11 @@ impl StorageEngine {
         content_type: Option<&str>,
     ) -> anyhow::Result<ObjectInfo> {
         self.ensure_bucket(bucket)?;
-
         let etag = hex::encode(Sha256::digest(data));
         let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-
         if data.len() <= CHUNK_SIZE {
             return self.put_whole_file(bucket, key, data, content_type, &etag, &now).await;
         }
-
         self.put_chunked_file(bucket, key, data, content_type, &etag, &now).await
     }
 
@@ -112,15 +105,12 @@ impl StorageEngine {
             anyhow::bail!("No storage backends configured");
         }
         let backend = &backends[0];
-
         let remote_path = format!("{}/{}/{}", backend.mount_prefix, bucket, key);
         let (remote_path_actual, _) = backend.backend.upload(&remote_path, data).await?;
-
         self.meta.put_object(
             bucket, key, data.len() as i64, etag, now,
             &backend.label, &remote_path_actual, content_type,
         )?;
-
         Ok(ObjectInfo {
             key: key.to_string(),
             size: data.len() as i64,
@@ -132,7 +122,6 @@ impl StorageEngine {
         })
     }
 
-    /// Store a large file as chunks distributed round-robin across backends (no erasure coding).
     pub async fn put_chunked_file(
         &self,
         bucket: &str,
@@ -147,10 +136,8 @@ impl StorageEngine {
             anyhow::bail!("No storage backends configured");
         }
 
-        // Step 1: Split into 32MB chunks
         let data_chunks = chunk_manager::split(data, CHUNK_SIZE);
 
-        // Step 2: Upload each chunk to a backend via round-robin
         #[derive(Debug)]
         struct ChunkUploadResult {
             global_index: u32,
@@ -186,7 +173,6 @@ impl StorageEngine {
             }
         }
 
-        // Step 3: Register file and chunks in metadata
         self.meta.with_conn(|conn| -> anyhow::Result<()> {
             conn.execute(
                 "INSERT OR REPLACE INTO files (bucket_name, key, size, etag, last_modified, content_type, storage_type)
@@ -229,18 +215,14 @@ impl StorageEngine {
         match storage_type.as_deref() {
             Some("chunked") => self.get_chunked_file(bucket, key).await,
             _ => {
-                let obj = self
-                    .meta
-                    .get_object(bucket, key)?
+                let obj = self.meta.get_object(bucket, key)?
                     .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
-
                 let backend = self.find_backend(&obj.account_email)?;
                 backend.backend.download(&obj.remote_path).await
             }
         }
     }
 
-    /// Get a chunked file: download chunks in parallel and assemble (no erasure decode needed).
     async fn get_chunked_file(&self, bucket: &str, key: &str) -> anyhow::Result<Vec<u8>> {
         let backends = &*self.backends;
 
@@ -276,8 +258,22 @@ impl StorageEngine {
             anyhow::bail!("No chunks found for chunked file: {}/{}", bucket, key);
         }
 
-        // Download all chunks in parallel
-        let mut download_handles = Vec::new();
+        // Get original file size for truncation
+        let original_size: i64 = self.meta.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT size FROM files WHERE bucket_name = ?1 AND key = ?2")?;
+            let mut rows = stmt.query(rusqlite::params![bucket, key])?;
+            if let Some(row) = rows.next()? {
+                Ok(row.get::<_, i64>(0)?)
+            } else {
+                Ok(0i64)
+            }
+        })?;
+
+        if original_size == 0 {
+            anyhow::bail!("File size not found in metadata for {}/{}", bucket, key);
+        }
+
+        let mut result = Vec::with_capacity(original_size as usize);
         for ci in &chunks_info {
             if let Some(backend) = backends.iter().find(|b| b.label == ci.account_email) {
                 let owned_path = if ci.remote_path.is_empty() {
@@ -285,48 +281,122 @@ impl StorageEngine {
                 } else {
                     ci.remote_path.clone()
                 };
-                download_handles.push(async move { backend.backend.download(&owned_path).await });
+
+                match backend.backend.download(&owned_path).await {
+                    Ok(data) => {
+                        result.extend_from_slice(&data);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to download chunk {} of {}/{}: {}", ci.index, bucket, key, e);
+                        anyhow::bail!("Failed to download chunk {}: {}", ci.index, e);
+                    }
+                }
             }
         }
+        result.truncate(original_size as usize);
+        Ok(result)
+    }
 
-        let downloaded: Vec<Vec<u8>> = futures::future::join_all(download_handles)
-            .await
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
-
-        if downloaded.is_empty() {
-            anyhow::bail!("Failed to download any chunks for {}/{}", bucket, key);
-        }
-
-        // Build chunks in order and assemble (no erasure decoding)
-        let mut chunk_objects = Vec::new();
-        for (i, data) in downloaded.iter().enumerate() {
-            if i < chunks_info.len() {
-                chunk_objects.push(chunk_manager::Chunk {
-                    index: chunks_info[i].index as u32,
-                    data: data.clone(),
-                    checksum: chunks_info[i].checksum.clone(),
-                });
-            }
-        }
-
-        let result = chunk_manager::assemble(&chunk_objects);
-
-        // Truncate to original file size
-        let original_size: i64 = self.meta.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT size FROM files WHERE bucket_name = ?1 AND key = ?2")?;
+    /// Stream a file's content through a channel. Each chunk from pCloud is sent immediately.
+    pub async fn get_object_stream(
+        &self,
+        bucket: &str,
+        key: &str,
+        tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
+    ) -> anyhow::Result<()> {
+        let storage_type: Option<String> = self.meta.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT storage_type FROM files WHERE bucket_name = ?1 AND key = ?2")?;
             let mut rows = stmt.query(rusqlite::params![bucket, key])?;
             if let Some(row) = rows.next()? {
-                Ok(row.get::<_, i64>(0)?)
+                Ok(Some(row.get::<_, String>(0)?))
             } else {
-                Ok(result.len() as i64)
+                Ok(None)
             }
         })?;
 
-        let mut result = result;
-        result.truncate(original_size as usize);
-        Ok(result)
+        match storage_type.as_deref() {
+            Some("chunked") => self.get_chunked_file_stream(bucket, key, tx).await,
+            _ => {
+                let obj = self.meta.get_object(bucket, key)?
+                    .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
+                let backend = self.find_backend(&obj.account_email)?;
+                let data = backend.backend.download(&obj.remote_path).await?;
+                for chunk in data.chunks(64 * 1024) {
+                    if tx.send(Ok(bytes::Bytes::copy_from_slice(chunk))).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn get_chunked_file_stream(
+        &self,
+        bucket: &str,
+        key: &str,
+        tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
+    ) -> anyhow::Result<()> {
+        let backends = &*self.backends;
+
+        #[derive(Debug)]
+        struct ChunkInfo {
+            index: i32,
+            _size: i64,
+            checksum: String,
+            account_email: String,
+            remote_path: String,
+        }
+
+        let chunks_info: Vec<ChunkInfo> = self.meta.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT chunk_index, size, checksum, account_email, remote_path
+                 FROM chunks WHERE bucket_name = ?1 AND key = ?2 ORDER BY chunk_index"
+            )?;
+            let rows = stmt.query_map(rusqlite::params![bucket, key], |row| {
+                Ok(ChunkInfo {
+                    index: row.get(0)?,
+                    _size: row.get(1)?,
+                    checksum: row.get(2)?,
+                    account_email: row.get(3)?,
+                    remote_path: row.get(4)?,
+                })
+            })?;
+            let mut infos = Vec::new();
+            for row in rows { infos.push(row?); }
+            Ok(infos)
+        })?;
+
+        if chunks_info.is_empty() {
+            anyhow::bail!("No chunks found for chunked file: {}/{}", bucket, key);
+        }
+
+        for ci in &chunks_info {
+            if let Some(backend) = backends.iter().find(|b| b.label == ci.account_email) {
+                let owned_path = if ci.remote_path.is_empty() {
+                    format!("{}/{}/{}.ck.{}", backend.mount_prefix, bucket, key, ci.index)
+                } else {
+                    ci.remote_path.clone()
+                };
+
+                match backend.backend.download(&owned_path).await {
+                    Ok(data) => {
+                        for chunk in data.chunks(64 * 1024) {
+                            if tx.send(Ok(bytes::Bytes::copy_from_slice(chunk))).await.is_err() {
+                                // Receiver dropped (client disconnected)
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to download chunk {} of {}/{}: {}", ci.index, bucket, key, e);
+                        let _ = tx.send(Err(anyhow::anyhow!("Storage error: {}", e))).await;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn head_object(&self, bucket: &str, key: &str) -> anyhow::Result<ObjectInfo> {
@@ -359,9 +429,7 @@ impl StorageEngine {
             });
         }
 
-        let obj = self
-            .meta
-            .get_object(bucket, key)?
+        let obj = self.meta.get_object(bucket, key)?
             .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
         Ok(ObjectInfo {
             key: obj.key,
@@ -375,11 +443,8 @@ impl StorageEngine {
     }
 
     pub async fn delete_object(&self, bucket: &str, key: &str) -> anyhow::Result<()> {
-        let obj = self
-            .meta
-            .get_object(bucket, key)?
+        let obj = self.meta.get_object(bucket, key)?
             .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
-
         let backend = self.find_backend(&obj.account_email)?;
         backend.backend.delete(&obj.remote_path).await?;
         self.meta.delete_object(bucket, key)?;
@@ -393,21 +458,16 @@ impl StorageEngine {
         max_keys: i64,
     ) -> anyhow::Result<Vec<ObjectInfo>> {
         let records = self.meta.list_objects(bucket, prefix, max_keys)?;
-        Ok(records
-            .into_iter()
-            .map(|r| ObjectInfo {
-                key: r.key,
-                size: r.size,
-                etag: r.etag,
-                last_modified: r.last_modified,
-                content_type: r.content_type,
-                account_email: r.account_email,
-                remote_path: r.remote_path,
-            })
-            .collect())
+        Ok(records.into_iter().map(|r| ObjectInfo {
+            key: r.key,
+            size: r.size,
+            etag: r.etag,
+            last_modified: r.last_modified,
+            content_type: r.content_type,
+            account_email: r.account_email,
+            remote_path: r.remote_path,
+        }).collect())
     }
-
-    // ---- Bucket operations ----
 
     pub async fn bucket_exists(&self, name: &str) -> anyhow::Result<bool> {
         self.meta.bucket_exists(name)
@@ -466,9 +526,7 @@ impl StorageEngine {
     }
 
     fn find_backend(&self, label: &str) -> anyhow::Result<&BackendHandle> {
-        self.backends
-            .iter()
-            .find(|b| b.label == label)
+        self.backends.iter().find(|b| b.label == label)
             .ok_or_else(|| anyhow::anyhow!("Backend not found: {}", label))
     }
 }

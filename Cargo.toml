@@ -17,6 +17,7 @@ hex = "0.4"
 async-trait = "0.1"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
