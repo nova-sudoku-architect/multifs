@@ -1,3 +1,4 @@
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::{
@@ -280,11 +281,20 @@ async fn handle_get(state: &WebDAVState, path: &str, method: Method, headers: Op
             .unwrap();
     }
 
-    // Streaming: pipe pCloud chunks directly to response body using channel.
-    // Client receives first bytes as soon as they arrive from pCloud.
+    // Check for Range header and parse byte range
     use tokio::sync::mpsc;
     use bytes::Bytes;
     use futures::stream::StreamExt;
+
+    // Parse optional HTTP Range header
+    let parsed_range: Option<(usize, usize)> = headers
+        .and_then(|hdrs| hdrs.get("range").and_then(|v| v.to_str().ok()))
+        .and_then(|rv| parse_range(rv, total_len));
+
+    let content_length = match parsed_range {
+        Some((start, end)) => end - start,
+        None => total_len,
+    };
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, anyhow::Error>>(16);
     let engine_clone = state.engine.clone();
@@ -297,20 +307,54 @@ async fn handle_get(state: &WebDAVState, path: &str, method: Method, headers: Op
         }
     });
 
-    // Convert channel receiver to a Stream, dropping errors
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
-        match rx.recv().await {
-            Some(Ok(chunk)) => Some((Ok::<Bytes, std::convert::Infallible>(chunk), rx)),
-            _ => None,
-        }
-    });
+    use tokio_stream::wrappers::ReceiverStream;
+    use futures::stream::StreamExt as _;
 
-    Response::builder()
+    let base_stream = ReceiverStream::new(rx)
+        .filter_map(|r| async move { r.ok() });
+
+    let stream: Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::convert::Infallible>> + Send>> =
+        if let Some((req_start, req_end)) = parsed_range {
+            let mut emitted: usize = 0;
+            let sliced = base_stream
+                .take_while(move |_| futures::future::ready(emitted < req_end))
+                .filter_map(move |chunk| {
+                    let chunk_len = chunk.len();
+                    let chunk_start = emitted;
+                    let chunk_end = emitted + chunk_len;
+                    emitted = chunk_end;
+                    if chunk_end <= req_start || chunk_start >= req_end {
+                        futures::future::ready(None)
+                    } else {
+                        let slice_begin = if chunk_start < req_start {
+                            req_start - chunk_start
+                        } else { 0 };
+                        let slice_end = if chunk_end > req_end {
+                            chunk_len - (chunk_end - req_end)
+                        } else { chunk_len };
+                        let sliced = chunk.slice(slice_begin..slice_end);
+                        futures::future::ready(if sliced.is_empty() { None } else { Some(Ok(sliced)) })
+                    }
+                });
+            Box::pin(sliced)
+        } else {
+            let full = base_stream.map(Ok);
+            Box::pin(full)
+        };
+
+    let mut response = Response::builder()
         .header(header::CONTENT_TYPE, &content_type)
-        .header(header::CONTENT_LENGTH, total_len.to_string())
-        .header("Accept-Ranges", "bytes")
-        .body(Body::from_stream(stream))
-        .unwrap()
+        .header(header::CONTENT_LENGTH, content_length.to_string())
+        .header("Accept-Ranges", "bytes");
+
+    // Add Content-Range header for partial responses
+    if let Some((start, end)) = parsed_range {
+        response = response
+            .header("Content-Range", format!("bytes {}-{}/{}", start, end - 1, total_len))
+            .status(StatusCode::PARTIAL_CONTENT);
+    }
+
+    response.body(Body::from_stream(stream)).unwrap()
 }
 
 /// WebDAV directory listing — show files in a bucket (or subdirectory) as HTML
@@ -629,32 +673,5 @@ fn webdav_bucket_multistatus(parent_path: &str, entries: &[(String, String, i64)
 /// Parse HTTP Range header like "bytes=0-1023" or "bytes=100-"
 /// Returns Some((start, end)) where end is exclusive and <= total_len
 fn parse_range(range: &str, total_len: usize) -> Option<(usize, usize)> {
-    let range = range.strip_prefix("bytes=")?;
-    if let Some(dash_pos) = range.find('-') {
-        let start_str = &range[..dash_pos];
-        let end_str = &range[dash_pos + 1..];
-
-        let start: usize = if start_str.is_empty() {
-            // Suffix range: bytes=-500 → last 500 bytes
-            let suffix: usize = end_str.parse().ok()?;
-            if suffix >= total_len {
-                return Some((0, total_len));
-            }
-            return Some((total_len - suffix, total_len));
-        } else {
-            start_str.parse().ok()?
-        };
-
-        let end: usize = if end_str.is_empty() {
-            total_len
-        } else {
-            // End is inclusive in HTTP range, convert to exclusive
-            let inclusive_end: usize = end_str.parse().ok()?;
-            inclusive_end + 1
-        };
-
-        Some((start, end))
-    } else {
-        None
-    }
+    crate::server::parse_range(range, total_len)
 }

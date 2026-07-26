@@ -5,6 +5,39 @@ pub mod nfs;
 
 use crate::config::Config;
 
+/// Parse HTTP Range header like "bytes=0-1023" or "bytes=100-"
+/// Returns Some((start, end)) where end is exclusive and <= total_len
+pub fn parse_range(range: &str, total_len: usize) -> Option<(usize, usize)> {
+    let range = range.strip_prefix("bytes=")?;
+    if let Some(dash_pos) = range.find('-') {
+        let start_str = &range[..dash_pos];
+        let end_str = &range[dash_pos + 1..];
+
+        let start: usize = if start_str.is_empty() {
+            // Suffix range: bytes=-500 → last 500 bytes
+            let suffix: usize = end_str.parse().ok()?;
+            if suffix >= total_len {
+                return Some((0, total_len));
+            }
+            return Some((total_len - suffix, total_len));
+        } else {
+            start_str.parse().ok()?
+        };
+
+        let end: usize = if end_str.is_empty() {
+            total_len
+        } else {
+            // End is inclusive in HTTP range, convert to exclusive
+            let inclusive_end: usize = end_str.parse().ok()?;
+            inclusive_end + 1
+        };
+
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
 /// Run all enabled protocol servers
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let meta = crate::storage::metadata::MetadataDb::open(&cfg.storage.meta_db_path)?;
