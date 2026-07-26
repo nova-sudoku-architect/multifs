@@ -162,6 +162,17 @@ impl Default for Config {
     }
 }
 
+/// Save configuration to a TOML file
+pub fn save(path: &str, config: &Config) -> anyhow::Result<()> {
+    let contents = toml::ser::to_string_pretty(config)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize config: {}", e))?;
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, &contents)?;
+    Ok(())
+}
+
 /// Load configuration from a TOML file
 pub fn load(path: &str) -> anyhow::Result<Config> {
     let contents = std::fs::read_to_string(path)

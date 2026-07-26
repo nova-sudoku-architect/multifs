@@ -36,6 +36,8 @@ enum Cli {
     Shard(cli::shard_cmd::ShardArgs),
     /// Show daemon health and account stats
     Status,
+    /// Audit pCloud accounts — find files not managed by MultiFS
+    Audit(cli::audit_cmd::AuditArgs),
 }
 
 #[tokio::main]
@@ -59,6 +61,7 @@ async fn main() -> Result<()> {
         Cli::Object(args) => cli::object_cmd::run(args).await?,
         Cli::Shard(args) => cli::shard_cmd::run(args).await?,
         Cli::Status => cli::status::run_status().await?,
+        Cli::Audit(args) => cli::audit_cmd::run(args).await?,
     }
 
     Ok(())

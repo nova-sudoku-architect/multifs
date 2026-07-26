@@ -519,6 +519,30 @@ impl MetadataDb {
         })
     }
 
+    pub fn list_all_objects(&self) -> anyhow::Result<Vec<ObjectRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT key, size, etag, last_modified, content_type, account_email, remote_path, bucket_name
+                 FROM objects ORDER BY bucket_name, key"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(ObjectRecord {
+                    key: row.get(0)?,
+                    size: row.get(1)?,
+                    etag: row.get(2)?,
+                    last_modified: row.get(3)?,
+                    content_type: row.get(4)?,
+                    account_email: row.get::<_, String>(5).unwrap_or_default(),
+                    remote_path: row.get::<_, String>(6).unwrap_or_default(),
+                    bucket_name: row.get(7)?,
+                })
+            })?;
+            let mut objects = Vec::new();
+            for row in rows { objects.push(row?); }
+            Ok(objects)
+        })
+    }
+
     pub fn delete_all_objects(&self, bucket: &str) -> anyhow::Result<()> {
         self.with_conn(|conn| {
             conn.execute("DELETE FROM objects WHERE bucket_name = ?1", params![bucket])?;
