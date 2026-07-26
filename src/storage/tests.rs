@@ -1,82 +1,10 @@
-/// In-memory mock backend for testing StorageEngine without real cloud accounts.
-#[cfg(test)]
-mod mock_backend {
-    use async_trait::async_trait;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    use crate::storage::backends::{StorageBackend, StorageFile};
-
-    pub struct MockBackend {
-        pub name: String,
-        pub files: Mutex<HashMap<String, Vec<u8>>>,
-    }
-
-    impl MockBackend {
-        pub fn new(name: &str) -> Self {
-            Self {
-                name: name.to_string(),
-                files: Mutex::new(HashMap::new()),
-            }
-        }
-
-        pub fn file_count(&self) -> usize {
-            self.files.lock().unwrap().len()
-        }
-    }
-
-    #[async_trait]
-    impl StorageBackend for MockBackend {
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        async fn check_quota(&self) -> anyhow::Result<(i64, i64)> {
-            let used: i64 = self.files.lock().unwrap().values().map(|v| v.len() as i64).sum();
-            Ok((used, 1_000_000_000)) // 1 GB total
-        }
-
-        async fn upload(&self, remote_path: &str, data: &[u8]) -> anyhow::Result<(String, i64)> {
-            self.files.lock().unwrap().insert(remote_path.to_string(), data.to_vec());
-            Ok((remote_path.to_string(), data.len() as i64))
-        }
-
-        async fn download(&self, remote_path: &str) -> anyhow::Result<Vec<u8>> {
-            self.files
-                .lock()
-                .unwrap()
-                .get(remote_path)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("File not found: {}", remote_path))
-        }
-
-        async fn delete(&self, remote_path: &str) -> anyhow::Result<()> {
-            self.files.lock().unwrap().remove(remote_path);
-            Ok(())
-        }
-
-        async fn list(&self, _prefix: &str) -> anyhow::Result<Vec<StorageFile>> {
-            let files = self.files.lock().unwrap();
-            Ok(files
-                .iter()
-                .map(|(path, data)| StorageFile {
-                    name: path.rsplit('/').next().unwrap_or(path).to_string(),
-                    path: path.clone(),
-                    size: data.len() as i64,
-                    modified: "2026-01-01".to_string(),
-                    is_folder: false,
-                })
-                .collect())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::storage::metadata::MetadataDb;
     use crate::storage::chunk_manager;
     use crate::storage::placement;
     use sha2::{Digest, Sha256};
+    use crate::storage::test_utils::MockBackend;
 
     // ---- Chunk Manager Integration ----
 
@@ -456,39 +384,12 @@ mod tests {
 
     struct TestEngine {
         engine: crate::storage::engine::StorageEngine,
-        mock: std::sync::Arc<super::mock_backend::MockBackend>,
         _dir: tempfile::TempDir,
     }
 
     fn make_test_engine() -> TestEngine {
-        use crate::storage::metadata::MetadataDb;
-        use crate::storage::engine::StorageEngine;
-        use super::mock_backend::MockBackend;
-
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        let db = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
-
-        let backends: Vec<crate::storage::engine::BackendHandle> = vec![
-            crate::storage::engine::BackendHandle::new(
-                Box::new(MockBackend::new("mock-a")),
-                "/mnt/mock-a".to_string(),
-                "mock-a".to_string(),
-                10,
-            ),
-            crate::storage::engine::BackendHandle::new(
-                Box::new(MockBackend::new("mock-b")),
-                "/mnt/mock-b".to_string(),
-                "mock-b".to_string(),
-                10,
-            ),
-        ];
-
-        TestEngine {
-            engine: StorageEngine::from_backends(backends, db),
-            mock: std::sync::Arc::new(MockBackend::new("mock-a")),
-            _dir: dir,
-        }
+        let (engine, dir) = crate::storage::test_utils::make_test_engine();
+        TestEngine { engine, _dir: dir }
     }
 
     #[tokio::test]

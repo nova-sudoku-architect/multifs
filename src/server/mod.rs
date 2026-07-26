@@ -3,6 +3,9 @@ pub mod webdav;
 pub mod webdav_tests;
 pub mod nfs;
 
+#[cfg(test)]
+mod handler_tests;
+
 use crate::config::Config;
 
 /// Parse HTTP Range header like "bytes=0-1023" or "bytes=100-"
