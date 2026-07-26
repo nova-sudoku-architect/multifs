@@ -125,7 +125,7 @@ async fn handle_root_get(state: &WebDAVState) -> Response {
 <ul>"#);
 
             if buckets.is_empty() {
-                html.push_str("<li><em>No buckets yet. Create one with:</em> <code>curl -X PUT https://vmi3137694.tailb9bfd3.ts.net/s3/my-bucket</code></li>");
+                html.push_str("<li><em>No buckets yet. Create one with:</em> <code>curl -X PUT /s3/my-bucket</code></li>");
             }
 
             for b in &buckets {
@@ -139,8 +139,8 @@ async fn handle_root_get(state: &WebDAVState) -> Response {
 
             html.push_str(r#"</ul>
 <div class="info">
-<p><strong>S3 API:</strong> <a href="https://vmi3137694.tailb9bfd3.ts.net/s3/">https://vmi3137694.tailb9bfd3.ts.net/s3/</a></p>
-<p><strong>WebDAV:</strong> <a href="/">https://vmi3137694.tailb9bfd3.ts.net/multifs/</a></p>
+<p><strong>S3 API:</strong> available at <code>/s3/</code></p>
+<p><strong>WebDAV:</strong> available at <code>/</code></p>
 <p><strong>Storage:</strong> 3 × pCloud accounts (~12 GB total)</p>
 </div>
 </body></html>"#);
