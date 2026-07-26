@@ -31,11 +31,10 @@ pub fn run(args: ConfigArgs) -> Result<()> {
             println!("{}", toml_str);
         }
         ConfigSubcommand::Set { key, value } => {
-            tracing::warn!(
-                "Config set not fully implemented yet. Edit {} directly.",
-                cfg_path
-            );
-            println!("Set {} = {}", key, value);
+            println!("⚠️  Config set is not yet implemented. To configure, edit {} directly:", cfg_path);
+            println!("   multifs config show   # view current config");
+            println!("   Key: {}", key);
+            println!("   Value: {}", value);
         }
     }
 

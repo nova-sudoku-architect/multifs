@@ -12,7 +12,10 @@ pub struct ShardArgs {
 pub enum ShardSubcommand {
     /// Show shard fill levels for all accounts
     Status,
-    /// Rebalance objects across accounts (may take a while)
+    /// Rebalance objects across accounts
+    ///
+    /// Note: automatic rebalancing has been removed. Uploads are now distributed
+    /// via round-robin at upload time. Manual migration not yet implemented.
     Rebalance,
 }
 
