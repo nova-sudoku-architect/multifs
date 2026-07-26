@@ -352,4 +352,83 @@ mod handler_tests {
         assert!(body.contains("vid1.mp4"), "Should list vid1.mp4 in HTML");
         assert!(body.contains("vid2.mp4"), "Should list vid2.mp4 in HTML");
     }
+
+    // ---- group_objects_by_prefix tests ----
+
+    use crate::server::group_objects_by_prefix;
+
+    fn make_obj(key: &str) -> crate::storage::engine::ObjectInfo {
+        crate::storage::engine::ObjectInfo {
+            key: key.to_string(),
+            size: 100,
+            etag: format!("etag-{}", key),
+            last_modified: "2026-01-01T00:00:00Z".to_string(),
+            content_type: None,
+            account_email: "test@example.com".to_string(),
+            remote_path: format!("/mnt/{}", key),
+        }
+    }
+
+    #[test]
+    fn test_group_empty() {
+        let (pfx, files) = group_objects_by_prefix(&[], None);
+        assert!(pfx.is_empty() && files.is_empty());
+    }
+
+    #[test]
+    fn test_group_flat_files_only() {
+        let objs = vec![make_obj("f1.mp4"), make_obj("f2.mp4")];
+        let (pfx, files) = group_objects_by_prefix(&objs, None);
+        assert!(pfx.is_empty());
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn test_group_with_folders() {
+        let objs = vec![
+            make_obj("v/001/a.mp4"),
+            make_obj("v/001/b.mp4"),
+            make_obj("v/readme.txt"),
+        ];
+        let (pfx, files) = group_objects_by_prefix(&objs, None);
+        // All three are inside "v/" subfolder - no top-level files
+        assert_eq!(pfx, vec!["v/"]);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_group_with_prefix() {
+        let objs = vec![
+            make_obj("data/2026/a.csv"),
+            make_obj("data/2027/b.csv"),
+            make_obj("data/notes.txt"),
+        ];
+        let (pfx, files) = group_objects_by_prefix(&objs, Some("data/"));
+        assert_eq!(pfx, vec!["data/2026/", "data/2027/"]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].key, "data/notes.txt");
+    }
+
+    #[test]
+    fn test_group_prefix_no_trailing_slash() {
+        let objs = vec![
+            make_obj("x/d/file.txt"),
+            make_obj("x/notes.txt"),
+        ];
+        let (pfx, files) = group_objects_by_prefix(&objs, Some("x"));
+        assert_eq!(pfx, vec!["x/d/"]);
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn test_group_deduplicates_prefixes() {
+        let objs = vec![
+            make_obj("d/a.txt"),
+            make_obj("d/b.txt"),
+            make_obj("d/c.txt"),
+        ];
+        let (pfx, files) = group_objects_by_prefix(&objs, None);
+        assert_eq!(pfx, vec!["d/"]);
+        assert!(files.is_empty());
+    }
 }

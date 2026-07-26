@@ -404,34 +404,21 @@ async fn handle_directory_listing(state: &WebDAVState, bucket: &str, method: Met
                     .unwrap();
             }
 
-            // Determine the depth: base prefix depth (number of segments before the first /)
-            // We split each object key into first-segment (folder) and remainder (file)
-            use std::collections::BTreeMap;
-            let mut folders: BTreeMap<String, bool> = BTreeMap::new();
-            let mut files: Vec<&crate::storage::engine::ObjectInfo> = Vec::new();
+            let (prefixes, files) = crate::server::group_objects_by_prefix(&objects, prefix);
 
+            // Extract just the last segment of each prefix for display
             let strip_prefix = prefix.map(|p| {
                 if p.ends_with('/') { p.to_string() } else { format!("{}/", p) }
             });
 
-            for obj in &objects {
-                let relative = if let Some(ref sp) = strip_prefix {
-                    obj.key.strip_prefix(sp.as_str()).unwrap_or(&obj.key)
+            // Render folders first — derive display name from the full prefix path
+            for folder_href in &prefixes {
+                let folder_name = if let Some(ref sp) = strip_prefix {
+                    folder_href.strip_prefix(sp.as_str()).unwrap_or(folder_href)
                 } else {
-                    &obj.key
+                    folder_href
                 };
-
-                if let Some(slash_pos) = relative.find('/') {
-                    // This object is inside a subfolder
-                    let folder_name = &relative[..slash_pos];
-                    folders.entry(folder_name.to_string()).or_insert(true);
-                } else if !relative.is_empty() {
-                    files.push(obj);
-                }
-            }
-
-            // Render folders first
-            for (folder_name, _) in &folders {
+                let folder_name = folder_name.trim_end_matches('/');
                 let href = if let Some(ref sp) = strip_prefix {
                     format!("{}{}/", sp, folder_name)
                 } else {

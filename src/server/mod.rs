@@ -41,6 +41,50 @@ pub fn parse_range(range: &str, total_len: usize) -> Option<(usize, usize)> {
     }
 }
 
+/// Group objects by their first path segment, separating folder-like prefixes
+/// from leaf files. Returns (prefixes, files) where prefixes are unique directory
+/// names (with trailing /) and files are objects at the current level.
+///
+/// Used by both S3 (CommonPrefixes) and WebDAV (folder listing).
+pub fn group_objects_by_prefix<'a>(
+    objects: &'a [crate::storage::engine::ObjectInfo],
+    prefix: Option<&str>,
+) -> (Vec<String>, Vec<&'a crate::storage::engine::ObjectInfo>) {
+    let mut prefixes: Vec<String> = Vec::new();
+    let mut files: Vec<&crate::storage::engine::ObjectInfo> = Vec::new();
+
+    // Normalize the strip prefix: ensure it ends with /
+    let strip_prefix = prefix.map(|p| {
+        if p.ends_with('/') { p.to_string() } else { format!("{}/", p) }
+    });
+
+    for obj in objects {
+        let relative = if let Some(ref sp) = strip_prefix {
+            obj.key.strip_prefix(sp.as_str()).unwrap_or(&obj.key)
+        } else {
+            &obj.key
+        };
+
+        if let Some(slash_pos) = relative.find('/') {
+            // This object belongs to a subdirectory
+            let folder_name = &relative[..slash_pos];
+            // Build full prefix including the original prefix path
+            let dir_name = if let Some(ref sp) = strip_prefix {
+                format!("{}{}/", sp, folder_name)
+            } else {
+                format!("{}/", folder_name)
+            };
+            if !prefixes.contains(&dir_name) {
+                prefixes.push(dir_name);
+            }
+        } else if !relative.is_empty() {
+            files.push(obj);
+        }
+    }
+
+    (prefixes, files)
+}
+
 /// Run all enabled protocol servers
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let meta = crate::storage::metadata::MetadataDb::open(&cfg.storage.meta_db_path)?;

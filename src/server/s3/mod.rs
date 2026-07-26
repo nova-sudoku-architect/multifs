@@ -279,34 +279,11 @@ async fn list_objects(
             let has_delimiter = delimiter == Some("/");
 
             if has_delimiter {
-                // Collect unique prefixes (directory names before first / after the given prefix)
-                let mut common_prefixes: Vec<String> = Vec::new();
-                let mut contents: Vec<(String, i64, String, String)> = Vec::new();
-
-                for obj in &objects {
-                    let relative = if let Some(p) = prefix {
-                        obj.key.strip_prefix(p).unwrap_or(&obj.key)
-                    } else {
-                        &obj.key
-                    };
-
-                    if let Some(slash_pos) = relative.find('/') {
-                        // This object belongs to a subdirectory
-                        let subdir = &relative[..slash_pos+1];
-                        let dir_name = if let Some(p) = prefix {
-                            // prefix already ends with /, so just append the subdir
-                            format!("{}{}", p, subdir)
-                        } else {
-                            format!("{}", subdir)
-                        };
-                        if !common_prefixes.contains(&dir_name) {
-                            common_prefixes.push(dir_name);
-                        }
-                    } else {
-                        // This object is at the current level (no subdirectory)
-                        contents.push((obj.key.clone(), obj.size, obj.etag.clone(), obj.last_modified.clone()));
-                    }
-                }
+                let (common_prefixes, file_objs) = crate::server::group_objects_by_prefix(&objects, prefix);
+                let contents: Vec<(String, i64, String, String)> = file_objs
+                    .iter()
+                    .map(|o| (o.key.clone(), o.size, o.etag.clone(), o.last_modified.clone()))
+                    .collect();
 
                 // Build XML response with CommonPrefixes
                 let contents_xml: String = contents
