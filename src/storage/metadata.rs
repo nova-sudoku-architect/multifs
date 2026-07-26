@@ -255,6 +255,14 @@ impl MetadataDb {
                 "DELETE FROM objects WHERE bucket_name = ?1 AND key = ?2",
                 params![bucket, key],
             )?;
+            conn.execute(
+                "DELETE FROM chunks WHERE bucket_name = ?1 AND key = ?2",
+                params![bucket, key],
+            )?;
+            conn.execute(
+                "DELETE FROM files WHERE bucket_name = ?1 AND key = ?2",
+                params![bucket, key],
+            )?;
             Ok(())
         })
         .await?
@@ -267,6 +275,8 @@ impl MetadataDb {
         tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&path)?;
             conn.execute("DELETE FROM objects WHERE bucket_name = ?1", params![bucket])?;
+            conn.execute("DELETE FROM chunks WHERE bucket_name = ?1", params![bucket])?;
+            conn.execute("DELETE FROM files WHERE bucket_name = ?1", params![bucket])?;
             Ok(())
         })
         .await?
@@ -515,6 +525,8 @@ impl MetadataDb {
     pub fn delete_object(&self, bucket: &str, key: &str) -> anyhow::Result<()> {
         self.with_conn(|conn| {
             conn.execute("DELETE FROM objects WHERE bucket_name = ?1 AND key = ?2", params![bucket, key])?;
+            conn.execute("DELETE FROM chunks WHERE bucket_name = ?1 AND key = ?2", params![bucket, key])?;
+            conn.execute("DELETE FROM files WHERE bucket_name = ?1 AND key = ?2", params![bucket, key])?;
             Ok(())
         })
     }
@@ -546,6 +558,8 @@ impl MetadataDb {
     pub fn delete_all_objects(&self, bucket: &str) -> anyhow::Result<()> {
         self.with_conn(|conn| {
             conn.execute("DELETE FROM objects WHERE bucket_name = ?1", params![bucket])?;
+            conn.execute("DELETE FROM chunks WHERE bucket_name = ?1", params![bucket])?;
+            conn.execute("DELETE FROM files WHERE bucket_name = ?1", params![bucket])?;
             Ok(())
         })
     }

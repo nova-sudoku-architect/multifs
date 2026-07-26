@@ -1,3 +1,5 @@
+#![cfg(feature = "integration_tests")]
+
 use std::process::Command;
 
 const S3_URL: &str = "http://100.100.30.59:9000";

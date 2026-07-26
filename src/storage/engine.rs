@@ -447,10 +447,50 @@ impl StorageEngine {
     }
 
     pub async fn delete_object(&self, bucket: &str, key: &str) -> anyhow::Result<()> {
-        let obj = self.meta.get_object(bucket, key)?
-            .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
-        let backend = self.find_backend(&obj.account_email)?;
-        backend.backend.delete(&obj.remote_path).await?;
+        // Check if it's a chunked file first
+        let storage_type: Option<String> = self.meta.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT storage_type FROM files WHERE bucket_name = ?1 AND key = ?2"
+            )?;
+            let mut rows = stmt.query(rusqlite::params![bucket, key])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(row.get::<_, String>(0)?))
+            } else {
+                Ok(None)
+            }
+        })?;
+
+        match storage_type.as_deref() {
+            Some("chunked") => {
+                // Delete all chunks from backends
+                let chunks_info: Vec<(String, String)> = self.meta.with_conn(|conn| {
+                    let mut stmt = conn.prepare(
+                        "SELECT account_email, remote_path FROM chunks WHERE bucket_name = ?1 AND key = ?2"
+                    )?;
+                    let rows = stmt.query_map(rusqlite::params![bucket, key], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?;
+                    let mut infos = Vec::new();
+                    for row in rows {
+                        infos.push(row?);
+                    }
+                    Ok(infos)
+                })?;
+
+                for (account_email, remote_path) in &chunks_info {
+                    if let Ok(backend) = self.find_backend(account_email) {
+                        let _ = backend.backend.delete(remote_path).await;
+                    }
+                }
+            }
+            _ => {
+                // Whole-file: existing logic
+                let obj = self.meta.get_object(bucket, key)?
+                    .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
+                let backend = self.find_backend(&obj.account_email)?;
+                backend.backend.delete(&obj.remote_path).await?;
+            }
+        }
         self.meta.delete_object(bucket, key)?;
         Ok(())
     }
@@ -484,11 +524,8 @@ impl StorageEngine {
     pub async fn delete_bucket(&self, name: &str) -> anyhow::Result<()> {
         let objects = self.meta.list_objects(name, None, 10000)?;
         for obj in &objects {
-            if let Ok(backend) = self.find_backend(&obj.account_email) {
-                let _ = backend.backend.delete(&obj.remote_path).await;
-            }
+            let _ = self.delete_object(name, &obj.key).await;
         }
-        self.meta.delete_all_objects(name)?;
         self.meta.delete_bucket(name)?;
         Ok(())
     }
