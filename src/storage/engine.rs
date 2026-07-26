@@ -426,6 +426,8 @@ impl StorageEngine {
     }
 
     /// Stream all chunks sequentially (no Range), caching each
+    /// Stream all chunks sequentially (no Range), page-by-page from pCloud.
+    /// Each chunk is downloaded via download_stream, forwarding pages immediately.
     async fn stream_chunked_file_full(
         &self,
         bucket: &str,
@@ -467,27 +469,59 @@ impl StorageEngine {
         }
 
         for ci in &chunks_info {
-            if let Some(backend) = backends.iter().find(|b| b.label == ci.account_email) {
-                let owned_path = if ci.remote_path.is_empty() {
-                    format!("{}/{}/{}.ck.{}", backend.mount_prefix, bucket, key, ci.index)
-                } else {
-                    ci.remote_path.clone()
-                };
+            let owned_path = if ci.remote_path.is_empty() {
+                let mp = backends.iter().find(|b| b.label == ci.account_email).map(|b| b.mount_prefix.as_str()).unwrap_or("");
+                format!("{}/{}/{}.ck.{}", mp, bucket, key, ci.index)
+            } else {
+                ci.remote_path.clone()
+            };
 
-                match backend.backend.download(&owned_path).await {
-                    Ok(data) => {
-                        for chunk in data.chunks(64 * 1024) {
-                            if tx.send(Ok(bytes::Bytes::copy_from_slice(chunk))).await.is_err() {
-                                // Receiver dropped (client disconnected)
+            // Try cache first
+            if let Some(d) = self.chunk_cache.get(bucket, key, ci.index).await {
+                for chunk in d.chunks(64 * 1024) {
+                    if tx.send(Ok(bytes::Bytes::copy_from_slice(chunk))).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                continue;
+            }
+
+            // Find backend by index (to avoid reference lifetime issues in spawn)
+            let bi = backends.iter().position(|b| b.label == ci.account_email);
+            if let Some(backend_idx) = bi {
+                // Stream page-by-page from pCloud, cache when complete
+                let (dl_tx, mut dl_rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, anyhow::Error>>(64);
+                let dl_path = owned_path.clone();
+                let dl_tx2 = dl_tx.clone();
+                let be_clone = self.backends.clone();
+
+                // Download runs concurrently with page forwarding
+                let dl_handle = tokio::spawn(async move {
+                    if let Some(bh) = be_clone.get(backend_idx) {
+                        let _ = bh.backend.download_stream(&dl_path, None, None, dl_tx2).await;
+                    }
+                });
+                drop(dl_tx);
+
+                let mut full = Vec::new();
+                while let Some(page_res) = dl_rx.recv().await {
+                    match page_res {
+                        Ok(page) => {
+                            full.extend_from_slice(&page);
+                            if tx.send(Ok(page)).await.is_err() {
                                 return Ok(());
                             }
                         }
+                        Err(e) => {
+                            let _ = tx.send(Err(anyhow::anyhow!("Chunk {} error: {}", ci.index, e))).await;
+                            return Ok(());
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to download chunk {} of {}/{}: {}", ci.index, bucket, key, e);
-                        let _ = tx.send(Err(anyhow::anyhow!("Storage error: {}", e))).await;
-                        return Ok(());
-                    }
+                }
+                let _ = dl_handle.await;
+
+                if !full.is_empty() {
+                    self.chunk_cache.put(bucket, key, ci.index, &full).await;
                 }
             }
         }
