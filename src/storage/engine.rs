@@ -10,7 +10,7 @@ use super::backends::StorageBackend;
 use super::metadata::{MetadataDb, BucketRecord};
 use rusqlite::params;
 use super::chunk_manager;
-use super::chunk_cache::ChunkCache;
+use super::page_cache::{self, PageCache};
 use super::download_tracker::DownloadTracker;
 
 const CHUNK_SIZE: usize = 32 * 1024 * 1024;
@@ -54,7 +54,7 @@ pub struct StorageEngine {
     placement: PlacementStrategy,
     next_backend_idx: Arc<AtomicUsize>,
     cached_quotas: Arc<Mutex<Vec<CachedQuota>>>,
-    chunk_cache: Arc<ChunkCache>,
+    page_cache: Arc<PageCache>,
     download_tracker: Arc<DownloadTracker>,
 }
 
@@ -109,7 +109,7 @@ impl StorageEngine {
             backends: Arc::new(handles),
             next_backend_idx: Arc::new(AtomicUsize::new(0)),
             cached_quotas: Arc::new(Mutex::new(cached)),
-            chunk_cache: Arc::new(ChunkCache::new("/var/cache/multifs/chunks", 50)),
+            page_cache: Arc::new(PageCache::new("/var/cache/multifs/chunks", 10)),
             download_tracker: Arc::new(DownloadTracker::new()),
         }
     }
@@ -435,6 +435,7 @@ impl StorageEngine {
         tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
     ) -> anyhow::Result<()> {
         let backends = &*self.backends;
+        let chunk_size = CHUNK_SIZE;
 
         #[derive(Debug)]
         struct ChunkInfo {
@@ -476,26 +477,29 @@ impl StorageEngine {
                 ci.remote_path.clone()
             };
 
-            // Try cache first
-            if let Some(d) = self.chunk_cache.get(bucket, key, ci.index).await {
-                for chunk in d.chunks(64 * 1024) {
-                    if tx.send(Ok(bytes::Bytes::copy_from_slice(chunk))).await.is_err() {
-                        return Ok(());
+            // Check cache: are all pages cached?
+            let missing = self.page_cache.missing_ranges(bucket, key, ci.index, 0, chunk_size, chunk_size).await;
+            if missing.is_empty() {
+                // All pages cached — stream them sequentially
+                let total_pages = (chunk_size + page_cache::PAGE_SIZE - 1) / page_cache::PAGE_SIZE;
+                for pn in 0..total_pages {
+                    if let Some(page) = self.page_cache.get_page(bucket, key, ci.index, pn, chunk_size).await {
+                        if tx.send(Ok(bytes::Bytes::from(page))).await.is_err() {
+                            return Ok(());
+                        }
                     }
                 }
                 continue;
             }
 
-            // Find backend by index (to avoid reference lifetime issues in spawn)
+            // Find backend by index
             let bi = backends.iter().position(|b| b.label == ci.account_email);
             if let Some(backend_idx) = bi {
-                // Stream page-by-page from pCloud, cache when complete
                 let (dl_tx, mut dl_rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, anyhow::Error>>(64);
                 let dl_path = owned_path.clone();
                 let dl_tx2 = dl_tx.clone();
                 let be_clone = self.backends.clone();
 
-                // Download runs concurrently with page forwarding
                 let dl_handle = tokio::spawn(async move {
                     if let Some(bh) = be_clone.get(backend_idx) {
                         let _ = bh.backend.download_stream(&dl_path, None, None, dl_tx2).await;
@@ -503,11 +507,14 @@ impl StorageEngine {
                 });
                 drop(dl_tx);
 
-                let mut full = Vec::new();
+                let mut offset = 0usize;
                 while let Some(page_res) = dl_rx.recv().await {
                     match page_res {
                         Ok(page) => {
-                            full.extend_from_slice(&page);
+                            let len = page.len();
+                            // Cache each page as it arrives
+                            self.page_cache.put_pages(bucket, key, ci.index, offset, &page, chunk_size).await;
+                            offset += len;
                             if tx.send(Ok(page)).await.is_err() {
                                 return Ok(());
                             }
@@ -519,10 +526,6 @@ impl StorageEngine {
                     }
                 }
                 let _ = dl_handle.await;
-
-                if !full.is_empty() {
-                    self.chunk_cache.put(bucket, key, ci.index, &full).await;
-                }
             }
         }
         Ok(())
@@ -580,7 +583,7 @@ impl StorageEngine {
             spawned += 1;
 
             let backends_owned = self.backends.clone();
-            let cc = self.chunk_cache.clone();
+            let cc = self.page_cache.clone();
             let cdt = dt.clone();
             let pt = page_tx.clone();
             let b = bucket.to_string();
@@ -657,49 +660,55 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Helper: download a single chunk as paged pages and forward through pt channel
+    /// Helper: download a single chunk as paged pages and forward through pt channel.
+    /// Checks page cache first; if missing, downloads from pCloud and caches each page.
     async fn stream_chunk_paged(
-        cc: Arc<ChunkCache>,
+        cc: Arc<PageCache>,
         cdt: Arc<DownloadTracker>,
         backends: Arc<Vec<BackendHandle>>,
         pt: tokio::sync::mpsc::UnboundedSender<(i32, bytes::Bytes)>,
         b: String, k: String, acct: String, ow: String, idx: i32,
     ) {
-        if let Some(d) = cc.get(&b, &k, idx).await {
-            for p in d.chunks(16 * 1024) {
-                if pt.send((idx, bytes::Bytes::copy_from_slice(p))).is_err() { return; }
+        let page_size = page_cache::PAGE_SIZE;
+        // Check if all pages are cached
+        let missing = cc.missing_ranges(&b, &k, idx, 0, CHUNK_SIZE, CHUNK_SIZE).await;
+        if missing.is_empty() {
+            // All pages cached — stream them sequentially
+            let total_pages = (CHUNK_SIZE + page_size - 1) / page_size;
+            for pn in 0..total_pages {
+                if let Some(page) = cc.get_page(&b, &k, idx, pn, CHUNK_SIZE).await {
+                    if pt.send((idx, bytes::Bytes::from(page))).is_err() { return; }
+                }
             }
             return;
         }
+
         let _ = cdt.try_register(&b, &k, idx).await;
-        // Find backend index first (avoids borrowing the backend across await)
         if let Some(backend_idx) = backends.iter().position(|bh| bh.label == acct) {
             let (dl_tx, mut dl_rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, anyhow::Error>>(64);
             let dl_path = ow.clone();
             let dl_tx2 = dl_tx.clone();
             let be_clone = backends.clone();
             let dl_handle = tokio::spawn(async move {
-                // Access backend by index after clone to avoid borrow issues
                 if let Some(bh) = be_clone.get(backend_idx) {
                     let _ = bh.backend.download_stream(&dl_path, None, None, dl_tx2).await;
                 }
             });
             drop(dl_tx);
-            let mut full = Vec::new();
+            let mut offset = 0usize;
             while let Some(res) = dl_rx.recv().await {
                 match res {
                     Ok(p) => {
-                        full.extend_from_slice(&p);
+                        let len = p.len();
+                        cc.put_pages(&b, &k, idx, offset, &p, CHUNK_SIZE).await;
+                        offset += len;
                         if pt.send((idx, p)).is_err() { break; }
                     }
                     Err(_) => break,
                 }
             }
             let _ = dl_handle.await;
-            if !full.is_empty() {
-                cc.put(&b, &k, idx, &full).await;
-                cdt.complete(&b, &k, idx, Ok(vec![])).await;
-            }
+            cdt.complete(&b, &k, idx, Ok(vec![])).await;
         }
     }
 
