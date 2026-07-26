@@ -8,6 +8,7 @@ use crate::config::{Config, PlacementStrategy};
 
 use super::backends::StorageBackend;
 use super::metadata::{MetadataDb, BucketRecord};
+use rusqlite::params;
 use super::chunk_manager;
 
 const CHUNK_SIZE: usize = 32 * 1024 * 1024;
@@ -655,5 +656,217 @@ impl StorageEngine {
     fn find_backend(&self, label: &str) -> anyhow::Result<&BackendHandle> {
         self.backends.iter().find(|b| b.label == label)
             .ok_or_else(|| anyhow::anyhow!("Backend not found: {}", label))
+    }
+
+    /// Rebalance — migrate objects/chunks from over-utilized backends to under-utilized ones.
+    ///
+    /// Per-item strategy: download chunk data from old backend → upload to new backend →
+    /// atomically update SQLite metadata → delete from old backend.
+    /// Works on individual chunks for chunked files, and on whole-object records for small files.
+    /// Returns (migrated_count, total_bytes_moved).
+    pub async fn rebalance(&self, dry_run: bool) -> anyhow::Result<(u64, i64)> {
+        let statuses = self.shard_status().await?;
+        if statuses.len() < 2 {
+            anyhow::bail!("Need at least 2 backends to rebalance");
+        }
+        let total_capacity: i64 = statuses.iter().map(|s| s.total_bytes).sum();
+        let total_used: i64 = statuses.iter().map(|s| s.used_bytes).sum();
+        if total_capacity == 0 {
+            anyhow::bail!("Cannot rebalance: no backends with capacity");
+        }
+        let target_fill = total_used as f64 / total_capacity as f64;
+
+        // Identify which accounts are over-full (should offload data)
+        let over_full_idx: Vec<usize> = statuses.iter().enumerate()
+            .filter(|(_, s)| s.total_bytes > 0
+                && (s.used_bytes as f64 / s.total_bytes as f64) > target_fill + 0.05)
+            .map(|(i, _)| i)
+            .collect();
+
+        if over_full_idx.is_empty() {
+            println!("  ✅ Distribution already balanced (within ±5% of target).");
+            return Ok((0, 0));
+        }
+
+        let over_emails: Vec<&str> = over_full_idx.iter().map(|i| statuses[*i].email.as_str()).collect();
+        println!("  Target fill: {:.1}%
+", target_fill * 100.0);
+        println!("  Over-full accounts (will migrate from):");
+        for i in &over_full_idx {
+            let s = &statuses[*i];
+            let pct = s.used_bytes as f64 / s.total_bytes.max(1) as f64 * 100.0;
+            println!("    {} — {:.1}% full", s.email, pct);
+        }
+
+        if dry_run {
+            // Dry-run: count how many records would move
+            let mut moved: u64 = 0;
+            let mut bytes: i64 = 0;
+
+            // Whole-file objects on over-full accounts
+            let all_objects = self.meta.list_all_objects()?;
+            for obj in &all_objects {
+                if over_emails.contains(&obj.account_email.as_str()) {
+                    let sz = if obj.size > 1_073_741_824 {
+                        format!("{:.1} GiB", obj.size as f64 / 1_073_741_824.0)
+                    } else if obj.size > 1_048_576 {
+                        format!("{:.1} MiB", obj.size as f64 / 1_048_576.0)
+                    } else {
+                        format!("{} B", obj.size)
+                    };
+                    println!("    WOULD MIGRATE: {}/{} ({}) — {}",
+                        obj.bucket_name, obj.key, sz, obj.account_email);
+                    moved += 1;
+                    bytes += obj.size;
+                }
+            }
+
+            // Chunks on over-full accounts
+            let chunk_count = self.meta.with_conn(|conn| -> anyhow::Result<i64> {
+                let mut stmt = conn.prepare(
+                    "SELECT COALESCE(SUM(size), 0), COUNT(*) FROM chunks"
+                )?;
+                Ok(stmt.query_row([], |row| Ok(row.get::<_, i64>(1)?))?)
+            })?;
+            println!("    PLUS {} chunk records (account-level tracking unavailable in dry-run)", chunk_count);
+
+            println!("\n  Would migrate ~{} items ({} bytes total)", moved, bytes);
+            return Ok((moved, bytes));
+        }
+
+        // --- Whole-file migration ---
+        let all_objects = self.meta.list_all_objects()?;
+        let mut migrated: u64 = 0;
+        let mut total_bytes: i64 = 0;
+
+        for obj in &all_objects {
+            if !over_emails.contains(&obj.account_email.as_str()) {
+                continue;
+            }
+            // Skip chunked entries (they're in the chunks table, not objects)
+            if obj.remote_path.starts_with("chunked://") {
+                continue;
+            }
+
+            // 1. Download from old backend
+            let data = match self.get_object(&obj.bucket_name, &obj.key).await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("  ⚠️  {}/{}: download failed ({}), skipping", obj.bucket_name, obj.key, e);
+                    continue;
+                }
+            };
+
+            // 2. Upload to least-full backend (fresh quota check via pick_backend)
+            let new_info = match self.put_object_with_content_type(
+                &obj.bucket_name, &obj.key, &data, obj.content_type.as_deref(),
+            ).await {
+                Ok(info) => info,
+                Err(e) => {
+                    tracing::error!("  ❌ {}/{}: re-upload failed ({}), skipping", obj.bucket_name, obj.key, e);
+                    continue;
+                }
+            };
+
+            // If we landed on a different backend, clean up old copy
+            if new_info.account_email != obj.account_email {
+                // Delete old pCloud file
+                if let Ok(old_backend) = self.find_backend(&obj.account_email) {
+                    let _ = old_backend.backend.delete(&obj.remote_path).await;
+                }
+                // Metadata was already updated by put_object, so old object record
+                // now points to new backend — done.
+                migrated += 1;
+                total_bytes += obj.size;
+                if migrated % 10 == 0 {
+                    println!("  Progress: {} whole-file objects migrated", migrated);
+                }
+            }
+        }
+
+        // --- Chunk-level migration ---
+        // For chunked files, migrate individual chunks from over-full accounts
+        let chunks_to_migrate: Vec<(String, String, i32, i64, String, String)> =
+            self.meta.with_conn(|conn| -> anyhow::Result<Vec<_>> {
+                let mut stmt = conn.prepare(
+                    "SELECT bucket_name, key, chunk_index, size, account_email, remote_path
+                     FROM chunks"
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i32>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })?;
+                let mut v = Vec::new();
+                for r in rows { v.push(r?); }
+                Ok(v)
+            })?;
+
+        let mut chunk_migrated: u64 = 0;
+        for (bucket, key, chunk_index, size, acc_email, remote_path) in &chunks_to_migrate {
+            if !over_emails.contains(&acc_email.as_str()) {
+                continue;
+            }
+
+            // 1. Download chunk from old backend
+            let old_backend = match self.find_backend(acc_email) {
+                Ok(b) => b,
+                Err(_) => {
+                    tracing::warn!("  ⚠️  chunk {}/{}[{}]: backend {} not found, skipping",
+                        bucket, key, chunk_index, acc_email);
+                    continue;
+                }
+            };
+
+            let data = match old_backend.backend.download(remote_path).await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("  ⚠️  chunk {}/{}[{}]: download failed ({}), skipping",
+                        bucket, key, chunk_index, e);
+                    continue;
+                }
+            };
+
+            // 2. Upload to least-full backend
+            let bi = self.pick_backend().await?;
+            let new_backend = &self.backends[bi];
+            let new_chunk_path = format!("{}/{}/{}.ck.{}", new_backend.mount_prefix, bucket, key, chunk_index);
+            let (new_remote_path, _) = match new_backend.backend.upload(&new_chunk_path, &data).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("  ❌ chunk {}/{}[{}]: upload to {} failed ({}), skipping",
+                        bucket, key, chunk_index, new_backend.label, e);
+                    continue;
+                }
+            };
+
+            // 3. Update SQLite: change account_email and remote_path for this chunk
+            self.meta.with_conn(|conn| -> anyhow::Result<()> {
+                conn.execute(
+                    "UPDATE chunks SET account_email = ?1, remote_path = ?2
+                     WHERE bucket_name = ?3 AND key = ?4 AND chunk_index = ?5",
+                    params![new_backend.label, new_remote_path, bucket, key, chunk_index],
+                )?;
+                Ok(())
+            })?;
+
+            // 4. Delete old chunk from old pCloud
+            let _ = old_backend.backend.delete(remote_path).await;
+
+            chunk_migrated += 1;
+            total_bytes += *size;
+            if chunk_migrated % 20 == 0 {
+                println!("  Progress: {} chunks migrated", chunk_migrated);
+            }
+        }
+
+        migrated += chunk_migrated;
+        println!("\n  ✅ Rebalance complete: {} items migrated ({} bytes)", migrated, total_bytes);
+        Ok((migrated, total_bytes))
     }
 }
