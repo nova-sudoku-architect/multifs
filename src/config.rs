@@ -167,7 +167,7 @@ fn default_cache_path() -> String {
     "/var/cache/multifs".to_string()
 }
 fn default_cache_size() -> u64 { 5120 }
-fn default_cache_chunks() -> usize { 50 }
+fn default_cache_chunks() -> usize { 10 }
 
 
 impl Default for ServerConfig {
