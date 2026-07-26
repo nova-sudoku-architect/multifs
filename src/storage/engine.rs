@@ -1,9 +1,10 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use sha2::{Digest, Sha256};
 use chrono::Utc;
 
-use crate::config::Config;
+use crate::config::{Config, PlacementStrategy};
 
 use super::backends::StorageBackend;
 use super::metadata::{MetadataDb, BucketRecord};
@@ -47,6 +48,9 @@ impl BackendHandle {
 pub struct StorageEngine {
     meta: MetadataDb,
     backends: Arc<Vec<BackendHandle>>,
+    placement: PlacementStrategy,
+    /// Round-robin counter (only used when placement is RoundRobin)
+    next_backend_idx: Arc<AtomicUsize>,
     /// Cached fill-level quotas for each backend index, refreshed periodically.
     cached_quotas: Arc<Mutex<Vec<CachedQuota>>>,
 }
@@ -62,7 +66,7 @@ impl StorageEngine {
     /// Backend construction logic lives here; callers wanting DI should use `from_backends`.
     pub fn new(cfg: &Config, meta: MetadataDb) -> anyhow::Result<Self> {
         let handles = Self::build_backends(cfg)?;
-        Ok(Self::from_backends(handles, meta))
+        Ok(Self::from_backends_with_strategy(handles, meta, cfg.storage.placement_strategy))
     }
 
     /// Build backend handles from config (extracted for reuse).
@@ -88,10 +92,19 @@ impl StorageEngine {
 
     /// Construct a StorageEngine from pre-built backends (for testing/DI)
     pub fn from_backends(handles: Vec<BackendHandle>, meta: MetadataDb) -> Self {
+        Self::from_backends_with_strategy(handles, meta, PlacementStrategy::Utilization)
+    }
+
+    /// Construct with explicit placement strategy (for testing/DI)
+    pub fn from_backends_with_strategy(
+        handles: Vec<BackendHandle>, meta: MetadataDb, placement: PlacementStrategy,
+    ) -> Self {
         let cached = handles.iter().map(|_| CachedQuota { fill_ratio: 0.0, total: 1 }).collect();
         Self {
             meta,
+            placement,
             backends: Arc::new(handles),
+            next_backend_idx: Arc::new(AtomicUsize::new(0)),
             cached_quotas: Arc::new(Mutex::new(cached)),
         }
     }
@@ -121,19 +134,25 @@ impl StorageEngine {
         self.put_chunked_file(bucket, key, data, content_type, &etag, &now).await
     }
 
-    /// Pick the backend with the lowest fill ratio (used/quota).
-    /// Refreshes the cache at most once per call (the refresh is async, so we rely on
-    /// the cached values which are updated lazily).
-    async fn pick_least_full_backend(&self) -> anyhow::Result<usize> {
+    /// Pick a backend according to the configured strategy.
+    async fn pick_backend(&self) -> anyhow::Result<usize> {
         let backends = &*self.backends;
         if backends.is_empty() {
             anyhow::bail!("No storage backends configured");
         }
-        let cached = self.cached_quotas.lock().await;
-        let (best_idx, _) = cached.iter().enumerate()
-            .min_by(|(_, a), (_, b)| a.fill_ratio.partial_cmp(&b.fill_ratio).unwrap_or(std::cmp::Ordering::Equal))
-            .ok_or_else(|| anyhow::anyhow!("No backends available"))?;
-        Ok(best_idx)
+        match self.placement {
+            PlacementStrategy::RoundRobin => {
+                let idx = self.next_backend_idx.fetch_add(1, Ordering::Relaxed) % backends.len();
+                Ok(idx)
+            }
+            PlacementStrategy::Utilization => {
+                let cached = self.cached_quotas.lock().await;
+                let (best_idx, _) = cached.iter().enumerate()
+                    .min_by(|(_, a), (_, b)| a.fill_ratio.partial_cmp(&b.fill_ratio).unwrap_or(std::cmp::Ordering::Equal))
+                    .ok_or_else(|| anyhow::anyhow!("No backends available"))?;
+                Ok(best_idx)
+            }
+        }
     }
 
     /// Refresh the fill-ratio cache by querying each backend's quota.
@@ -165,9 +184,10 @@ impl StorageEngine {
         if backends.is_empty() {
             anyhow::bail!("No storage backends configured");
         }
-        // Refresh quotas for utilization-based placement
-        let _ = self.refresh_quotas().await;
-        let idx = self.pick_least_full_backend().await?;
+        if self.placement == PlacementStrategy::Utilization {
+            let _ = self.refresh_quotas().await;
+        }
+        let idx = self.pick_backend().await?;
         let backend = &backends[idx];
         let remote_path = format!("{}/{}/{}", backend.mount_prefix, bucket, key);
         let (remote_path_actual, _) = backend.backend.upload(&remote_path, data).await?;
@@ -213,14 +233,14 @@ impl StorageEngine {
             account: String,
         }
 
-        // Refresh quotas for utilization-based placement
-        let _ = self.refresh_quotas().await;
+        if self.placement == PlacementStrategy::Utilization {
+            let _ = self.refresh_quotas().await;
+        }
 
         let mut results = Vec::new();
         for (local_idx, chunk) in data_chunks.iter().enumerate() {
             let global_idx = local_idx as u32;
-            // Pick least-full backend for each chunk
-            let bi = self.pick_least_full_backend().await?;
+            let bi = self.pick_backend().await?;
             let chunk_path = format!("{}/{}/{}.ck.{}", backends[bi].mount_prefix, bucket, key, global_idx);
 
             match backends[bi].backend.upload(&chunk_path, &chunk.data).await {

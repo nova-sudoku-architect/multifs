@@ -1,5 +1,43 @@
 use serde::{Deserialize, Serialize};
 
+/// Placement strategy for distributing uploads across backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlacementStrategy {
+    /// Round-robin across all backends (original behavior)
+    RoundRobin,
+    /// Pick the backend with the lowest utilization rate
+    Utilization,
+}
+
+impl std::str::FromStr for PlacementStrategy {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "round-robin" | "round_robin" | "roundrobin" => Ok(Self::RoundRobin),
+            "utilization" | "fill-level" | "fill_level" | "least-full" | "least_full" | "leastfull" => Ok(Self::Utilization),
+            other => anyhow::bail!("Unknown placement strategy '{}'. Expected: round-robin or utilization", other),
+        }
+    }
+}
+
+impl std::fmt::Display for PlacementStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RoundRobin => write!(f, "round-robin"),
+            Self::Utilization => write!(f, "utilization"),
+        }
+    }
+}
+
+impl PlacementStrategy {
+    /// All known strategy names (for help text)
+    pub const VARIANTS: &'static [&'static str] = &["round-robin", "utilization"];
+}
+
+fn default_placement_strategy() -> PlacementStrategy {
+    PlacementStrategy::Utilization
+}
+
 /// Top-level configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -71,9 +109,10 @@ pub struct StorageConfig {
     /// Cache size in MB
     #[serde(default = "default_cache_size")]
     pub cache_size_mb: u64,
-    /// Sharding strategy: "fill-level" or "round-robin"
-    #[serde(default = "default_shard_strategy")]
-    pub shard_strategy: String,
+    /// Placement strategy for distributing uploads across backends.
+    /// Options: "round-robin" (default), "utilization" (picks least-full account).
+    #[serde(default = "default_placement_strategy")]
+    pub placement_strategy: PlacementStrategy,
     /// List of pCloud accounts
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
@@ -124,7 +163,7 @@ fn default_cache_path() -> String {
     "/var/cache/multifs".to_string()
 }
 fn default_cache_size() -> u64 { 5120 }
-fn default_shard_strategy() -> String { "fill-level".to_string() }
+
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -146,7 +185,7 @@ impl Default for StorageConfig {
             meta_db_path: default_meta_db(),
             cache_path: default_cache_path(),
             cache_size_mb: default_cache_size(),
-            shard_strategy: default_shard_strategy(),
+            placement_strategy: default_placement_strategy(),
             accounts: Vec::new(),
         }
     }

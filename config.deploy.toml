@@ -16,25 +16,32 @@ domain = "vmi3137694.tailb9bfd3.ts.net"
 meta_db_path = "/var/lib/multifs/meta.db"
 cache_path = "/var/cache/multifs"
 cache_size_mb = 512
-shard_strategy = "fill-level"
+placement_strategy = "utilization"
+
+[[storage.accounts]]
+backend_type = "pcloud"
+email = "nova-video-12@agentmail.to"
+token_env = "PCLOUD_TOKEN_VIDEO_12"
+mount_prefix = "/multifs/12"
+quota_gb = 5
 
 [[storage.accounts]]
 backend_type = "pcloud"
 email = "nova-video-20@agentmail.to"
-token_env = "PCLOUD_TOKEN_VIDEO_10"
+token_env = "PCLOUD_TOKEN_VIDEO_20"
 mount_prefix = "/multifs/20"
-quota_gb = 4
+quota_gb = 5
 
 [[storage.accounts]]
 backend_type = "pcloud"
 email = "nova-video-21@agentmail.to"
-token_env = "PCLOUD_TOKEN_VIDEO_11"
+token_env = "PCLOUD_TOKEN_VIDEO_21"
 mount_prefix = "/multifs/21"
-quota_gb = 4
+quota_gb = 5
 
 [[storage.accounts]]
 backend_type = "pcloud"
 email = "nova-video-22@agentmail.to"
-token_env = "PCLOUD_TOKEN_VIDEO_12"
+token_env = "PCLOUD_TOKEN_VIDEO_22"
 mount_prefix = "/multifs/22"
 quota_gb = 4
