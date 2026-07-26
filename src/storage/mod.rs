@@ -1,6 +1,5 @@
 pub mod chunk_manager;
 pub mod engine;
-pub mod local_cache;
 pub mod metadata;
 pub mod placement;
 pub mod backends;

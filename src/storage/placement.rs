@@ -59,24 +59,6 @@ pub fn get_account_for_chunk(accounts: &[String], chunk_index: u32) -> &str {
     &accounts[idx]
 }
 
-/// Given a set of chunk-index-to-account assignments from a PlacementPlan,
-/// reconstruct the ordered list of accounts used.
-///
-/// NOTE: This function has been replaced by `PlacementPlan::unique_accounts()`.
-/// It is kept for backward compatibility and returns the unique accounts from a plan.
-#[deprecated(since = "0.1.0", note = "Use PlacementPlan::unique_accounts() instead")]
-pub fn reconstruct_accounts(accounts: &[String]) -> Vec<String> {
-    // For a fresh plan, just deduplicate in round-robin order
-    let mut seen = std::collections::HashSet::new();
-    let mut result = Vec::new();
-    for acct in accounts {
-        if seen.insert(acct.clone()) {
-            result.push(acct.clone());
-        }
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,24 +133,7 @@ mod tests {
         assert_eq!(used[0], accounts[0]);
     }
 
-    // ---- Test 4: reconstruct_accounts (get account list from plan) ----
-
-    #[test]
-    fn test_reconstruct_accounts() {
-        let accounts = test_accounts();
-        let plan = plan_placement(&accounts, 7);
-
-        let unique = plan.unique_accounts();
-        // With 7 chunks across 6 accounts, we use all 6
-        assert_eq!(unique.len(), 6);
-
-        // All accounts should be present
-        for acct in &accounts {
-            assert!(unique.contains(acct), "Account {} should be in unique set", acct);
-        }
-    }
-
-    // ---- Test 5: even distribution ----
+    // ---- Test 4: even distribution ----
 
     #[test]
     fn test_even_distribution() {
