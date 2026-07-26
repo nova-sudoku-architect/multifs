@@ -1,3 +1,76 @@
+/// In-memory mock backend for testing StorageEngine without real cloud accounts.
+#[cfg(test)]
+mod mock_backend {
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use crate::storage::backends::{StorageBackend, StorageFile};
+
+    pub struct MockBackend {
+        pub name: String,
+        pub files: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl MockBackend {
+        pub fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                files: Mutex::new(HashMap::new()),
+            }
+        }
+
+        pub fn file_count(&self) -> usize {
+            self.files.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for MockBackend {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn check_quota(&self) -> anyhow::Result<(i64, i64)> {
+            let used: i64 = self.files.lock().unwrap().values().map(|v| v.len() as i64).sum();
+            Ok((used, 1_000_000_000)) // 1 GB total
+        }
+
+        async fn upload(&self, remote_path: &str, data: &[u8]) -> anyhow::Result<(String, i64)> {
+            self.files.lock().unwrap().insert(remote_path.to_string(), data.to_vec());
+            Ok((remote_path.to_string(), data.len() as i64))
+        }
+
+        async fn download(&self, remote_path: &str) -> anyhow::Result<Vec<u8>> {
+            self.files
+                .lock()
+                .unwrap()
+                .get(remote_path)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("File not found: {}", remote_path))
+        }
+
+        async fn delete(&self, remote_path: &str) -> anyhow::Result<()> {
+            self.files.lock().unwrap().remove(remote_path);
+            Ok(())
+        }
+
+        async fn list(&self, _prefix: &str) -> anyhow::Result<Vec<StorageFile>> {
+            let files = self.files.lock().unwrap();
+            Ok(files
+                .iter()
+                .map(|(path, data)| StorageFile {
+                    name: path.rsplit('/').next().unwrap_or(path).to_string(),
+                    path: path.clone(),
+                    size: data.len() as i64,
+                    modified: "2026-01-01".to_string(),
+                    is_folder: false,
+                })
+                .collect())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::storage::metadata::MetadataDb;
@@ -377,6 +450,193 @@ mod tests {
         assert_eq!(db.bucket_total_size("test").unwrap(), 300);
         assert_eq!(db.count_objects_for_account("a1").unwrap(), 2);
         assert_eq!(db.account_total_size("a1").unwrap(), 300);
+    }
+
+    // ---- StorageEngine Tests (using MockBackend) ----
+
+    struct TestEngine {
+        engine: crate::storage::engine::StorageEngine,
+        mock: std::sync::Arc<super::mock_backend::MockBackend>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn make_test_engine() -> TestEngine {
+        use crate::storage::metadata::MetadataDb;
+        use crate::storage::engine::StorageEngine;
+        use super::mock_backend::MockBackend;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
+
+        let backends: Vec<crate::storage::engine::BackendHandle> = vec![
+            crate::storage::engine::BackendHandle::new(
+                Box::new(MockBackend::new("mock-a")),
+                "/mnt/mock-a".to_string(),
+                "mock-a".to_string(),
+                10,
+            ),
+            crate::storage::engine::BackendHandle::new(
+                Box::new(MockBackend::new("mock-b")),
+                "/mnt/mock-b".to_string(),
+                "mock-b".to_string(),
+                10,
+            ),
+        ];
+
+        TestEngine {
+            engine: StorageEngine::from_backends(backends, db),
+            mock: std::sync::Arc::new(MockBackend::new("mock-a")),
+            _dir: dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_engine_put_get_object() {
+        let t = make_test_engine();
+        let engine = &t.engine;
+        engine.create_bucket("test-bucket").await.unwrap();
+
+        let data = b"Hello, MultiFS Engine!" as &[u8];
+        let obj = engine.put_object("test-bucket", "hello.txt", data).await.unwrap();
+        assert_eq!(obj.key, "hello.txt");
+        assert_eq!(obj.size, data.len() as i64);
+
+        let downloaded = engine.get_object("test-bucket", "hello.txt").await.unwrap();
+        assert_eq!(downloaded, data);
+    }
+
+    #[tokio::test]
+    async fn test_engine_put_get_empty_object() {
+        let t = make_test_engine();
+        let engine = &t.engine;
+        engine.create_bucket("empty-bucket").await.unwrap();
+
+        let empty: &[u8] = &[];
+        let obj = engine.put_object("empty-bucket", "empty.txt", empty).await.unwrap();
+        assert_eq!(obj.size, 0);
+
+        let downloaded = engine.get_object("empty-bucket", "empty.txt").await.unwrap();
+        assert!(downloaded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_engine_delete_object() {
+        let t = make_test_engine();
+        let engine = &t.engine;
+        engine.create_bucket("del-bucket").await.unwrap();
+
+        engine.put_object("del-bucket", "tmp.txt", b"temp").await.unwrap();
+        engine.delete_object("del-bucket", "tmp.txt").await.unwrap();
+
+        // Should fail (not found)
+        let result = engine.get_object("del-bucket", "tmp.txt").await;
+        assert!(result.is_err(), "Fetching deleted object should fail");
+    }
+
+    #[tokio::test]
+    async fn test_engine_list_objects() {
+        let t = make_test_engine();
+        let engine = &t.engine;
+        engine.create_bucket("list-bucket").await.unwrap();
+
+        engine.put_object("list-bucket", "a.txt", b"aaa").await.unwrap();
+        engine.put_object("list-bucket", "b.txt", b"bbb").await.unwrap();
+        engine.put_object("list-bucket", "c.txt", b"ccc").await.unwrap();
+
+        let objs = engine.list_objects("list-bucket", None, 100).await.unwrap();
+        assert_eq!(objs.len(), 3);
+
+        let prefixed = engine.list_objects("list-bucket", Some("a"), 100).await.unwrap();
+        assert_eq!(prefixed.len(), 1);
+        assert_eq!(prefixed[0].key, "a.txt");
+    }
+
+    #[tokio::test]
+    async fn test_engine_bucket_crud() {
+        let t = make_test_engine();
+        let engine = &t.engine;
+
+        assert!(!engine.bucket_exists("my-bucket").await.unwrap());
+        engine.create_bucket("my-bucket").await.unwrap();
+        assert!(engine.bucket_exists("my-bucket").await.unwrap());
+        engine.delete_bucket("my-bucket").await.unwrap();
+        assert!(!engine.bucket_exists("my-bucket").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_engine_non_existent_object() {
+        let t = make_test_engine();
+        let engine = &t.engine;
+        engine.create_bucket("ghost-bucket").await.unwrap();
+
+        let result = engine.get_object("ghost-bucket", "nope.txt").await;
+        assert!(result.is_err());
+
+        let del_result = engine.delete_object("ghost-bucket", "nope.txt").await;
+        assert!(del_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_engine_round_robin_across_backends() {
+        let t = make_test_engine();
+        let engine = &t.engine;
+        engine.create_bucket("rr-bucket").await.unwrap();
+
+        // Put 4 small files — they should round-robin across 2 backends
+        engine.put_object("rr-bucket", "f1.txt", b"data1").await.unwrap();
+        engine.put_object("rr-bucket", "f2.txt", b"data2").await.unwrap();
+        engine.put_object("rr-bucket", "f3.txt", b"data3").await.unwrap();
+        engine.put_object("rr-bucket", "f4.txt", b"data4").await.unwrap();
+
+        // All 4 should be retrievable
+        assert_eq!(engine.get_object("rr-bucket", "f1.txt").await.unwrap(), b"data1");
+        assert_eq!(engine.get_object("rr-bucket", "f2.txt").await.unwrap(), b"data2");
+        assert_eq!(engine.get_object("rr-bucket", "f3.txt").await.unwrap(), b"data3");
+        assert_eq!(engine.get_object("rr-bucket", "f4.txt").await.unwrap(), b"data4");
+    }
+
+    #[tokio::test]
+    async fn test_engine_delete_chunked_file() {
+        let t = make_test_engine();
+        let engine = &t.engine;
+        engine.create_bucket("chunk-bucket").await.unwrap();
+
+        // 80 MB should be chunked (chunk size is 32 MB)
+        let big_data = vec![0xABu8; 80 * 1024 * 1024];
+        engine.put_object("chunk-bucket", "bigfile.bin", &big_data).await.unwrap();
+
+        // Verify it exists
+        let downloaded = engine.get_object("chunk-bucket", "bigfile.bin").await.unwrap();
+        assert_eq!(downloaded.len(), 80 * 1024 * 1024);
+        assert_eq!(&downloaded[..10], &big_data[..10]);
+
+        // Now delete it
+        engine.delete_object("chunk-bucket", "bigfile.bin").await.unwrap();
+
+        // Should be gone
+        let result = engine.get_object("chunk-bucket", "bigfile.bin").await;
+        assert!(result.is_err(), "Deleted chunked file should not be retrievable");
+    }
+
+    #[tokio::test]
+    async fn test_engine_delete_bucket_with_mixed_files() {
+        let t = make_test_engine();
+        let engine = &t.engine;
+        engine.create_bucket("mixed-bucket").await.unwrap();
+
+        // Mix of small and large files
+        engine.put_object("mixed-bucket", "small.txt", b"hi").await.unwrap();
+        let big_data = vec![0xCDu8; 70 * 1024 * 1024]; // chunked
+        engine.put_object("mixed-bucket", "large.bin", &big_data).await.unwrap();
+
+        // List should show both
+        let objs = engine.list_objects("mixed-bucket", None, 100).await.unwrap();
+        assert_eq!(objs.len(), 2);
+
+        // Delete the bucket — should clean both whole-file and chunked
+        engine.delete_bucket("mixed-bucket").await.unwrap();
+        assert!(!engine.bucket_exists("mixed-bucket").await.unwrap());
     }
 }
 

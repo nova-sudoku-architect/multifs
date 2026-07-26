@@ -30,11 +30,17 @@ pub struct ShardStatus {
     pub total_bytes: i64,
 }
 
-struct BackendHandle {
-    backend: Box<dyn StorageBackend>,
-    mount_prefix: String,
-    label: String,
-    quota_gb: u64,
+pub struct BackendHandle {
+    pub backend: Box<dyn StorageBackend>,
+    pub mount_prefix: String,
+    pub label: String,
+    pub quota_gb: u64,
+}
+
+impl BackendHandle {
+    pub fn new(backend: Box<dyn StorageBackend>, mount_prefix: String, label: String, quota_gb: u64) -> Self {
+        Self { backend, mount_prefix, label, quota_gb }
+    }
 }
 
 #[derive(Clone)]
@@ -55,18 +61,27 @@ impl StorageEngine {
                 }
                 Some(other) => anyhow::bail!("Unknown backend type: {}", other),
             };
-            handles.push(BackendHandle {
+            handles.push(BackendHandle::new(
                 backend,
-                mount_prefix: acct.mount_prefix.clone(),
-                label: acct.email.clone(),
-                quota_gb: acct.quota_gb.unwrap_or(10),
-            });
+                acct.mount_prefix.clone(),
+                acct.email.clone(),
+                acct.quota_gb.unwrap_or(10),
+            ));
         }
         Ok(Self {
             meta,
             backends: Arc::new(handles),
             next_whole_file_idx: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// Construct a StorageEngine from pre-built backends (for testing/DI)
+    pub fn from_backends(handles: Vec<BackendHandle>, meta: MetadataDb) -> Self {
+        Self {
+            meta,
+            backends: Arc::new(handles),
+            next_whole_file_idx: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     pub async fn put_object(
