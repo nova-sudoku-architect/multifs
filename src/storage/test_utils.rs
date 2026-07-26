@@ -48,6 +48,23 @@ impl StorageBackend for MockBackend {
             .ok_or_else(|| anyhow::anyhow!("File not found: {}", remote_path))
     }
 
+    async fn download_stream(
+        &self,
+        remote_path: &str,
+        _range_start: Option<u64>,
+        _range_end: Option<u64>,
+        tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
+    ) -> anyhow::Result<()> {
+        // For mock: send the full file in 64KB chunks (no real Range support needed for tests)
+        let data = self.download(remote_path).await?;
+        for chunk in data.chunks(64 * 1024) {
+            if tx.send(Ok(bytes::Bytes::copy_from_slice(chunk))).await.is_err() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     async fn delete(&self, remote_path: &str) -> anyhow::Result<()> {
         self.files.lock().unwrap().remove(remote_path);
         Ok(())

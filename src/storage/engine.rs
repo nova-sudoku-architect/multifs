@@ -343,13 +343,9 @@ impl StorageEngine {
                 let obj = self.meta.get_object(bucket, key)?
                     .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
                 let backend = self.find_backend(&obj.account_email)?;
-                let data = backend.backend.download(&obj.remote_path).await?;
-                for chunk in data.chunks(64 * 1024) {
-                    if tx.send(Ok(bytes::Bytes::copy_from_slice(chunk))).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(())
+                // Stream from pCloud: each chunk forwarded through the channel as it arrives
+                // No full-file buffering — VLC can start playing immediately
+                backend.backend.download_stream(&obj.remote_path, None, None, tx).await
             }
         }
     }

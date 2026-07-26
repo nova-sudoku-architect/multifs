@@ -478,12 +478,20 @@ async fn put_object(
     }
 }
 
-/// GET /{bucket}/{key} — Download object with optional Range support
+/// GET /{bucket}/{key} — Download object with streaming Range support.
+/// Uses channel-based streaming so video players (VLC) can seek without
+/// the server buffering the entire file into memory.
 async fn get_object(
     State(state): State<S3State>,
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
+    use tokio::sync::mpsc;
+    use bytes::Bytes;
+    use futures::stream::StreamExt;
+    use std::pin::Pin;
+
+    // Get object metadata first (size, content-type, etag)
     let obj_info = match state.engine.head_object(&bucket, &key).await {
         Ok(info) => info,
         Err(e) => {
@@ -496,83 +504,70 @@ async fn get_object(
         }
     };
 
-    let data = match state.engine.get_object(&bucket, &key).await {
-        Ok(d) => d,
-        Err(e) => {
-            let xml = s3_error_xml("NoSuchKey", &e.to_string(), &format!("{}/{}", bucket, key));
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header("Content-Type", "application/xml")
-                .body(Body::from(xml))
-                .unwrap();
-        }
-    };
-
-    let total_len = data.len();
+    let total_len = obj_info.size as usize;
     let content_type = obj_info.content_type.unwrap_or_else(|| "application/octet-stream".to_string());
 
-    // Handle Range header
-    if let Some(range_val) = headers.get(http::header::RANGE) {
-        if let Ok(range_str) = range_val.to_str() {
-            if let Some((start, end)) = parse_range(range_str, total_len) {
-                if start < total_len {
-                    let end = end.min(total_len);
-                    let chunk = &data[start..end];
-                    let chunk_len = chunk.len();
+    // Parse optional Range header
+    let range_val = headers.get(http::header::RANGE).and_then(|v| v.to_str().ok());
+    let parsed_range = range_val.and_then(|rv| crate::server::parse_range(rv, total_len));
 
-                    return Response::builder()
-                        .status(StatusCode::PARTIAL_CONTENT)
-                        .header("Content-Type", &content_type)
-                        .header("Content-Length", chunk_len.to_string())
-                        .header("Content-Range", format!("bytes {}-{}/{}", start, end - 1, total_len))
-                        .header("Accept-Ranges", "bytes")
-                        .body(Body::from(chunk.to_vec()))
-                        .unwrap();
-                }
-            }
+    // Set up streaming channel
+    let content_length = match parsed_range {
+        Some((start, end)) => end.saturating_sub(start),
+        None => total_len,
+    };
+
+    let (tx, rx) = mpsc::channel::<Result<Bytes, anyhow::Error>>(16);
+    let engine = state.engine.clone();
+    let b = bucket.clone();
+    let k = key.clone();
+
+    tokio::task::spawn(async move {
+        if let Err(e) = engine.get_object_stream(&b, &k, tx).await {
+            tracing::error!("S3 stream error for {}/{}: {}", b, k, e);
         }
-    }
+    });
 
-    // Full content
-    Response::builder()
+    use tokio_stream::wrappers::ReceiverStream;
+    let base_stream = ReceiverStream::new(rx).filter_map(|r| async move { r.ok() });
+
+    // Apply Range slicing on the stream (same pattern as WebDAV)
+    let stream: Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::convert::Infallible>> + Send>> =
+        if let Some((req_start, req_end)) = parsed_range {
+            let mut emitted: usize = 0;
+            let sliced = base_stream
+                .take_while(move |_| futures::future::ready(emitted < req_end))
+                .filter_map(move |chunk| {
+                    let chunk_len = chunk.len();
+                    let chunk_start = emitted;
+                    let chunk_end = emitted + chunk_len;
+                    emitted = chunk_end;
+                    if chunk_end <= req_start || chunk_start >= req_end {
+                        futures::future::ready(None)
+                    } else {
+                        let slice_begin = if chunk_start < req_start { req_start - chunk_start } else { 0 };
+                        let slice_end = if chunk_end > req_end { chunk_len - (chunk_end - req_end) } else { chunk_len };
+                        futures::future::ready(if slice_begin >= slice_end { None } else { Some(Ok(chunk.slice(slice_begin..slice_end))) })
+                    }
+                });
+            Box::pin(sliced)
+        } else {
+            Box::pin(base_stream.map(Ok))
+        };
+
+    let mut response = Response::builder()
         .header("Content-Type", &content_type)
-        .header("Content-Length", total_len.to_string())
+        .header("Content-Length", content_length.to_string())
         .header("Accept-Ranges", "bytes")
-        .body(Body::from(data))
-        .unwrap()
-}
+        .header("ETag", format!("\"{}\"", obj_info.etag));
 
-/// Parse HTTP Range header like "bytes=0-1023" or "bytes=100-"
-/// Returns Some((start, end)) where end is exclusive and <= total_len
-fn parse_range(range: &str, total_len: usize) -> Option<(usize, usize)> {
-    let range = range.strip_prefix("bytes=")?;
-    if let Some(dash_pos) = range.find('-') {
-        let start_str = &range[..dash_pos];
-        let end_str = &range[dash_pos + 1..];
-
-        let start: usize = if start_str.is_empty() {
-            // Suffix range: bytes=-500 → last 500 bytes
-            let suffix: usize = end_str.parse().ok()?;
-            if suffix >= total_len {
-                return Some((0, total_len));
-            }
-            return Some((total_len - suffix, total_len));
-        } else {
-            start_str.parse().ok()?
-        };
-
-        let end: usize = if end_str.is_empty() {
-            total_len
-        } else {
-            // End is inclusive in HTTP range, convert to exclusive
-            let inclusive_end: usize = end_str.parse().ok()?;
-            inclusive_end + 1
-        };
-
-        Some((start, end))
-    } else {
-        None
+    if let Some((start, end)) = parsed_range {
+        response = response
+            .header("Content-Range", format!("bytes {}-{}/{}", start, end.saturating_sub(1), total_len))
+            .status(StatusCode::PARTIAL_CONTENT);
     }
+
+    response.body(Body::from_stream(stream)).unwrap()
 }
 
 /// HEAD /{bucket}/{key} — Object metadata

@@ -201,6 +201,76 @@ impl PCloudClient {
         Ok(result_bytes)
     }
 
+    /// Download a file from pCloud, streaming chunks through a channel.
+    /// Each chunk is sent as it arrives from the CDN — no full-file buffering.
+    /// Supports Range headers via the optional `range_start`/`range_end` parameters.
+    pub async fn download_stream(
+        &self,
+        remote_path: &str,
+        range_start: Option<u64>,
+        range_end: Option<u64>,
+        tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
+    ) -> anyhow::Result<()> {
+        // Get the file link (same auth as regular download)
+        let resp = self
+            .client
+            .get(format!("{}/getfilelink", self.base_url))
+            .query(&[
+                ("access_token", self.token.as_str()),
+                ("path", remote_path),
+            ])
+            .send()
+            .await?;
+
+        let body: serde_json::Value = resp.json().await?;
+        let result = body["result"].as_i64().unwrap_or(-1);
+        if result != 0 {
+            anyhow::bail!("Get file link error {}: {}", result, body["error"]);
+        }
+
+        let host = body["hosts"]
+            .as_array()
+            .and_then(|h| h.first())
+            .and_then(|h| h.as_str())
+            .ok_or_else(|| anyhow::anyhow!("No hosts in response"))?;
+        let link_path = body["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("No path in response"))?;
+
+        let download_url = format!("https://{}{}", host, link_path);
+
+        // Build the request, optionally with Range header
+        let mut req = self.client.get(&download_url);
+        if let Some(start) = range_start {
+            let end = range_end.map_or("".to_string(), |e| e.to_string());
+            req = req.header("Range", format!("bytes={}-{}", start, end));
+        }
+
+        let response = req.send().await?;
+        let status = response.status();
+        if !status.is_success() && status.as_u16() != 206 {
+            anyhow::bail!("pCloud download failed with status {}", status);
+        }
+
+        // Stream chunks to the channel as they arrive
+        let mut stream = response.bytes_stream();
+        use futures::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        break; // Receiver dropped (client disconnected)
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(anyhow::anyhow!("Download stream error: {}", e))).await;
+                    anyhow::bail!("Download stream error: {}", e);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Copy a file server-side using pCloud's copyfile API
     pub async fn copy_file(&self, source_path: &str, dest_parent: &str, new_name: &str) -> anyhow::Result<()> {
         let resp = self

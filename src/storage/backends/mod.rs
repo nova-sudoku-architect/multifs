@@ -26,6 +26,17 @@ pub trait StorageBackend: Send + Sync {
     /// Download a file's content.
     async fn download(&self, remote_path: &str) -> anyhow::Result<Vec<u8>>;
 
+    /// Download a file, streaming chunks through a channel.
+    /// Each chunk is sent as it arrives — no full-file buffering.
+    /// Optional range_start/range_end for partial downloads (VLC seeking).
+    async fn download_stream(
+        &self,
+        remote_path: &str,
+        range_start: Option<u64>,
+        range_end: Option<u64>,
+        tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
+    ) -> anyhow::Result<()>;
+
     /// Delete a file.
     async fn delete(&self, remote_path: &str) -> anyhow::Result<()>;
 

@@ -38,6 +38,16 @@ impl StorageBackend for PCloudBackend {
         self.client.download(remote_path).await
     }
 
+    async fn download_stream(
+        &self,
+        remote_path: &str,
+        range_start: Option<u64>,
+        range_end: Option<u64>,
+        tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
+    ) -> anyhow::Result<()> {
+        self.client.download_stream(remote_path, range_start, range_end, tx).await
+    }
+
     async fn delete(&self, remote_path: &str) -> anyhow::Result<()> {
         self.client.delete(remote_path).await
     }
