@@ -51,7 +51,15 @@ pub struct StorageEngine {
 }
 
 impl StorageEngine {
+    /// Construct StorageEngine from a Config (convenience wrapper).
+    /// Backend construction logic lives here; callers wanting DI should use `from_backends`.
     pub fn new(cfg: &Config, meta: MetadataDb) -> anyhow::Result<Self> {
+        let handles = Self::build_backends(cfg)?;
+        Ok(Self::from_backends(handles, meta))
+    }
+
+    /// Build backend handles from config (extracted for reuse).
+    fn build_backends(cfg: &Config) -> anyhow::Result<Vec<BackendHandle>> {
         let mut handles = Vec::new();
         for acct in &cfg.storage.accounts {
             let backend: Box<dyn StorageBackend> = match acct.backend_type.as_deref() {
@@ -68,11 +76,7 @@ impl StorageEngine {
                 acct.quota_gb.unwrap_or(10),
             ));
         }
-        Ok(Self {
-            meta,
-            backends: Arc::new(handles),
-            next_whole_file_idx: Arc::new(AtomicUsize::new(0)),
-        })
+        Ok(handles)
     }
 
     /// Construct a StorageEngine from pre-built backends (for testing/DI)
