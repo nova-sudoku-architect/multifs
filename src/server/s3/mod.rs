@@ -523,37 +523,17 @@ async fn get_object(
     let k = key.clone();
 
     tokio::task::spawn(async move {
-        if let Err(e) = engine.get_object_stream(&b, &k, tx).await {
+        let range_for_stream = parsed_range;
+        if let Err(e) = engine.get_object_stream(&b, &k, range_for_stream, tx).await {
             tracing::error!("S3 stream error for {}/{}: {}", b, k, e);
         }
     });
 
     use tokio_stream::wrappers::ReceiverStream;
-    let base_stream = ReceiverStream::new(rx).filter_map(|r| async move { r.ok() });
 
-    // Apply Range slicing on the stream (same pattern as WebDAV)
+    // Range slicing is handled inside the engine for chunked files.
     let stream: Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::convert::Infallible>> + Send>> =
-        if let Some((req_start, req_end)) = parsed_range {
-            let mut emitted: usize = 0;
-            let sliced = base_stream
-                .take_while(move |_| futures::future::ready(emitted < req_end))
-                .filter_map(move |chunk| {
-                    let chunk_len = chunk.len();
-                    let chunk_start = emitted;
-                    let chunk_end = emitted + chunk_len;
-                    emitted = chunk_end;
-                    if chunk_end <= req_start || chunk_start >= req_end {
-                        futures::future::ready(None)
-                    } else {
-                        let slice_begin = if chunk_start < req_start { req_start - chunk_start } else { 0 };
-                        let slice_end = if chunk_end > req_end { chunk_len - (chunk_end - req_end) } else { chunk_len };
-                        futures::future::ready(if slice_begin >= slice_end { None } else { Some(Ok(chunk.slice(slice_begin..slice_end))) })
-                    }
-                });
-            Box::pin(sliced)
-        } else {
-            Box::pin(base_stream.map(Ok))
-        };
+        Box::pin(ReceiverStream::new(rx).filter_map(|r| async move { r.ok() }).map(Ok));
 
     let mut response = Response::builder()
         .header("Content-Type", &content_type)

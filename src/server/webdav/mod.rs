@@ -287,8 +287,11 @@ async fn handle_get(state: &WebDAVState, path: &str, method: Method, headers: Op
     use futures::stream::StreamExt;
 
     // Parse optional HTTP Range header
-    let parsed_range: Option<(usize, usize)> = headers
-        .and_then(|hdrs| hdrs.get("range").and_then(|v| v.to_str().ok()))
+    let raw_range = headers.and_then(|hdrs| hdrs.get("range").and_then(|v| v.to_str().ok().map(|s| s.to_string())));
+    if let Some(ref r) = raw_range {
+        tracing::debug!("WebDAV GET Range: {} (total_len={})", r, total_len);
+    }
+    let parsed_range: Option<(usize, usize)> = raw_range.as_deref()
         .and_then(|rv| parse_range(rv, total_len));
 
     let content_length = match parsed_range {
@@ -302,7 +305,7 @@ async fn handle_get(state: &WebDAVState, path: &str, method: Method, headers: Op
     let k = key.to_string();
 
     tokio::task::spawn(async move {
-        if let Err(e) = engine_clone.get_object_stream(&b, &k, tx).await {
+        if let Err(e) = engine_clone.get_object_stream(&b, &k, parsed_range, tx).await {
             tracing::error!("Stream error: {}", e);
         }
     });
@@ -310,37 +313,11 @@ async fn handle_get(state: &WebDAVState, path: &str, method: Method, headers: Op
     use tokio_stream::wrappers::ReceiverStream;
     use futures::stream::StreamExt as _;
 
-    let base_stream = ReceiverStream::new(rx)
-        .filter_map(|r| async move { r.ok() });
-
+    // Range slicing is handled inside the engine's get_chunked_file_stream
+    // for chunked files. For non-chunked files, the engine passes the offset
+    // to the backend. No additional slicing needed here.
     let stream: Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::convert::Infallible>> + Send>> =
-        if let Some((req_start, req_end)) = parsed_range {
-            let mut emitted: usize = 0;
-            let sliced = base_stream
-                .take_while(move |_| futures::future::ready(emitted < req_end))
-                .filter_map(move |chunk| {
-                    let chunk_len = chunk.len();
-                    let chunk_start = emitted;
-                    let chunk_end = emitted + chunk_len;
-                    emitted = chunk_end;
-                    if chunk_end <= req_start || chunk_start >= req_end {
-                        futures::future::ready(None)
-                    } else {
-                        let slice_begin = if chunk_start < req_start {
-                            req_start - chunk_start
-                        } else { 0 };
-                        let slice_end = if chunk_end > req_end {
-                            chunk_len - (chunk_end - req_end)
-                        } else { chunk_len };
-                        let sliced = chunk.slice(slice_begin..slice_end);
-                        futures::future::ready(if sliced.is_empty() { None } else { Some(Ok(sliced)) })
-                    }
-                });
-            Box::pin(sliced)
-        } else {
-            let full = base_stream.map(Ok);
-            Box::pin(full)
-        };
+        Box::pin(ReceiverStream::new(rx).filter_map(|r| async move { r.ok() }).map(Ok));
 
     let mut response = Response::builder()
         .header(header::CONTENT_TYPE, &content_type)

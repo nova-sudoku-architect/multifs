@@ -10,6 +10,8 @@ use super::backends::StorageBackend;
 use super::metadata::{MetadataDb, BucketRecord};
 use rusqlite::params;
 use super::chunk_manager;
+use super::chunk_cache::ChunkCache;
+use super::download_tracker::DownloadTracker;
 
 const CHUNK_SIZE: usize = 32 * 1024 * 1024;
 
@@ -50,10 +52,10 @@ pub struct StorageEngine {
     meta: MetadataDb,
     backends: Arc<Vec<BackendHandle>>,
     placement: PlacementStrategy,
-    /// Round-robin counter (only used when placement is RoundRobin)
     next_backend_idx: Arc<AtomicUsize>,
-    /// Cached fill-level quotas for each backend index, refreshed periodically.
     cached_quotas: Arc<Mutex<Vec<CachedQuota>>>,
+    chunk_cache: Arc<ChunkCache>,
+    download_tracker: Arc<DownloadTracker>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -107,6 +109,8 @@ impl StorageEngine {
             backends: Arc::new(handles),
             next_backend_idx: Arc::new(AtomicUsize::new(0)),
             cached_quotas: Arc::new(Mutex::new(cached)),
+            chunk_cache: Arc::new(ChunkCache::new("/var/cache/multifs/chunks", 50)),
+            download_tracker: Arc::new(DownloadTracker::new()),
         }
     }
 
@@ -392,11 +396,11 @@ impl StorageEngine {
         Ok(result)
     }
 
-    /// Stream a file's content through a channel. Each chunk from pCloud is sent immediately.
     pub async fn get_object_stream(
         &self,
         bucket: &str,
         key: &str,
+        range: Option<(usize, usize)>,
         tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
     ) -> anyhow::Result<()> {
         let storage_type: Option<String> = self.meta.with_conn(|conn| {
@@ -410,19 +414,19 @@ impl StorageEngine {
         })?;
 
         match storage_type.as_deref() {
-            Some("chunked") => self.get_chunked_file_stream(bucket, key, tx).await,
+            Some("chunked") if range.is_some() => self.stream_chunked_file_range(bucket, key, range.unwrap(), tx).await,
+            Some("chunked") => self.stream_chunked_file_full(bucket, key, tx).await,
             _ => {
                 let obj = self.meta.get_object(bucket, key)?
                     .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
                 let backend = self.find_backend(&obj.account_email)?;
-                // Stream from pCloud: each chunk forwarded through the channel as it arrives
-                // No full-file buffering — VLC can start playing immediately
                 backend.backend.download_stream(&obj.remote_path, None, None, tx).await
             }
         }
     }
 
-    async fn get_chunked_file_stream(
+    /// Stream all chunks sequentially (no Range), caching each
+    async fn stream_chunked_file_full(
         &self,
         bucket: &str,
         key: &str,
@@ -488,6 +492,181 @@ impl StorageEngine {
             }
         }
         Ok(())
+    }
+
+    /// Parallel ranged streaming: spawn concurrent chunk downloads (tracker-deduped),
+    /// pipe pCloud pages directly to VLC as they arrive.
+    async fn stream_chunked_file_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        (req_start, req_end): (usize, usize),
+        tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
+    ) -> anyhow::Result<()> {
+        let backends = &*self.backends;
+        let chunk_size = CHUNK_SIZE;
+        let first_chunk = req_start / chunk_size;
+        let last_chunk = if req_end == 0 { 0 } else { (req_end - 1) / chunk_size };
+
+        #[derive(Debug)]
+        struct ChunkRec {
+            index: i32,
+            size: i64,
+            checksum: String,
+            account_email: String,
+            remote_path: String,
+        }
+        let chunks_info: Vec<ChunkRec> = self.meta.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT chunk_index, size, checksum, account_email, remote_path
+                 FROM chunks WHERE bucket_name = ?1 AND key = ?2 ORDER BY chunk_index"
+            )?;
+            let rows = stmt.query_map(rusqlite::params![bucket, key], |row| {
+                Ok(ChunkRec {
+                    index: row.get(0)?,
+                    size: row.get(1)?,
+                    checksum: row.get(2)?,
+                    account_email: row.get(3)?,
+                    remote_path: row.get(4)?,
+                })
+            })?;
+            let mut infos = Vec::new();
+            for row in rows { infos.push(row?); }
+            Ok(infos)
+        })?;
+
+        // Spawn concurrent chunk downloads. Each task pipes pCloud's HTTP stream
+        // page-by-page through a shared channel.
+        let (page_tx, page_rx) = tokio::sync::mpsc::unbounded_channel::<(i32, bytes::Bytes)>();
+        let mut spawned = 0u32;
+        let dt = self.download_tracker.clone();
+
+        for ci in &chunks_info {
+            if ci.index < first_chunk as i32 || ci.index > last_chunk as i32 { continue; }
+            spawned += 1;
+
+            let backends_owned = self.backends.clone();
+            let cc = self.chunk_cache.clone();
+            let cdt = dt.clone();
+            let pt = page_tx.clone();
+            let b = bucket.to_string();
+            let k = key.to_string();
+            let acct = ci.account_email.clone();
+            let rp = ci.remote_path.clone();
+            let idx = ci.index;
+
+            // Compute mount path and owned path
+            let mp = self.backends.iter().find(|bh| bh.label == acct).map(|bh| bh.mount_prefix.clone()).unwrap_or_default();
+            let ow = if rp.is_empty() { format!("{}/{}/{}.ck.{}", mp, b, k, idx) } else { rp };
+
+            tokio::spawn(async move {
+                Self::stream_chunk_paged(cc, cdt, backends_owned, pt, b, k, acct, ow, idx).await;
+            });
+        }
+        drop(page_tx);
+
+        // Stream pages to VLC in chunk order, buffering out-of-order arrivals
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+        use futures::StreamExt;
+        let mut stream = UnboundedReceiverStream::new(page_rx);
+        let mut buf: std::collections::HashMap<i32, Vec<bytes::Bytes>> = std::collections::HashMap::new();
+        let mut next = first_chunk as i32;
+        let mut done = 0u32;
+
+        while let Some((idx, page)) = stream.next().await {
+            done += 1;
+            if idx == next {
+                // Stream this page
+                let co = idx as usize * chunk_size;
+                let sb = if req_start > co { req_start - co } else { 0 };
+                let se = page.len().min(req_end.saturating_sub(co + sb));
+                if sb < se && sb < page.len() {
+                    let re = se.min(page.len());
+                    if tx.send(Ok(page.slice(sb..re))).await.is_err() { return Ok(()); }
+                }
+                // Flush buffered next chunks
+                loop {
+                    next += 1;
+                    if let Some(pp) = buf.remove(&next) {
+                        for p in pp {
+                            let co2 = next as usize * chunk_size;
+                            let sb2 = if req_start > co2 { req_start - co2 } else { 0 };
+                            let se2 = p.len().min(req_end.saturating_sub(co2 + sb2));
+                            if sb2 < se2 && sb2 < p.len() {
+                                if tx.send(Ok(p.slice(sb2..se2.min(p.len())))).await.is_err() { return Ok(()); }
+                            }
+                        }
+                    } else {
+                        next -= 1;
+                        break;
+                    }
+                }
+            } else if idx > next {
+                buf.entry(idx).or_default().push(page);
+            }
+            if done >= spawned { break; }
+        }
+
+        // Drain remaining
+        while let Some((idx, page)) = stream.next().await {
+            if idx == next {
+                let co = idx as usize * chunk_size;
+                let sb = if req_start > co { req_start - co } else { 0 };
+                let se = page.len().min(req_end.saturating_sub(co + sb));
+                if sb < se && sb < page.len() {
+                    if tx.send(Ok(page.slice(sb..se.min(page.len())))).await.is_err() { return Ok(()); }
+                }
+                next += 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Helper: download a single chunk as paged pages and forward through pt channel
+    async fn stream_chunk_paged(
+        cc: Arc<ChunkCache>,
+        cdt: Arc<DownloadTracker>,
+        backends: Arc<Vec<BackendHandle>>,
+        pt: tokio::sync::mpsc::UnboundedSender<(i32, bytes::Bytes)>,
+        b: String, k: String, acct: String, ow: String, idx: i32,
+    ) {
+        if let Some(d) = cc.get(&b, &k, idx).await {
+            for p in d.chunks(16 * 1024) {
+                if pt.send((idx, bytes::Bytes::copy_from_slice(p))).is_err() { return; }
+            }
+            return;
+        }
+        let _ = cdt.try_register(&b, &k, idx).await;
+        // Find backend index first (avoids borrowing the backend across await)
+        if let Some(backend_idx) = backends.iter().position(|bh| bh.label == acct) {
+            let (dl_tx, mut dl_rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, anyhow::Error>>(64);
+            let dl_path = ow.clone();
+            let dl_tx2 = dl_tx.clone();
+            let be_clone = backends.clone();
+            let dl_handle = tokio::spawn(async move {
+                // Access backend by index after clone to avoid borrow issues
+                if let Some(bh) = be_clone.get(backend_idx) {
+                    let _ = bh.backend.download_stream(&dl_path, None, None, dl_tx2).await;
+                }
+            });
+            drop(dl_tx);
+            let mut full = Vec::new();
+            while let Some(res) = dl_rx.recv().await {
+                match res {
+                    Ok(p) => {
+                        full.extend_from_slice(&p);
+                        if pt.send((idx, p)).is_err() { break; }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = dl_handle.await;
+            if !full.is_empty() {
+                cc.put(&b, &k, idx, &full).await;
+                cdt.complete(&b, &k, idx, Ok(vec![])).await;
+            }
+        }
     }
 
     pub async fn head_object(&self, bucket: &str, key: &str) -> anyhow::Result<ObjectInfo> {

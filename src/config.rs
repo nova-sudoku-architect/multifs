@@ -109,6 +109,10 @@ pub struct StorageConfig {
     /// Cache size in MB
     #[serde(default = "default_cache_size")]
     pub cache_size_mb: u64,
+    /// Maximum number of chunk files to keep in local cache (default 50).
+    /// Speeds up repeated reads (VLC seeking, parallel Range requests).
+    #[serde(default = "default_cache_chunks")]
+    pub cache_chunks: usize,
     /// Placement strategy for distributing uploads across backends.
     /// Options: "round-robin" (default), "utilization" (picks least-full account).
     #[serde(default = "default_placement_strategy")]
@@ -163,6 +167,7 @@ fn default_cache_path() -> String {
     "/var/cache/multifs".to_string()
 }
 fn default_cache_size() -> u64 { 5120 }
+fn default_cache_chunks() -> usize { 50 }
 
 
 impl Default for ServerConfig {
@@ -185,6 +190,7 @@ impl Default for StorageConfig {
             meta_db_path: default_meta_db(),
             cache_path: default_cache_path(),
             cache_size_mb: default_cache_size(),
+            cache_chunks: default_cache_chunks(),
             placement_strategy: default_placement_strategy(),
             accounts: Vec::new(),
         }
