@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use sha2::{Digest, Sha256};
 use chrono::Utc;
 
@@ -47,7 +47,14 @@ impl BackendHandle {
 pub struct StorageEngine {
     meta: MetadataDb,
     backends: Arc<Vec<BackendHandle>>,
-    next_whole_file_idx: Arc<AtomicUsize>,
+    /// Cached fill-level quotas for each backend index, refreshed periodically.
+    cached_quotas: Arc<Mutex<Vec<CachedQuota>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedQuota {
+    fill_ratio: f64,
+    total: i64,
 }
 
 impl StorageEngine {
@@ -81,10 +88,11 @@ impl StorageEngine {
 
     /// Construct a StorageEngine from pre-built backends (for testing/DI)
     pub fn from_backends(handles: Vec<BackendHandle>, meta: MetadataDb) -> Self {
+        let cached = handles.iter().map(|_| CachedQuota { fill_ratio: 0.0, total: 1 }).collect();
         Self {
             meta,
             backends: Arc::new(handles),
-            next_whole_file_idx: Arc::new(AtomicUsize::new(0)),
+            cached_quotas: Arc::new(Mutex::new(cached)),
         }
     }
 
@@ -113,6 +121,37 @@ impl StorageEngine {
         self.put_chunked_file(bucket, key, data, content_type, &etag, &now).await
     }
 
+    /// Pick the backend with the lowest fill ratio (used/quota).
+    /// Refreshes the cache at most once per call (the refresh is async, so we rely on
+    /// the cached values which are updated lazily).
+    async fn pick_least_full_backend(&self) -> anyhow::Result<usize> {
+        let backends = &*self.backends;
+        if backends.is_empty() {
+            anyhow::bail!("No storage backends configured");
+        }
+        let cached = self.cached_quotas.lock().await;
+        let (best_idx, _) = cached.iter().enumerate()
+            .min_by(|(_, a), (_, b)| a.fill_ratio.partial_cmp(&b.fill_ratio).unwrap_or(std::cmp::Ordering::Equal))
+            .ok_or_else(|| anyhow::anyhow!("No backends available"))?;
+        Ok(best_idx)
+    }
+
+    /// Refresh the fill-ratio cache by querying each backend's quota.
+    pub async fn refresh_quotas(&self) {
+        let backends = &*self.backends;
+        let mut cached = self.cached_quotas.lock().await;
+        for (i, handle) in backends.iter().enumerate() {
+            if i >= cached.len() {
+                cached.push(CachedQuota { fill_ratio: 0.0, total: 1 });
+            }
+            if let Ok((used, total)) = handle.backend.check_quota().await {
+                let fill = if total > 0 { used as f64 / total as f64 } else { 0.0 };
+                cached[i] = CachedQuota { fill_ratio: fill, total };
+            }
+            // else keep previous cached value
+        }
+    }
+
     pub async fn put_whole_file(
         &self,
         bucket: &str,
@@ -126,7 +165,9 @@ impl StorageEngine {
         if backends.is_empty() {
             anyhow::bail!("No storage backends configured");
         }
-        let idx = self.next_whole_file_idx.fetch_add(1, Ordering::Relaxed) % backends.len();
+        // Refresh quotas for utilization-based placement
+        let _ = self.refresh_quotas().await;
+        let idx = self.pick_least_full_backend().await?;
         let backend = &backends[idx];
         let remote_path = format!("{}/{}/{}", backend.mount_prefix, bucket, key);
         let (remote_path_actual, _) = backend.backend.upload(&remote_path, data).await?;
@@ -172,10 +213,14 @@ impl StorageEngine {
             account: String,
         }
 
+        // Refresh quotas for utilization-based placement
+        let _ = self.refresh_quotas().await;
+
         let mut results = Vec::new();
         for (local_idx, chunk) in data_chunks.iter().enumerate() {
             let global_idx = local_idx as u32;
-            let bi = global_idx as usize % backends.len();
+            // Pick least-full backend for each chunk
+            let bi = self.pick_least_full_backend().await?;
             let chunk_path = format!("{}/{}/{}.ck.{}", backends[bi].mount_prefix, bucket, key, global_idx);
 
             match backends[bi].backend.upload(&chunk_path, &chunk.data).await {
@@ -189,6 +234,12 @@ impl StorageEngine {
                         key: key.to_string(),
                         account: backends[bi].label.clone(),
                     });
+                    // Update cache in-memory to reflect new chunk usage immediately
+                    let mut cached = self.cached_quotas.lock().await;
+                    if bi < cached.len() && cached[bi].total > 0 {
+                        let used = (cached[bi].fill_ratio * cached[bi].total as f64) + chunk.data.len() as f64;
+                        cached[bi].fill_ratio = used / cached[bi].total as f64;
+                    }
                 }
                 Err(e) => {
                     tracing::error!("Failed to upload chunk {}: {}", global_idx, e);
