@@ -4,6 +4,7 @@ use super::{StorageBackend, StorageFile};
 use crate::config::AccountConfig;
 
 /// pCloud storage backend
+#[derive(Clone)]
 pub struct PCloudBackend {
     config: AccountConfig,
     client: crate::storage::pcloud::client::PCloudClient,
@@ -79,5 +80,9 @@ impl StorageBackend for PCloudBackend {
 
         let dest_path = format!("{}/{}", dest_parent.trim_end_matches('/'), filename);
         Ok(Some(dest_path))
+    }
+
+    fn clone_box(&self) -> Box<dyn StorageBackend> {
+        Box::new(self.clone())
     }
 }

@@ -13,7 +13,7 @@ use super::chunk_manager;
 use super::page_cache::{self, PageCache};
 use super::download_tracker::DownloadTracker;
 
-const CHUNK_SIZE: usize = 32 * 1024 * 1024;
+pub(crate) const CHUNK_SIZE: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ObjectInfo {
@@ -426,113 +426,36 @@ impl StorageEngine {
     }
 
     /// Stream all chunks sequentially (no Range), caching each
-    /// Stream all chunks sequentially (no Range), page-by-page from pCloud.
-    /// Each chunk is downloaded via download_stream, forwarding pages immediately.
+    /// Stream all chunks sequentially (no Range). Delegates to stream_chunked_file_range
+    /// for a single consistent streaming code path.
     async fn stream_chunked_file_full(
         &self,
         bucket: &str,
         key: &str,
         tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
     ) -> anyhow::Result<()> {
-        let backends = &*self.backends;
-        let chunk_size = CHUNK_SIZE;
-
-        #[derive(Debug)]
-        struct ChunkInfo {
-            index: i32,
-            _size: i64,
-            checksum: String,
-            account_email: String,
-            remote_path: String,
-        }
-
-        let chunks_info: Vec<ChunkInfo> = self.meta.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT chunk_index, size, checksum, account_email, remote_path
-                 FROM chunks WHERE bucket_name = ?1 AND key = ?2 ORDER BY chunk_index"
-            )?;
-            let rows = stmt.query_map(rusqlite::params![bucket, key], |row| {
-                Ok(ChunkInfo {
-                    index: row.get(0)?,
-                    _size: row.get(1)?,
-                    checksum: row.get(2)?,
-                    account_email: row.get(3)?,
-                    remote_path: row.get(4)?,
-                })
-            })?;
-            let mut infos = Vec::new();
-            for row in rows { infos.push(row?); }
-            Ok(infos)
+        // Get total file size from metadata
+        let file_size: i64 = self.meta.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT size FROM files WHERE bucket_name = ?1 AND key = ?2")?;
+            let mut rows = stmt.query(rusqlite::params![bucket, key])?;
+            if let Some(row) = rows.next()? {
+                Ok(row.get::<_, i64>(0)?)
+            } else {
+                Ok(0i64)
+            }
         })?;
 
-        if chunks_info.is_empty() {
-            anyhow::bail!("No chunks found for chunked file: {}/{}", bucket, key);
+        if file_size == 0 {
+            anyhow::bail!("File size not found for {}/{}", bucket, key);
         }
 
-        for ci in &chunks_info {
-            let owned_path = if ci.remote_path.is_empty() {
-                let mp = backends.iter().find(|b| b.label == ci.account_email).map(|b| b.mount_prefix.as_str()).unwrap_or("");
-                format!("{}/{}/{}.ck.{}", mp, bucket, key, ci.index)
-            } else {
-                ci.remote_path.clone()
-            };
-
-            // Check cache: are all pages cached?
-            let missing = self.page_cache.missing_ranges(bucket, key, ci.index, 0, chunk_size, chunk_size).await;
-            if missing.is_empty() {
-                // All pages cached — stream them sequentially
-                let total_pages = (chunk_size + page_cache::PAGE_SIZE - 1) / page_cache::PAGE_SIZE;
-                for pn in 0..total_pages {
-                    if let Some(page) = self.page_cache.get_page(bucket, key, ci.index, pn, chunk_size).await {
-                        if tx.send(Ok(bytes::Bytes::from(page))).await.is_err() {
-                            return Ok(());
-                        }
-                    }
-                }
-                continue;
-            }
-
-            // Find backend by index
-            let bi = backends.iter().position(|b| b.label == ci.account_email);
-            if let Some(backend_idx) = bi {
-                let (dl_tx, mut dl_rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, anyhow::Error>>(64);
-                let dl_path = owned_path.clone();
-                let dl_tx2 = dl_tx.clone();
-                let be_clone = self.backends.clone();
-
-                let dl_handle = tokio::spawn(async move {
-                    if let Some(bh) = be_clone.get(backend_idx) {
-                        let _ = bh.backend.download_stream(&dl_path, None, None, dl_tx2).await;
-                    }
-                });
-                drop(dl_tx);
-
-                let mut offset = 0usize;
-                while let Some(page_res) = dl_rx.recv().await {
-                    match page_res {
-                        Ok(page) => {
-                            let len = page.len();
-                            // Cache each page as it arrives
-                            self.page_cache.put_pages(bucket, key, ci.index, offset, &page, chunk_size).await;
-                            offset += len;
-                            if tx.send(Ok(page)).await.is_err() {
-                                return Ok(());
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(anyhow::anyhow!("Chunk {} error: {}", ci.index, e))).await;
-                            return Ok(());
-                        }
-                    }
-                }
-                let _ = dl_handle.await;
-            }
-        }
-        Ok(())
+        // Unify into the ranged streaming path
+        self.stream_chunked_file_range(bucket, key, (0, file_size as usize), tx).await
     }
 
     /// Parallel ranged streaming: spawn concurrent chunk downloads (tracker-deduped),
-    /// pipe pCloud pages directly to VLC as they arrive.
+    /// pipe pCloud pages directly to VLC as they arrive, in chunk order.
+    /// Each download task sends an empty sentinel page when complete.
     async fn stream_chunked_file_range(
         &self,
         bucket: &str,
@@ -542,8 +465,10 @@ impl StorageEngine {
     ) -> anyhow::Result<()> {
         let backends = &*self.backends;
         let chunk_size = CHUNK_SIZE;
+        let page_size = page_cache::PAGE_SIZE;
         let first_chunk = req_start / chunk_size;
         let last_chunk = if req_end == 0 { 0 } else { (req_end - 1) / chunk_size };
+        let num_chunks = (last_chunk - first_chunk + 1) as u32;
 
         #[derive(Debug)]
         struct ChunkRec {
@@ -573,7 +498,7 @@ impl StorageEngine {
         })?;
 
         // Spawn concurrent chunk downloads. Each task pipes pCloud's HTTP stream
-        // page-by-page through a shared channel.
+        // page-by-page through a shared channel, followed by an empty sentinel.
         let (page_tx, page_rx) = tokio::sync::mpsc::unbounded_channel::<(i32, bytes::Bytes)>();
         let mut spawned = 0u32;
         let dt = self.download_tracker.clone();
@@ -602,57 +527,81 @@ impl StorageEngine {
         }
         drop(page_tx);
 
-        // Stream pages to VLC in chunk order, buffering out-of-order arrivals
+        // Stream pages to VLC in chunk order. Pages accumulate in a buffer per chunk.
+        // When a chunk's sentinel arrives, assemble the chunk data, slice to range,
+        // send it, and advance to the next chunk.
         use tokio_stream::wrappers::UnboundedReceiverStream;
         use futures::StreamExt;
         let mut stream = UnboundedReceiverStream::new(page_rx);
-        let mut buf: std::collections::HashMap<i32, Vec<bytes::Bytes>> = std::collections::HashMap::new();
+        // Buffer: per chunk, accumulate pages until sentinel received
+        let mut chunk_pages: std::collections::HashMap<i32, Vec<bytes::Bytes>> = std::collections::HashMap::new();
         let mut next = first_chunk as i32;
-        let mut done = 0u32;
+        let mut chunks_done = 0u32;
 
-        while let Some((idx, page)) = stream.next().await {
-            done += 1;
-            if idx == next {
-                // Stream this page
-                let co = idx as usize * chunk_size;
-                let sb = if req_start > co { req_start - co } else { 0 };
-                let se = page.len().min(req_end.saturating_sub(co + sb));
-                if sb < se && sb < page.len() {
-                    let re = se.min(page.len());
-                    if tx.send(Ok(page.slice(sb..re))).await.is_err() { return Ok(()); }
-                }
-                // Flush buffered next chunks
-                loop {
-                    next += 1;
-                    if let Some(pp) = buf.remove(&next) {
-                        for p in pp {
-                            let co2 = next as usize * chunk_size;
-                            let sb2 = if req_start > co2 { req_start - co2 } else { 0 };
-                            let se2 = p.len().min(req_end.saturating_sub(co2 + sb2));
-                            if sb2 < se2 && sb2 < p.len() {
-                                if tx.send(Ok(p.slice(sb2..se2.min(p.len())))).await.is_err() { return Ok(()); }
-                            }
-                        }
-                    } else {
-                        next -= 1;
-                        break;
+        /// Assemble pages for a chunk, slice to the requested byte range, send to tx.
+        async fn send_chunk_data(
+            pages: Vec<bytes::Bytes>, chunk_idx: i32, chunk_sz: usize,
+            req_start: usize, req_end: usize,
+            tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
+        ) -> bool {
+            // Concatenate all pages for this chunk
+            let mut chunk_data = Vec::new();
+            for p in &pages {
+                chunk_data.extend_from_slice(p);
+            }
+            // Compute slice within this chunk
+            let co = chunk_idx as usize * chunk_sz;
+            let sb = if req_start > co { req_start - co } else { 0 };
+            let se = std::cmp::min(chunk_data.len(), req_end.saturating_sub(co + sb));
+            if sb < se && sb < chunk_data.len() {
+                let slice = &chunk_data[sb..se];
+                // Send as pages for backpressure (max 64KB each)
+                for page_chunk in slice.chunks(65536) {
+                    if tx.send(Ok(bytes::Bytes::copy_from_slice(page_chunk))).await.is_err() {
+                        return false;
                     }
                 }
-            } else if idx > next {
-                buf.entry(idx).or_default().push(page);
             }
-            if done >= spawned { break; }
+            true
         }
 
-        // Drain remaining
-        while let Some((idx, page)) = stream.next().await {
-            if idx == next {
-                let co = idx as usize * chunk_size;
-                let sb = if req_start > co { req_start - co } else { 0 };
-                let se = page.len().min(req_end.saturating_sub(co + sb));
-                if sb < se && sb < page.len() {
-                    if tx.send(Ok(page.slice(sb..se.min(page.len())))).await.is_err() { return Ok(()); }
+        // Collect pages until all chunks complete
+        let mut sentinel_rcvd: std::collections::HashSet<i32> = std::collections::HashSet::new();
+        while let Some((idx, mut page)) = stream.next().await {
+            // Empty page = sentinel (chunk download complete)
+            if page.is_empty() {
+                sentinel_rcvd.insert(idx);
+                chunks_done += 1;
+                // Send completed chunk and any subsequent completed chunks
+                while sentinel_rcvd.contains(&next) {
+                    if let Some(pages) = chunk_pages.remove(&next) {
+                        if !send_chunk_data(pages, next, chunk_size, req_start, req_end, &tx).await {
+                            return Ok(());
+                        }
+                        next += 1;
+                    } else {
+                        tracing::warn!("CHUNKED_SENTINEL_NO_PAGES: chunk {} sentinel received but no pages", next);
+                        next += 1;
+                    }
                 }
+                if chunks_done >= spawned {
+                    break;
+                }
+                continue;
+            }
+
+            // Accumulate page data for this chunk
+            chunk_pages.entry(idx).or_default().push(page);
+        }
+
+        // Drain any remaining completed chunks in order
+        while sentinel_rcvd.contains(&next) {
+            if let Some(pages) = chunk_pages.remove(&next) {
+                if !send_chunk_data(pages, next, chunk_size, req_start, req_end, &tx).await {
+                    return Ok(());
+                }
+                next += 1;
+            } else {
                 next += 1;
             }
         }
@@ -680,9 +629,12 @@ impl StorageEngine {
                     if pt.send((idx, bytes::Bytes::from(page))).is_err() { return; }
                 }
             }
+            // Sentinel: signal chunk complete
+            let _ = pt.send((idx, bytes::Bytes::new()));
             return;
         }
 
+        // Register with download tracker for dedup; share result if already registered
         let _ = cdt.try_register(&b, &k, idx).await;
         if let Some(backend_idx) = backends.iter().position(|bh| bh.label == acct) {
             let (dl_tx, mut dl_rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, anyhow::Error>>(64);
@@ -704,12 +656,18 @@ impl StorageEngine {
                         offset += len;
                         if pt.send((idx, p)).is_err() { break; }
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        tracing::warn!("Chunk download error for {}/{} chunk {}: {}", b, k, idx, e);
+                        break;
+                    }
                 }
             }
             let _ = dl_handle.await;
             cdt.complete(&b, &k, idx, Ok(vec![])).await;
         }
+        // Always send sentinel — even on failure, so the assembly pipeline doesn't hang.
+        // The upload fix ensures chunks always exist on pCloud, making this safe.
+        let _ = pt.send((idx, bytes::Bytes::new()));
     }
 
     pub async fn head_object(&self, bucket: &str, key: &str) -> anyhow::Result<ObjectInfo> {

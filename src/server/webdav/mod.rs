@@ -291,7 +291,7 @@ async fn handle_get(state: &WebDAVState, path: &str, method: Method, headers: Op
     if let Some(ref r) = raw_range {
         tracing::debug!("WebDAV GET Range: {} (total_len={})", r, total_len);
     }
-    let parsed_range: Option<(usize, usize)> = raw_range.as_deref()
+    let mut parsed_range: Option<(usize, usize)> = raw_range.as_deref()
         .and_then(|rv| parse_range(rv, total_len));
 
     let content_length = match parsed_range {
@@ -304,8 +304,9 @@ async fn handle_get(state: &WebDAVState, path: &str, method: Method, headers: Op
     let b = bucket.to_string();
     let k = key.to_string();
 
+    let range_for_engine = parsed_range;
     tokio::task::spawn(async move {
-        if let Err(e) = engine_clone.get_object_stream(&b, &k, parsed_range, tx).await {
+        if let Err(e) = engine_clone.get_object_stream(&b, &k, range_for_engine, tx).await {
             tracing::error!("Stream error: {}", e);
         }
     });

@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 futures = "0.3"
 sha2 = "0.10"
+md-5 = "0.11"
 hex = "0.4"
 async-trait = "0.1"
 # Async runtime
@@ -76,3 +77,5 @@ assert_cmd = "2"
 predicates = "3"
 bytes = "1"
 futures = "0.3"
+rand = "0.8"
+mockall = "0.13"

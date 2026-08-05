@@ -51,5 +51,15 @@ pub trait StorageBackend: Send + Sync {
         // Default: not supported
         Ok(None)
     }
+
+    /// Get a direct download link for a file (optional).
+    /// Returns the URL or an error if not supported.
+    /// Used by the link pre-fetch optimisation in stream_chunked_file_range.
+    async fn get_download_link(&self, _remote_path: &str) -> anyhow::Result<String> {
+        anyhow::bail!("get_download_link not implemented for this backend");
+    }
+
+    /// Clone this backend into a boxed trait object.
+    fn clone_box(&self) -> Box<dyn StorageBackend>;
 }
 pub mod pcloud;

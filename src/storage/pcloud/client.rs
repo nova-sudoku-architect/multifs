@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 
 /// pCloud API client
+#[derive(Clone)]
 pub struct PCloudClient {
     email: String,
     token: String,
@@ -28,8 +29,8 @@ impl PCloudClient {
     pub async fn check_quota(&self) -> anyhow::Result<(i64, i64)> {
         let resp = self
             .client
-            .get(format!("{}/userinfo", self.base_url))
-            .query(&[("access_token", &self.token)])
+            .post(format!("{}/userinfo", self.base_url))
+            .form(&[("access_token", &self.token)])
             .send()
             .await?;
 
@@ -57,8 +58,8 @@ impl PCloudClient {
     pub async fn ensure_path(&self, path: &str) -> anyhow::Result<()> {
         let resp = self
             .client
-            .get(format!("{}/listfolder", self.base_url))
-            .query(&[
+            .post(format!("{}/listfolder", self.base_url))
+            .form(&[
                 ("access_token", self.token.as_str()),
                 ("path", path),
                 ("nofiles", "1"),
@@ -83,8 +84,8 @@ impl PCloudClient {
             current.push_str(part);
             let resp = self
                 .client
-                .get(format!("{}/createfolder", self.base_url))
-                .query(&[
+                .post(format!("{}/createfolder", self.base_url))
+                .form(&[
                     ("access_token", self.token.as_str()),
                     ("path", current.as_str()),
                 ])
@@ -117,9 +118,16 @@ impl PCloudClient {
             .and_then(|n| n.to_str())
             .unwrap_or("file");
 
+        // Build multipart form with all fields (auth + file) in the same multipart body.
+        // .form() and .multipart() can't be used together in reqwest — multipart wins.
+        // So access_token, path, filename, and nopartial go as .text() fields alongside the file.
         let form = reqwest::multipart::Form::new()
+            .text("access_token", self.token.clone())
+            .text("path", parent.to_string())
+            .text("filename", filename.to_string())
+            .text("nopartial", "1")
             .part(
-                filename.to_string(),
+                "file",
                 reqwest::multipart::Part::bytes(data.to_vec())
                     .file_name(filename.to_string()),
             );
@@ -127,12 +135,6 @@ impl PCloudClient {
         let resp = self
             .client
             .post(format!("{}/uploadfile", self.base_url))
-            .query(&[
-                ("access_token", self.token.as_str()),
-                ("path", parent),
-                ("filename", filename),
-                ("nopartial", "1"),
-            ])
             .multipart(form)
             .send()
             .await?;
@@ -165,8 +167,8 @@ impl PCloudClient {
         // First, get the file link
         let resp = self
             .client
-            .get(format!("{}/getfilelink", self.base_url))
-            .query(&[
+            .post(format!("{}/getfilelink", self.base_url))
+            .form(&[
                 ("access_token", self.token.as_str()),
                 ("path", remote_path),
             ])
@@ -214,8 +216,8 @@ impl PCloudClient {
         // Get the file link (same auth as regular download)
         let resp = self
             .client
-            .get(format!("{}/getfilelink", self.base_url))
-            .query(&[
+            .post(format!("{}/getfilelink", self.base_url))
+            .form(&[
                 ("access_token", self.token.as_str()),
                 ("path", remote_path),
             ])
@@ -275,8 +277,8 @@ impl PCloudClient {
     pub async fn copy_file(&self, source_path: &str, dest_parent: &str, new_name: &str) -> anyhow::Result<()> {
         let resp = self
             .client
-            .get(format!("{}/copyfile", self.base_url))
-            .query(&[
+            .post(format!("{}/copyfile", self.base_url))
+            .form(&[
                 ("access_token", self.token.as_str()),
                 ("path", source_path),
                 ("topath", dest_parent),
@@ -299,8 +301,8 @@ impl PCloudClient {
     pub async fn delete(&self, remote_path: &str) -> anyhow::Result<()> {
         let resp = self
             .client
-            .get(format!("{}/deletefile", self.base_url))
-            .query(&[
+            .post(format!("{}/deletefile", self.base_url))
+            .form(&[
                 ("access_token", self.token.as_str()),
                 ("path", remote_path),
             ])
@@ -321,8 +323,8 @@ impl PCloudClient {
     pub async fn list_folder(&self, path: &str) -> anyhow::Result<Vec<PCloudFile>> {
         let resp = self
             .client
-            .get(format!("{}/listfolder", self.base_url))
-            .query(&[
+            .post(format!("{}/listfolder", self.base_url))
+            .form(&[
                 ("access_token", self.token.as_str()),
                 ("path", path),
             ])
