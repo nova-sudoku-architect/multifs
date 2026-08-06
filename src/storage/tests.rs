@@ -1116,8 +1116,8 @@ async fn test_flaw_full_file_downloads_every_chunk_not_just_header() {
     let (engine, _dir, b1, b2) = make_tracked_engine();
     engine.create_bucket("flaw2-bucket").await.unwrap();
 
-    // 5 chunks = 160MB
-    let data = vec![0xABu8; 3 * 1024];
+    // 5 chunks = 160MB (must actually be chunked so >64MB of chunks exist to stream)
+    let data = vec![0xABu8; 160 * 1024 * 1024];
     engine.put_object("flaw2-bucket", "flaw2.bin", &data).await.unwrap();
     b1.clear_accesses();
     b2.clear_accesses();
