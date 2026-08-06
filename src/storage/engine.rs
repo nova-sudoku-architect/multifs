@@ -54,16 +54,30 @@ pub struct StorageEngine {
     backends: Arc<Vec<BackendHandle>>,
     placement: PlacementStrategy,
     next_backend_idx: Arc<AtomicUsize>,
-    cached_quotas: Arc<Mutex<Vec<CachedQuota>>>,
+    cached_quotas: Arc<Mutex<CachedQuotas>>,
     page_cache: Arc<PageCache>,
     download_tracker: Arc<DownloadTracker>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct CachedQuota {
     fill_ratio: f64,
     total: i64,
 }
+
+/// Quota cache with a time-based refresh window so we don't hit pCloud's
+/// /userinfo on every write. Holds per-backend fill ratios plus the last
+/// refresh timestamp (monotonic seconds).
+#[derive(Debug, Clone)]
+struct CachedQuotas {
+    per_backend: Vec<CachedQuota>,
+    last_refresh_ms: u128,
+}
+
+/// Minimum interval (ms) between full quota refreshes. Within this window
+/// `refresh_quotas()` is a no-op on pCloud. Makes huge-file copies avoid
+/// N_accounts redundant /userinfo calls per part/chunk.
+const QUOTA_REFRESH_MS: u128 = 60_000;
 
 impl StorageEngine {
     /// Construct StorageEngine from a Config (convenience wrapper).
@@ -103,13 +117,13 @@ impl StorageEngine {
     pub fn from_backends_with_strategy(
         handles: Vec<BackendHandle>, meta: MetadataDb, placement: PlacementStrategy,
     ) -> Self {
-        let cached = handles.iter().map(|_| CachedQuota { fill_ratio: 0.0, total: 1 }).collect();
+        let per_backend = handles.iter().map(|_| CachedQuota { fill_ratio: 0.0, total: 1 }).collect();
         Self {
             meta,
             placement,
             backends: Arc::new(handles),
             next_backend_idx: Arc::new(AtomicUsize::new(0)),
-            cached_quotas: Arc::new(Mutex::new(cached)),
+            cached_quotas: Arc::new(Mutex::new(CachedQuotas { per_backend, last_refresh_ms: 0 })),
             page_cache: Arc::new(PageCache::new("/var/cache/multifs/chunks", 10)),
             download_tracker: Arc::new(DownloadTracker::new()),
         }
@@ -153,7 +167,7 @@ impl StorageEngine {
             }
             PlacementStrategy::Utilization => {
                 let cached = self.cached_quotas.lock().await;
-                let (best_idx, _) = cached.iter().enumerate()
+                let (best_idx, _) = cached.per_backend.iter().enumerate()
                     .min_by(|(_, a), (_, b)| a.fill_ratio.partial_cmp(&b.fill_ratio).unwrap_or(std::cmp::Ordering::Equal))
                     .ok_or_else(|| anyhow::anyhow!("No backends available"))?;
                 Ok(best_idx)
@@ -162,19 +176,37 @@ impl StorageEngine {
     }
 
     /// Refresh the fill-ratio cache by querying each backend's quota.
+    /// TTL-gated: within `QUOTA_REFRESH_MS` of the last refresh this is a no-op
+    /// (no pCloud /userinfo calls). Quotas barely change during a copy, so this
+    /// avoids N_accounts redundant network round-trips per file/part/chunk.
     pub async fn refresh_quotas(&self) {
-        let backends = &*self.backends;
-        let mut cached = self.cached_quotas.lock().await;
-        for (i, handle) in backends.iter().enumerate() {
-            if i >= cached.len() {
-                cached.push(CachedQuota { fill_ratio: 0.0, total: 1 });
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        {
+            let cached = self.cached_quotas.lock().await;
+            if now.saturating_sub(cached.last_refresh_ms) < QUOTA_REFRESH_MS {
+                return; // fresh enough — no pCloud calls
             }
-            if let Ok((used, total)) = handle.backend.check_quota().await {
-                let fill = if total > 0 { used as f64 / total as f64 } else { 0.0 };
-                cached[i] = CachedQuota { fill_ratio: fill, total };
-            }
-            // else keep previous cached value
         }
+
+        let backends = &*self.backends;
+        let mut fresh: Vec<CachedQuota> = Vec::with_capacity(backends.len());
+        for handle in backends.iter() {
+            let mut c = CachedQuota { fill_ratio: 0.0, total: 1 };
+            if let Ok((used, total)) = handle.backend.check_quota().await {
+                c.total = total;
+                c.fill_ratio = if total > 0 { used as f64 / total as f64 } else { 0.0 };
+            }
+            fresh.push(c);
+        }
+
+        // Publish the freshly-fetched fill ratios + timestamp. Lock is only held
+        // for the (non-await) swap, never across network I/O.
+        let mut cached = self.cached_quotas.lock().await;
+        cached.per_backend = fresh;
+        cached.last_refresh_ms = now;
     }
 
     pub async fn put_whole_file(
@@ -262,9 +294,9 @@ impl StorageEngine {
                     });
                     // Update cache in-memory to reflect new chunk usage immediately
                     let mut cached = self.cached_quotas.lock().await;
-                    if bi < cached.len() && cached[bi].total > 0 {
-                        let used = (cached[bi].fill_ratio * cached[bi].total as f64) + chunk.data.len() as f64;
-                        cached[bi].fill_ratio = used / cached[bi].total as f64;
+                    if bi < cached.per_backend.len() && cached.per_backend[bi].total > 0 {
+                        let used = (cached.per_backend[bi].fill_ratio * cached.per_backend[bi].total as f64) + chunk.data.len() as f64;
+                        cached.per_backend[bi].fill_ratio = used / cached.per_backend[bi].total as f64;
                     }
                 }
                 Err(e) => {
@@ -374,9 +406,9 @@ impl StorageEngine {
                 Ok((actual_path, _)) => {
                     results.push((global_idx, actual_path, chunk.checksum.clone(), chunk.data.len() as i64, backends[bi].label.clone()));
                     let mut cached = self.cached_quotas.lock().await;
-                    if bi < cached.len() && cached[bi].total > 0 {
-                        let used = (cached[bi].fill_ratio * cached[bi].total as f64) + chunk.data.len() as f64;
-                        cached[bi].fill_ratio = used / cached[bi].total as f64;
+                    if bi < cached.per_backend.len() && cached.per_backend[bi].total > 0 {
+                        let used = (cached.per_backend[bi].fill_ratio * cached.per_backend[bi].total as f64) + chunk.data.len() as f64;
+                        cached.per_backend[bi].fill_ratio = used / cached.per_backend[bi].total as f64;
                     }
                 }
                 Err(e) => {
