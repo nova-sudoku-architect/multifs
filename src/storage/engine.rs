@@ -687,27 +687,61 @@ impl StorageEngine {
         let mut spawned = 0u32;
         let dt = self.download_tracker.clone();
 
+        // Adjacent-chunk prefetch: after the requested range, also cache the next
+        // PREFETCH_CHUNKS chunks (N+1, N+2 ...) so VLC/seek-adjacent bytes are warm.
+        // These are downloaded into the page cache but NOT emitted to the client
+        // (they fall outside [req_start, req_end]), matching the design docs.
+        const PREFETCH_CHUNKS: i32 = 2;
+        let prefetch_last = last_chunk as i32 + PREFETCH_CHUNKS;
+
         for ci in &chunks_info {
-            if ci.index < first_chunk as i32 || ci.index > last_chunk as i32 { continue; }
-            spawned += 1;
+            // In-range chunks are streamed to the client.
+            if ci.index >= first_chunk as i32 && ci.index <= last_chunk as i32 {
+                spawned += 1;
 
-            let backends_owned = self.backends.clone();
-            let cc = self.page_cache.clone();
-            let cdt = dt.clone();
-            let pt = page_tx.clone();
-            let b = bucket.to_string();
-            let k = key.to_string();
-            let acct = ci.account_email.clone();
-            let rp = ci.remote_path.clone();
-            let idx = ci.index;
+                let backends_owned = self.backends.clone();
+                let cc = self.page_cache.clone();
+                let cdt = dt.clone();
+                let pt = page_tx.clone();
+                let b = bucket.to_string();
+                let k = key.to_string();
+                let acct = ci.account_email.clone();
+                let rp = ci.remote_path.clone();
+                let idx = ci.index;
 
-            // Compute mount path and owned path
-            let mp = self.backends.iter().find(|bh| bh.label == acct).map(|bh| bh.mount_prefix.clone()).unwrap_or_default();
-            let ow = if rp.is_empty() { format!("{}/{}/{}.ck.{}", mp, b, k, idx) } else { rp };
+                // Compute mount path and owned path
+                let mp = self.backends.iter().find(|bh| bh.label == acct).map(|bh| bh.mount_prefix.clone()).unwrap_or_default();
+                let ow = if rp.is_empty() { format!("{}/{}/{}.ck.{}", mp, b, k, idx) } else { rp };
 
-            tokio::spawn(async move {
-                Self::stream_chunk_paged(cc, cdt, backends_owned, pt, b, k, acct, ow, idx).await;
-            });
+                tokio::spawn(async move {
+                    Self::stream_chunk_paged(cc, cdt, backends_owned, pt, b, k, acct, ow, idx).await;
+                });
+                continue;
+            }
+
+            // Otherwise, prefetch the adjacent chunks that follow the requested
+            // range (N+1 .. N+PREFETCH_CHUNKS) into the page cache. These are not
+            // piped to the client; they only warm the cache for the next seek.
+            if ci.index > last_chunk as i32 && ci.index <= prefetch_last {
+                let backends_owned = self.backends.clone();
+                let cc = self.page_cache.clone();
+                let cdt = dt.clone();
+                let b = bucket.to_string();
+                let k = key.to_string();
+                let acct = ci.account_email.clone();
+                let rp = ci.remote_path.clone();
+                let idx = ci.index;
+
+                let mp = self.backends.iter().find(|bh| bh.label == acct).map(|bh| bh.mount_prefix.clone()).unwrap_or_default();
+                let ow = if rp.is_empty() { format!("{}/{}/{}.ck.{}", mp, b, k, idx) } else { rp };
+
+                // Prefetch via the same paged path but without the client channel
+                // receiver — it will populate the page cache and stop there.
+                let (_probe_tx, _probe_rx) = tokio::sync::mpsc::unbounded_channel::<(i32, bytes::Bytes)>();
+                tokio::spawn(async move {
+                    Self::stream_chunk_paged(cc, cdt, backends_owned, _probe_tx, b, k, acct, ow, idx).await;
+                });
+            }
         }
         drop(page_tx);
 
