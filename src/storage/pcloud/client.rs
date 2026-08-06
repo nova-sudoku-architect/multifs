@@ -1,5 +1,7 @@
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex as StdMutex};
 
 /// pCloud API client
 #[derive(Clone)]
@@ -8,6 +10,10 @@ pub struct PCloudClient {
     token: String,
     base_url: String,
     client: reqwest::Client,
+    /// Directories already confirmed to exist (path -> created/verified once).
+    /// Avoids a pCloud /listfolder round-trip on every chunk upload to the
+    /// same bucket/prefix.
+    known_dirs: Arc<StdMutex<HashSet<String>>>,
 }
 
 impl PCloudClient {
@@ -22,6 +28,26 @@ impl PCloudClient {
                 .user_agent("multifs/0.1.0")
                 .build()
                 .expect("Failed to build HTTP client"),
+            known_dirs: Arc::new(StdMutex::new(HashSet::new())),
+        }
+    }
+
+    /// Normalize a pCloud path: collapse duplicate slashes and trailing slash so
+    // the same logical directory maps to one cache key.
+    fn normalize_path(path: &str) -> String {
+        let trimmed = path.trim_end_matches('/');
+        let mut out = String::new();
+        for part in trimmed.split('/') {
+            if part.is_empty() {
+                continue;
+            }
+            out.push('/');
+            out.push_str(part);
+        }
+        if out.is_empty() {
+            "/".to_string()
+        } else {
+            out
         }
     }
 
@@ -55,7 +81,25 @@ impl PCloudClient {
     }
 
     /// Ensure a directory path exists on pCloud (mkdir -p)
+    /// Ensure a directory path exists on pCloud (mkdir -p).
+    ///
+    /// Normalizes the path so different spellings of the same dir hit one cache
+    /// entry, then returns immediately if we already know it exists. Only does a
+    /// pCloud /listfolder (and possibly /createfolder) the first time a parent
+    /// dir is seen — avoids a round-trip on every chunk upload to the same path.
     pub async fn ensure_path(&self, path: &str) -> anyhow::Result<()> {
+        // Root or empty path is trivially present.
+        let norm = Self::normalize_path(path);
+        if norm.is_empty() || norm == "/" {
+            return Ok(());
+        }
+        {
+            let known = self.known_dirs.lock().unwrap();
+            if known.contains(&norm) {
+                return Ok(());
+            }
+        }
+
         let resp = self
             .client
             .post(format!("{}/listfolder", self.base_url))
@@ -72,11 +116,12 @@ impl PCloudClient {
 
         // If folder exists, we're done
         if result == 0 {
+            self.known_dirs.lock().unwrap().insert(norm);
             return Ok(());
         }
 
         // Otherwise, create directories recursively
-        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        let parts: Vec<&str> = norm.split('/').filter(|p| !p.is_empty()).collect();
         let mut current = String::new();
 
         for part in &parts {
@@ -98,6 +143,7 @@ impl PCloudClient {
             if result != 0 && result != 2004 && result != 2005 {
                 anyhow::bail!("Failed to create folder '{}': {}", current, body["error"]);
             }
+            self.known_dirs.lock().unwrap().insert(current.clone());
         }
 
         Ok(())
