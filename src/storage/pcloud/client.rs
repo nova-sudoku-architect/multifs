@@ -174,8 +174,10 @@ impl PCloudClient {
             .text("nopartial", "1")
             .part(
                 "file",
-                reqwest::multipart::Part::bytes(data.to_vec())
-                    .file_name(filename.to_string()),
+                reqwest::multipart::Part::stream(hyper::body::Bytes::copy_from_slice(data))
+                    .file_name(filename.to_string())
+                    .mime_str("application/octet-stream")
+                    .unwrap_or_else(|_| reqwest::multipart::Part::stream(hyper::body::Bytes::copy_from_slice(data))),
             );
 
         let resp = self
