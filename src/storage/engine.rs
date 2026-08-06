@@ -750,79 +750,63 @@ impl StorageEngine {
         // send it, and advance to the next chunk.
         use tokio_stream::wrappers::UnboundedReceiverStream;
         use futures::StreamExt;
-        let mut stream = UnboundedReceiverStream::new(page_rx);
-        // Buffer: per chunk, accumulate pages until sentinel received
-        let mut chunk_pages: std::collections::HashMap<i32, Vec<bytes::Bytes>> = std::collections::HashMap::new();
-        let mut next = first_chunk as i32;
-        let mut chunks_done = 0u32;
+        // Page-level streaming: forward ONLY the pages overlapping the requested
+        // range immediately as they arrive — no whole-32MB-chunk buffering. This
+        // keeps mid-chunk TTFB low and avoids buffering large chunks in memory.
+        //
+        // The assembly loop runs in a background task so this function returns as
+        // soon as the producer tasks are dispatched; the client drains `tx`
+        // concurrently. Without this, a single-chunk range over a channel smaller
+        // than the window (e.g. 5MB window over capacity-64 mpsc) deadlocks: the
+        // 65th send blocks against a receiver that is still awaiting this call.
+        tokio::spawn(async move {
+            let mut stream = UnboundedReceiverStream::new(page_rx);
+            let mut chunk_offset: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+            let mut sentinel_rcvd: std::collections::HashSet<i32> = std::collections::HashSet::new();
+            let mut chunks_done = 0u32;
+            let mut next = first_chunk as i32;
 
-        /// Assemble pages for a chunk, slice to the requested byte range, send to tx.
-        async fn send_chunk_data(
-            pages: Vec<bytes::Bytes>, chunk_idx: i32, chunk_sz: usize,
-            req_start: usize, req_end: usize,
-            tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
-        ) -> bool {
-            // Concatenate all pages for this chunk
-            let mut chunk_data = Vec::new();
-            for p in &pages {
-                chunk_data.extend_from_slice(p);
-            }
-            // Compute slice within this chunk
-            let co = chunk_idx as usize * chunk_sz;
-            let sb = if req_start > co { req_start - co } else { 0 };
-            let se = std::cmp::min(chunk_data.len(), req_end.saturating_sub(co));
-            if sb < se && sb < chunk_data.len() {
-                let slice = &chunk_data[sb..se];
-                // Send as pages for backpressure (max 64KB each)
-                for page_chunk in slice.chunks(65536) {
-                    if tx.send(Ok(bytes::Bytes::copy_from_slice(page_chunk))).await.is_err() {
-                        return false;
+            while let Some((idx, page)) = stream.next().await {
+                // Empty page = sentinel (chunk download complete)
+                if page.is_empty() {
+                    sentinel_rcvd.insert(idx);
+                    chunks_done += 1;
+                    // Advance past any chunks that finished out-of-order.
+                    while sentinel_rcvd.contains(&next) {
+                        next += 1;
                     }
+                    if chunks_done >= spawned {
+                        break;
+                    }
+                    continue;
                 }
-            }
-            true
-        }
 
-        // Collect pages until all chunks complete
-        let mut sentinel_rcvd: std::collections::HashSet<i32> = std::collections::HashSet::new();
-        while let Some((idx, mut page)) = stream.next().await {
-            // Empty page = sentinel (chunk download complete)
-            if page.is_empty() {
-                sentinel_rcvd.insert(idx);
-                chunks_done += 1;
-                // Send completed chunk and any subsequent completed chunks
-                while sentinel_rcvd.contains(&next) {
-                    if let Some(pages) = chunk_pages.remove(&next) {
-                        if !send_chunk_data(pages, next, chunk_size, req_start, req_end, &tx).await {
-                            return Ok(());
+                // Skip chunks not in the requested range.
+                if idx < first_chunk as i32 || idx > last_chunk as i32 {
+                    continue;
+                }
+
+                // This chunk's global byte offset.
+                let co = idx as usize * chunk_size;
+                // Running byte offset of this chunk's accumulated pages so far.
+                let cur = *chunk_offset.entry(idx).or_insert(0);
+                // Advance this chunk's offset BEFORE computing the slice.
+                chunk_offset.insert(idx, cur + page.len());
+
+                // This page occupies global bytes [co+cur, co+cur+page.len()).
+                // Requested window is [req_start, req_end). Forward only the overlap.
+                let s = cur.max(req_start.saturating_sub(co));
+                let e = (cur + page.len()).min(req_end.saturating_sub(co));
+                if s < e {
+                    let slice = &page[s - cur..e - cur];
+                    for page_chunk in slice.chunks(65536) {
+                        if tx.send(Ok(bytes::Bytes::copy_from_slice(page_chunk))).await.is_err() {
+                            return;
                         }
-                        next += 1;
-                    } else {
-                        tracing::warn!("CHUNKED_SENTINEL_NO_PAGES: chunk {} sentinel received but no pages", next);
-                        next += 1;
                     }
                 }
-                if chunks_done >= spawned {
-                    break;
-                }
-                continue;
             }
-
-            // Accumulate page data for this chunk
-            chunk_pages.entry(idx).or_default().push(page);
-        }
-
-        // Drain any remaining completed chunks in order
-        while sentinel_rcvd.contains(&next) {
-            if let Some(pages) = chunk_pages.remove(&next) {
-                if !send_chunk_data(pages, next, chunk_size, req_start, req_end, &tx).await {
-                    return Ok(());
-                }
-                next += 1;
-            } else {
-                next += 1;
-            }
-        }
+        });
 
         Ok(())
     }
