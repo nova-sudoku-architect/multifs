@@ -344,6 +344,145 @@ impl StorageEngine {
         self.meta.create_multipart(upload_id, bucket, key, content_type)
     }
 
+    /// Stream an object write without buffering the whole body.
+    ///
+    /// Reads `S` (a stream of `bytes::Bytes`) and spools it into 32MiB chunks,
+    /// uploading each chunk to pCloud as it fills. This is the S3-parity path
+    /// for huge files: rclone streams the object/part body, we persist chunk by
+    /// chunk instead of holding the entire object in RAM. Returns the object
+    /// metadata (ETag computed over the full SHA-256 of the streamed bytes).
+    pub async fn put_object_stream<S>(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: Option<&str>,
+        stream: S,
+    ) -> anyhow::Result<ObjectInfo>
+    where
+        S: futures::Stream<Item = Result<bytes::Bytes, anyhow::Error>> + Send + 'static,
+    {
+        use futures::StreamExt;
+        use sha2::{Digest as _, Sha256};
+
+        self.ensure_bucket(bucket)?;
+        let backends = &*self.backends;
+        if backends.is_empty() {
+            anyhow::bail!("No storage backends configured");
+        }
+
+        if self.placement == PlacementStrategy::Utilization {
+            let _ = self.refresh_quotas().await;
+        }
+
+        #[derive(Debug)]
+        struct ChunkUploadResult {
+            global_index: u32,
+            remote_path: String,
+            checksum: String,
+            size: i64,
+            bucket: String,
+            key: String,
+            account: String,
+        }
+
+        let mut results = Vec::new();
+        let mut hasher = Sha256::new();
+        let mut buf: Vec<u8> = Vec::with_capacity(CHUNK_SIZE);
+        let mut total: i64 = 0;
+        let mut global_idx: u32 = 0;
+
+        let mut pin = Box::pin(stream);
+        while let Some(item) = pin.next().await {
+            let chunk = item?;
+            hasher.update(&chunk);
+            total += chunk.len() as i64;
+            buf.extend_from_slice(&chunk);
+
+            // Upload once we have a full 32MiB chunk (or on end-of-stream below).
+            if buf.len() >= CHUNK_SIZE {
+                let bi = self.pick_backend().await?;
+                let data = std::mem::take(&mut buf);
+                let checksum = hex::encode(Sha256::digest(&data));
+                let chunk_path = format!("{}/{}/{}.ck.{}", backends[bi].mount_prefix, bucket, key, global_idx);
+                match backends[bi].backend.upload(&chunk_path, &data).await {
+                    Ok((actual_path, _)) => {
+                        results.push(ChunkUploadResult {
+                            global_index: global_idx,
+                            remote_path: actual_path,
+                            checksum,
+                            size: data.len() as i64,
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                            account: backends[bi].label.clone(),
+                        });
+                        let mut cached = self.cached_quotas.lock().await;
+                        if bi < cached.per_backend.len() && cached.per_backend[bi].total > 0 {
+                            let used = (cached.per_backend[bi].fill_ratio * cached.per_backend[bi].total as f64) + data.len() as f64;
+                            cached.per_backend[bi].fill_ratio = used / cached.per_backend[bi].total as f64;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("stream upload chunk {} failed for {}/{}: {}", global_idx, bucket, key, e);
+                    }
+                }
+                global_idx += 1;
+            }
+        }
+
+        // Flush any trailing partial chunk.
+        if !buf.is_empty() {
+            let bi = self.pick_backend().await?;
+            let data = std::mem::take(&mut buf);
+            let checksum = hex::encode(Sha256::digest(&data));
+            let chunk_path = format!("{}/{}/{}.ck.{}", backends[bi].mount_prefix, bucket, key, global_idx);
+            match backends[bi].backend.upload(&chunk_path, &data).await {
+                Ok((actual_path, _)) => {
+                    results.push(ChunkUploadResult {
+                        global_index: global_idx,
+                        remote_path: actual_path,
+                        checksum,
+                        size: data.len() as i64,
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        account: backends[bi].label.clone(),
+                    });
+                }
+                Err(e) => {
+                    tracing::error!("stream upload final chunk {} failed for {}/{}: {}", global_idx, bucket, key, e);
+                }
+            }
+        }
+
+        let etag = hex::encode(hasher.finalize());
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+
+        self.meta.with_conn(|conn| -> anyhow::Result<()> {
+            conn.execute(
+                "INSERT OR REPLACE INTO files (bucket_name, key, size, etag, last_modified, content_type, storage_type)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'chunked')",
+                rusqlite::params![bucket, key, total, etag, now, content_type],
+            )?;
+            for r in &results {
+                conn.execute(
+                    "INSERT OR REPLACE INTO chunks (bucket_name, key, chunk_index, size, checksum, is_parity, account_email, remote_path)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
+                    rusqlite::params![r.bucket, r.key, r.global_index as i32, r.size, r.checksum, r.account, r.remote_path],
+                )?;
+            }
+            Ok(())
+        })?;
+
+        Ok(ObjectInfo {
+            key: key.to_string(),
+            size: total,
+            etag,
+            last_modified: now,
+            content_type: content_type.map(|s| s.to_string()),
+            account_email: backends[0].label.clone(),
+            remote_path: format!("chunked://{}/{}", bucket, key),
+        })
+    }
+
     /// Look up an in-progress multipart upload by id. Returns (bucket, key, content_type).
     pub async fn get_multipart_upload(&self, upload_id: &str) -> anyhow::Result<Option<(String, String, Option<String>)>> {
         self.meta.get_multipart(upload_id)

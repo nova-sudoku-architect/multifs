@@ -10,6 +10,7 @@ use axum::{
     routing::get, Router,
 };
 use chrono::Utc;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
@@ -536,40 +537,19 @@ async fn put_object(
 
     const CHUNK_SIZE_LIMIT: u64 = 32 * 1024 * 1024; // 32 MB — same as engine's chunk size
 
-    let result = if let Some(len) = content_length {
-        // If we know the full size and it's small, use buffered path
-        if len <= CHUNK_SIZE_LIMIT {
-            // Buffer the full body
-            let full_body = match axum::body::to_bytes(body, len as usize).await {
-                Ok(b) => b,
-                Err(e) => {
-                    let xml = s3_error_xml("InternalError", &format!("Failed to buffer body: {}", e), &format!("{}/{}", bucket, key));
-                    return Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
-                }
-            };
-            state.engine.put_object_with_content_type(&bucket, &key, &full_body, content_type.as_deref()).await
-        } else {
-            // Large file (>32 MB): buffer the full body and use chunked storage
-            let full_body = match axum::body::to_bytes(body, len as usize).await {
-                Ok(b) => b,
-                Err(e) => {
-                    let xml = s3_error_xml("InternalError", &format!("Failed to buffer body: {}", e), &format!("{}/{}", bucket, key));
-                    return Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
-                }
-            };
-            state.engine.put_object_with_content_type(&bucket, &key, &full_body, content_type.as_deref()).await
-        }
-    } else {
-        // No Content-Length: buffer entirely (handles chunked transfer encoding) up to 2GB
-        let full_body = match axum::body::to_bytes(body, 2_147_483_648).await {
-            Ok(b) => b,
-            Err(e) => {
-                let xml = s3_error_xml("InternalError", &format!("Failed to buffer body: {}", e), &format!("{}/{}", bucket, key));
-                return Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
-            }
-        };
-        state.engine.put_object_with_content_type(&bucket, &key, &full_body, content_type.as_deref()).await
-    };
+    // Stream the request body into storage, spooling 32MiB chunks as they
+    // arrive — no full-object RAM buffering. rclone sends the object/part body
+    // as a stream; this is the S3-parity write path.
+    // `Body::into_data_stream()` yields a `BodyDataStream` (Item = Result<Bytes>).
+    let result = state
+        .engine
+        .put_object_stream(
+            &bucket,
+            &key,
+            content_type.as_deref(),
+            body.into_data_stream().map(|r| r.map_err(|e| anyhow::anyhow!(e.to_string()))),
+        )
+        .await;
 
     match result {
         Ok(info) => {
