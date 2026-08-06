@@ -329,6 +329,20 @@ mod handler_tests {
             .map(|l| l.trim().trim_start_matches("<UploadId>").trim_end_matches("</UploadId>").to_string())
             .expect("UploadId in initiate response");
 
+        // Upload a real part first so Complete has staged data to stitch.
+        // (Completing a multipart upload with zero parts is invalid and would
+        // correctly return an error, not 200.)
+        let part_data = b"multipart part 1 body -- enough bytes to form a staged chunk" as &[u8];
+        let part_req = Request::builder()
+            .method("PUT")
+            .uri(format!("/test-bucket/large-file.bin?partNumber=1&uploadId={}", upload_id))
+            .header("content-type", "application/octet-stream")
+            .header("content-length", part_data.len().to_string())
+            .body(Body::from(part_data.to_vec()))
+            .unwrap();
+        let part_resp = app.clone().oneshot(part_req).await.unwrap();
+        assert_eq!(part_resp.status(), 200, "UploadPart should return 200");
+
         let request = Request::builder()
             .method("POST")
             .uri(format!("/test-bucket/large-file.bin?uploadId={}", upload_id))
