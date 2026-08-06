@@ -1,7 +1,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use sha2::{Digest, Sha256};
+use sha2::{Digest as Sha2Digest, Sha256};
+use md5::{Digest as Md5Digest, Md5};
 use chrono::Utc;
 
 use crate::config::{Config, PlacementStrategy};
@@ -298,6 +299,189 @@ impl StorageEngine {
             account_email: backends[0].label.clone(),
             remote_path: format!("chunked://{}/{}", bucket, key),
         })
+    }
+
+    /// Register a new in-progress multipart upload on-disk (wrapper around metadata).
+    pub async fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        content_type: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.meta.create_multipart(upload_id, bucket, key, content_type)
+    }
+
+    /// Look up an in-progress multipart upload by id. Returns (bucket, key, content_type).
+    pub async fn get_multipart_upload(&self, upload_id: &str) -> anyhow::Result<Option<(String, String, Option<String>)>> {
+        self.meta.get_multipart(upload_id)
+    }
+
+    /// Count how many chunk rows are staged for a part's staging key.
+    pub async fn count_part_chunks(&self, bucket: &str, staging_key: &str) -> anyhow::Result<i32> {
+        let rows = self.meta.list_chunks_for_key(bucket, staging_key)?;
+        Ok(rows.len() as i32)
+    }
+
+    /// Record per-part metadata so Complete can stitch staged chunks in order.
+    pub async fn store_part_meta(
+        &self,
+        upload_id: &str,
+        part_number: u64,
+        size: i64,
+        part_etag: &str,
+        chunk_count: i32,
+    ) -> anyhow::Result<()> {
+        self.meta.store_multipart_part(upload_id, part_number, size, part_etag, 0, chunk_count)
+    }
+
+    /// Stream a single UploadPart's bytes to storage as 32 MiB chunks.
+    ///
+    /// The chunks are staged under a per-part unique key so concurrent parts for
+    /// the same object don't collide in the `chunks` table (whose PK is
+    /// (bucket, key, chunk_index)). Only metadata is recorded on-disk; the part
+    /// bytes are NOT held in RAM and NOT re-uploaded at Complete time.
+    ///
+    /// Returns (staging_key, total_part_size, part_md5).
+    pub async fn upload_part_as_chunks(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        part_number: u64,
+        data: &[u8],
+    ) -> anyhow::Result<(String, i64, String)> {
+        let backends = &*self.backends;
+        if backends.is_empty() {
+            anyhow::bail!("No storage backends configured");
+        }
+        // Staging key unique per upload+part, so chunk records never collide.
+        let staging_key = format!("__multipart__/{}/{}", upload_id, part_number);
+        let data_chunks = chunk_manager::split(data, CHUNK_SIZE);
+
+        if self.placement == PlacementStrategy::Utilization {
+            let _ = self.refresh_quotas().await;
+        }
+
+        let mut results = Vec::new();
+        for (local_idx, chunk) in data_chunks.iter().enumerate() {
+            let global_idx = local_idx as u32;
+            let bi = self.pick_backend().await?;
+            let chunk_path = format!(
+                "{}/{}/{}.mp.{}",
+                backends[bi].mount_prefix, bucket, staging_key, global_idx
+            );
+            match backends[bi].backend.upload(&chunk_path, &chunk.data).await {
+                Ok((actual_path, _)) => {
+                    results.push((global_idx, actual_path, chunk.checksum.clone(), chunk.data.len() as i64, backends[bi].label.clone()));
+                    let mut cached = self.cached_quotas.lock().await;
+                    if bi < cached.len() && cached[bi].total > 0 {
+                        let used = (cached[bi].fill_ratio * cached[bi].total as f64) + chunk.data.len() as f64;
+                        cached[bi].fill_ratio = used / cached[bi].total as f64;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "multipart part {} chunk {} upload failed for {}/{}: {}",
+                        part_number, global_idx, bucket, staging_key, e
+                    );
+                }
+            }
+        }
+
+        // Record staged chunk metadata under the staging key.
+        self.meta.with_conn(|conn| -> anyhow::Result<()> {
+            for (idx, remote_path, checksum, size, account) in &results {
+                conn.execute(
+                    "INSERT OR REPLACE INTO chunks (bucket_name, key, chunk_index, size, checksum, is_parity, account_email, remote_path)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
+                    rusqlite::params![bucket, staging_key, *idx as i32, *size, checksum, account, remote_path],
+                )?;
+            }
+            Ok(())
+        })?;
+
+        let part_md5 = hex::encode(Md5::digest(data));
+        Ok((staging_key, data.len() as i64, part_md5))
+    }
+
+    /// Stitch a completed multipart upload into a final object.
+    ///
+    /// Reads the ordered part records, maps each part's staged chunks to a
+    /// contiguous global chunk range under the final key, writes the `files`
+    /// row + `chunks` rows, and returns the S3 multipart ETag
+    /// (MD5 of the concatenation of each part's binary MD5).
+    pub async fn stitch_multipart(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        content_type: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let parts = self.meta.list_multipart_parts(upload_id)?;
+        if parts.is_empty() {
+            anyhow::bail!("No parts recorded for multipart upload {}", upload_id);
+        }
+
+        // Resolve the real object key from the upload record.
+        let (_, real_key, ct) = self.meta.get_multipart(upload_id)?
+            .ok_or_else(|| anyhow::anyhow!("Multipart upload {} not found", upload_id))?;
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        let total_size: i64 = parts.iter().map(|(_, size, _, _, _)| size).sum();
+
+        // S3 multipart ETag: MD5 over the concat of each part's binary MD5.
+        let mut md5_concat = Vec::new();
+        for (_, _, part_etag, _, _) in &parts {
+            let bin = hex::decode(part_etag)?;
+            md5_concat.extend_from_slice(&bin);
+        }
+        let etag = hex::encode(Md5::digest(&md5_concat));
+
+        // Clear stale chunks under the real key, write files row.
+        self.meta.with_conn(|conn| -> anyhow::Result<()> {
+            conn.execute(
+                "DELETE FROM chunks WHERE bucket_name = ?1 AND key = ?2",
+                rusqlite::params![bucket, real_key],
+            )?;
+            conn.execute(
+                "INSERT OR REPLACE INTO files (bucket_name, key, size, etag, last_modified, content_type, storage_type)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'chunked')",
+                rusqlite::params![bucket, real_key, total_size, etag, now, content_type.as_deref().or(ct.as_deref())],
+            )?;
+            Ok(())
+        })?;
+
+        // Re-stitch: map each part's staged chunks into a global sequential
+        // chunk_index under the real key.
+        let mut global_idx: i32 = 0;
+        for (pn, _, _, _, _) in &parts {
+            let staging_key = format!("__multipart__/{}/{}", upload_id, pn);
+            let staged = self.meta.list_chunks_for_key(bucket, &staging_key)?;
+            for (_, size, checksum, account, remote_path) in &staged {
+                self.meta.with_conn(|conn| -> anyhow::Result<()> {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO chunks (bucket_name, key, chunk_index, size, checksum, is_parity, account_email, remote_path)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
+                        rusqlite::params![bucket, real_key, global_idx, size, checksum, account, remote_path],
+                    )?;
+                    Ok(())
+                })?;
+                global_idx += 1;
+            }
+        }
+
+        // Clean up staged chunk rows + upload record.
+        for (pn, _, _, _, _) in &parts {
+            let staging_key = format!("__multipart__/{}/{}", upload_id, pn);
+            self.meta.with_conn(|conn| -> anyhow::Result<()> {
+                conn.execute(
+                    "DELETE FROM chunks WHERE bucket_name = ?1 AND key = ?2",
+                    rusqlite::params![bucket, staging_key],
+                )?;
+                Ok(())
+            })?;
+        }
+        self.meta.delete_multipart(upload_id)?;
+
+        Ok(etag)
     }
 
     pub async fn get_object(&self, bucket: &str, key: &str) -> anyhow::Result<Vec<u8>> {

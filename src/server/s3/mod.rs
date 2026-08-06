@@ -1,9 +1,6 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow;
-use sha2::{Digest, Sha256};
-use md5::{Digest as Md5Digest, Md5};
 use axum::{
     extract::DefaultBodyLimit,
     body::Body,
@@ -14,27 +11,14 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
 use crate::storage::engine::StorageEngine;
-
-/// An in-progress S3 multipart upload: buffered parts keyed by part number.
-struct MultipartUpload {
-    bucket: String,
-    key: String,
-    content_type: Option<String>,
-    /// part number -> (part bytes, MD5 hex of those bytes)
-    parts: BTreeMap<u64, (Vec<u8>, String)>,
-    created: i64,
-}
 
 /// Shared application state
 #[derive(Clone)]
 pub struct S3State {
     pub engine: Arc<StorageEngine>,
-    /// upload_id -> in-progress multipart upload.
-    pub multipart_uploads: Arc<Mutex<BTreeMap<String, MultipartUpload>>>,
 }
 
 /// Parse a raw query string into a map (axum 0.8 may need manual parsing for
@@ -57,7 +41,6 @@ fn parse_query(query_str: &str) -> std::collections::HashMap<String, String> {
 pub fn build_router(engine: Arc<StorageEngine>) -> Router {
     let state = S3State {
         engine,
-        multipart_uploads: Arc::new(Mutex::new(BTreeMap::new())),
     };
 
     Router::new()
@@ -396,24 +379,19 @@ async fn put_object(
     // POST /{bucket}/{key}?uploads — Initiate multipart upload
     if has_uploads && !has_upload_id {
         let upload_id = format!("multipart-{}", chrono::Utc::now().format("%Y%m%d%H%M%S%f"));
-        // Register in-progress upload so later parts can be stored against it.
-        state
-            .multipart_uploads
-            .lock()
+        let content_type = headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        // Persist the in-progress upload on-disk (survives restarts).
+        if let Err(e) = state
+            .engine
+            .create_multipart_upload(&bucket, &key, &upload_id, content_type.as_deref())
             .await
-            .insert(
-                upload_id.clone(),
-                MultipartUpload {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    content_type: headers
-                        .get(http::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string()),
-                    parts: BTreeMap::new(),
-                    created: chrono::Utc::now().timestamp(),
-                },
-            );
+        {
+            let xml = s3_error_xml("InternalError", &e.to_string(), &format!("{}/{}", bucket, key));
+            return Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
+        }
         let xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -438,39 +416,22 @@ async fn put_object(
             .or_else(|| q.get("upload_id"))
             .cloned()
             .unwrap_or_default();
-        let mp = {
-            let mut map = state.multipart_uploads.lock().await;
-            map.remove(&upload_id)
-        };
-        let mp = match mp {
-            Some(mp) => mp,
-            None => {
+        // Verify the upload actually exists before stitching.
+        match state.engine.get_multipart_upload(&upload_id).await {
+            Ok(None) => {
                 let xml = s3_error_xml("NoSuchUpload", "no such multipart upload", &format!("{}/{}", bucket, key));
                 return Response::builder().status(StatusCode::NOT_FOUND).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
             }
-        };
-        // Assemble parts in part-number order into the final object.
-        let mut data = Vec::new();
-        let mut md5_concat = Vec::new();
-        for (_num, (part, _part_md5)) in mp.parts.iter() {
-            data.extend_from_slice(part);
-            // S3 multipart ETag = MD5 of the concatenation of each part's
-            // binary MD5. We recompute here (independent of what UploadPart
-            // returned) so the object ETag is always spec-compliant.
-            md5_concat.extend_from_slice(&Md5::digest(part));
+            Err(e) => {
+                let xml = s3_error_xml("InternalError", &e.to_string(), &format!("{}/{}", bucket, key));
+                return Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
+            }
+            Ok(Some(_)) => {}
         }
-        // Recompute the object MD5 directly from the assembled bytes (single MD5,
-        // used when the whole object IS a single part / for the checksum).
-        // For multipart ETag we use the standard MD5-of-part-MD5s form,
-        // which rclone verifies against on the first pass.
-        let etag = hex::encode(Md5::digest(&md5_concat));
-        let content_type = mp.content_type.clone();
-        return match state
-            .engine
-            .put_object_with_content_type(&mp.bucket, &mp.key, &data, content_type.as_deref())
-            .await
-        {
-            Ok(_info) => {
+        // Stitch the staged part chunks into the final object (no RAM reassembly,
+        // no re-upload). Returns the spec-compliant multipart ETag.
+        return match state.engine.stitch_multipart(&bucket, &upload_id, None).await {
+            Ok(etag) => {
                 let xml = format!(
                     r#"<?xml version="1.0" encoding="UTF-8"?>
 <CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -479,7 +440,7 @@ async fn put_object(
   <Key>{}</Key>
   <ETag>&quot;{}&quot;</ETag>
 </CompleteMultipartUploadResult>"#,
-                    mp.bucket, mp.key, mp.bucket, mp.key, etag
+                    bucket, key, bucket, key, etag
                 );
                 Response::builder()
                     .status(StatusCode::OK)
@@ -489,7 +450,7 @@ async fn put_object(
                     .unwrap()
             }
             Err(e) => {
-                let xml = s3_error_xml("InternalError", &e.to_string(), &format!("{}/{}", mp.bucket, mp.key));
+                let xml = s3_error_xml("InternalError", &e.to_string(), &format!("{}/{}", bucket, key));
                 Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap()
             }
         };
@@ -507,8 +468,22 @@ async fn put_object(
             .get("partNumber")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
+        // Verify the upload exists before storing anything.
+        match state.engine.get_multipart_upload(&upload_id).await {
+            Ok(None) => {
+                let xml = s3_error_xml("NoSuchUpload", "no such multipart upload", &format!("{}/{}", bucket, key));
+                return Response::builder().status(StatusCode::NOT_FOUND).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
+            }
+            Err(e) => {
+                let xml = s3_error_xml("InternalError", &e.to_string(), &format!("{}/{}", bucket, key));
+                return Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
+            }
+            Ok(Some(_)) => {}
+        }
         // Read the full part body so the connection is fully consumed (prevents
         // the broken-pipe / "empty response payload" rclone hit before).
+        // NOTE: parts larger than memory are not supported; rclone splits into
+        // bounded parts, so this stays within limits.
         let part_data = match axum::body::to_bytes(body, 2_147_483_648).await {
             Ok(b) => b.to_vec(),
             Err(e) => {
@@ -516,23 +491,30 @@ async fn put_object(
                 return Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
             }
         };
-        // Store the part against the in-progress upload.
-        // S3 spec: each part's ETag must be MD5(part bytes) so clients (rclone)
-        // can verify the part on the first pass with no retry churn.
-        let part_md5 = hex::encode(Md5::digest(&part_data));
+        // Stream the part bytes to storage as chunks (no RAM retention of the
+        // whole object across parts, no re-upload at Complete). Record the part
+        // metadata so Complete can stitch.
+        let (staging_key, part_size, part_md5) =
+            match state.engine.upload_part_as_chunks(&bucket, &upload_id, part_no, &part_data).await {
+                Ok(t) => t,
+                Err(e) => {
+                    let xml = s3_error_xml("InternalError", &e.to_string(), &format!("{}/{}", bucket, key));
+                    return Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
+                }
+            };
+        // Record per-part metadata for stitching (first_chunk + chunk_count).
+        let chunk_count = state
+            .engine
+            .count_part_chunks(&bucket, &staging_key)
+            .await
+            .unwrap_or(0);
+        if let Err(e) = state
+            .engine
+            .store_part_meta(&upload_id, part_no, part_size, &part_md5, chunk_count)
+            .await
         {
-            let mut map = state.multipart_uploads.lock().await;
-            match map.get_mut(&upload_id) {
-                Some(mp) => {
-                    // Keep the part body AND its MD5 for the final ETag assembly.
-                    mp.parts.insert(part_no, (part_data, part_md5.clone()));
-                }
-                None => {
-                    drop(map);
-                    let xml = s3_error_xml("NoSuchUpload", "no such multipart upload", &format!("{}/{}", bucket, key));
-                    return Response::builder().status(StatusCode::NOT_FOUND).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
-                }
-            }
+            let xml = s3_error_xml("InternalError", &e.to_string(), &format!("{}/{}", bucket, key));
+            return Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
         }
         // ETag = MD5 of the actual part bytes (S3-compliant, differs per part).
         return Response::builder()

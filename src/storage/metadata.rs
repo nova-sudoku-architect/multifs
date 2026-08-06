@@ -108,6 +108,24 @@ impl MetadataDb {
             CREATE INDEX IF NOT EXISTS idx_chunks_account ON chunks(account_email);
             CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(bucket_name, key);
             CREATE INDEX IF NOT EXISTS idx_files_bucket ON files(bucket_name);
+
+            CREATE TABLE IF NOT EXISTS multipart_uploads (
+                upload_id TEXT PRIMARY KEY,
+                bucket TEXT NOT NULL,
+                key TEXT NOT NULL,
+                content_type TEXT,
+                created INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS multipart_parts (
+                upload_id TEXT NOT NULL,
+                part_number INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                part_etag TEXT NOT NULL,
+                first_chunk INTEGER NOT NULL,
+                chunk_count INTEGER NOT NULL,
+                PRIMARY KEY (upload_id, part_number)
+            );
             ",
         )?;
         Ok(Self { path: path.to_string() })
@@ -298,6 +316,94 @@ impl MetadataDb {
     pub fn account_total_size(&self, email: &str) -> anyhow::Result<i64> {
         self.with_conn(|conn| {
             conn.query_row("SELECT COALESCE(SUM(size), 0) FROM objects WHERE account_email = ?1", params![email], |row| row.get(0)).map_err(anyhow::Error::from)
+        })
+    }
+
+    // ---- Multipart upload (streaming) helpers ----
+
+    /// Register a new in-progress multipart upload (on-disk so it survives restarts).
+    pub fn create_multipart(&self, upload_id: &str, bucket: &str, key: &str, content_type: Option<&str>) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO multipart_uploads (upload_id, bucket, key, content_type, created) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![upload_id, bucket, key, content_type, chrono::Utc::now().timestamp()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Get an in-progress multipart upload. Returns (bucket, key, content_type).
+    pub fn get_multipart(&self, upload_id: &str) -> anyhow::Result<Option<(String, String, Option<String>)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT bucket, key, content_type FROM multipart_uploads WHERE upload_id = ?1")?;
+            let mut rows = stmt.query(params![upload_id])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?)))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    /// Remove an in-progress multipart upload and all its part records.
+    pub fn delete_multipart(&self, upload_id: &str) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute("DELETE FROM multipart_uploads WHERE upload_id = ?1", params![upload_id])?;
+            conn.execute("DELETE FROM multipart_parts WHERE upload_id = ?1", params![upload_id])?;
+            Ok(())
+        })
+    }
+
+    /// Store the metadata for a single stored part. The part bytes already live
+    /// on backends as chunks; this records how to stitch them on Complete.
+    pub fn store_multipart_part(
+        &self,
+        upload_id: &str,
+        part_number: u64,
+        size: i64,
+        part_etag: &str,
+        first_chunk: i32,
+        chunk_count: i32,
+    ) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO multipart_parts (upload_id, part_number, size, part_etag, first_chunk, chunk_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![upload_id, part_number as i64, size, part_etag, first_chunk, chunk_count],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Fetch ordered part records: (part_number, size, part_etag, first_chunk, chunk_count).
+    pub fn list_multipart_parts(&self, upload_id: &str) -> anyhow::Result<Vec<(u64, i64, String, i32, i32)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT part_number, size, part_etag, first_chunk, chunk_count FROM multipart_parts
+                 WHERE upload_id = ?1 ORDER BY part_number",
+            )?;
+            let rows = stmt.query_map(params![upload_id], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, i32>(3)?, row.get::<_, i32>(4)?))
+            })?;
+            let mut v = Vec::new();
+            for r in rows { v.push(r?); }
+            Ok(v)
+        })
+    }
+
+    /// Fetch chunk metadata rows for an object key, ordered by chunk_index.
+    pub fn list_chunks_for_key(&self, bucket: &str, key: &str) -> anyhow::Result<Vec<(i32, i64, String, String, String)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT chunk_index, size, checksum, account_email, remote_path FROM chunks
+                 WHERE bucket_name = ?1 AND key = ?2 ORDER BY chunk_index",
+            )?;
+            let rows = stmt.query_map(params![bucket, key], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            })?;
+            let mut v = Vec::new();
+            for r in rows { v.push(r?); }
+            Ok(v)
         })
     }
 }
