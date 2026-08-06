@@ -736,7 +736,7 @@ impl StorageEngine {
             // Compute slice within this chunk
             let co = chunk_idx as usize * chunk_sz;
             let sb = if req_start > co { req_start - co } else { 0 };
-            let se = std::cmp::min(chunk_data.len(), req_end.saturating_sub(co + sb));
+            let se = std::cmp::min(chunk_data.len(), req_end.saturating_sub(co));
             if sb < se && sb < chunk_data.len() {
                 let slice = &chunk_data[sb..se];
                 // Send as pages for backpressure (max 64KB each)

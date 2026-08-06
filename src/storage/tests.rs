@@ -908,8 +908,9 @@ mod tests {
         let (engine, _dir, b1, b2) = make_tracked_engine();
         engine.create_bucket("prefetch-bucket").await.unwrap();
 
-        // 5 chunks: 160MB
-        let data = vec![0xABu8; 3 * 1024];
+        // 5 chunks: 160MB (must be above the 32MB chunk threshold so the file
+        // is actually stored chunked and .ck.N chunks exist for prefetching).
+        let data = vec![0xABu8; 160 * 1024 * 1024];
         engine.put_object("prefetch-bucket", "video.mp4", &data).await.unwrap();
 
         // Clear access tracking
