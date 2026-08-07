@@ -578,7 +578,17 @@ async fn get_object(
     State(state): State<S3State>,
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
 ) -> Response {
+    // GET /{bucket}/{key}?uploadId=... — ListParts (rclone compatibility).
+    // Served before attempting a normal object download so a multipart
+    // ListParts call never falls through to a head_object of a staged part.
+    let has_upload_id =
+        uri.query().map(|q| q.contains("uploadId=") || q.contains("upload_id=")).unwrap_or(false);
+    if has_upload_id {
+        return list_parts(&state, &bucket, &key, uri.query().unwrap_or("")).await;
+    }
+
     use tokio::sync::mpsc;
     use bytes::Bytes;
     use futures::stream::StreamExt;
@@ -645,6 +655,94 @@ async fn get_object(
     }
 
     response.body(Body::from_stream(stream)).unwrap()
+}
+
+/// GET /{bucket}/{key}?uploadId=... — ListParts (rclone compatibility).
+///
+/// rclone uses ListParts to enumerate the parts of an in-progress multipart
+/// upload (e.g. when resuming / verifying parts before CompleteMultipartUpload).
+/// The parts are stored on-disk in `multipart_parts`; we serve them back as
+/// the S3 ListParts XML document. No pCloud calls are made.
+async fn list_parts(
+    state: &S3State,
+    bucket: &str,
+    key: &str,
+    query_str: &str,
+) -> Response {
+    let q = parse_query(query_str);
+    let upload_id = q
+        .get("uploadId")
+        .or_else(|| q.get("upload_id"))
+        .cloned()
+        .unwrap_or_default();
+
+    // Verify the upload exists.
+    match state.engine.get_multipart_upload(&upload_id).await {
+        Ok(None) => {
+            let xml =
+                s3_error_xml("NoSuchUpload", "no such multipart upload", &format!("{}/{}", bucket, key));
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap();
+        }
+        Err(e) => {
+            let xml =
+                s3_error_xml("InternalError", &e.to_string(), &format!("{}/{}", bucket, key));
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap();
+        }
+        Ok(Some(_)) => {}
+    }
+
+    let parts = match state.engine.list_multipart_parts_public(&upload_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            let xml =
+                s3_error_xml("InternalError", &e.to_string(), &format!("{}/{}", bucket, key));
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap();
+        }
+    };
+
+    // Build the ListParts XML document.
+    let mut body = String::new();
+    body.push_str(&format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>{}</Bucket>
+  <Key>{}</Key>
+  <UploadId>{}</UploadId>
+  <IsTruncated>false</IsTruncated>
+  <PartNumberMarker>0</PartNumberMarker>
+  <NextPartNumberMarker>0</NextPartNumberMarker>
+  <MaxParts>1000</MaxParts>
+"#,
+        bucket, key, upload_id
+    ));
+    for (part_number, size, part_etag, _first_chunk, _chunk_count) in parts {
+        body.push_str(&format!(
+            "  <Part>\n    <PartNumber>{}</PartNumber>\n    <Size>{}</Size>\n    <ETag>&quot;{}&quot;</ETag>\n    <LastModified>{}</LastModified>\n  </Part>\n",
+            part_number,
+            size,
+            part_etag,
+            chrono::Utc::now().to_rfc3339(),
+        ));
+    }
+    body.push_str("</ListPartsResult>");
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/xml")
+        .body(Body::from(body))
+        .unwrap()
 }
 
 /// HEAD /{bucket}/{key} — Object metadata

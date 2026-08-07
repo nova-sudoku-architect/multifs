@@ -488,6 +488,12 @@ impl StorageEngine {
         self.meta.get_multipart(upload_id)
     }
 
+    /// List the parts recorded for a multipart upload, ordered by part number.
+    /// Returns (part_number, size, part_etag, first_chunk, chunk_count).
+    pub async fn list_multipart_parts_public(&self, upload_id: &str) -> anyhow::Result<Vec<(u64, i64, String, i32, i32)>> {
+        self.meta.list_multipart_parts(upload_id)
+    }
+
     /// Count how many chunk rows are staged for a part's staging key.
     pub async fn count_part_chunks(&self, bucket: &str, staging_key: &str) -> anyhow::Result<i32> {
         let rows = self.meta.list_chunks_for_key(bucket, staging_key)?;

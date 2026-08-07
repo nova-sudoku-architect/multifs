@@ -453,6 +453,80 @@ mod handler_tests {
         assert_eq!(obj, expected, "assembled object should equal parts concatenated in order");
     }
 
+    /// ListParts: after initiating an upload and uploading parts, GET
+    /// /{bucket}/{key}?uploadId=... must return a ListPartsResult XML with the
+    /// staged part numbers/sizes. rclone relies on this to verify/resume.
+    #[tokio::test]
+    async fn test_s3_list_parts_returns_parts_xml() {
+        use crate::server::s3;
+
+        let engine = build_s3_app().await;
+        let app = s3::build_router(engine.clone());
+
+        // Initiate
+        let init = Request::builder()
+            .method("POST")
+            .uri("/test-bucket/large.bin?uploads")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(init).await.unwrap();
+        let xml =
+            String::from_utf8_lossy(&axum::body::to_bytes(resp.into_body(), 4096).await.unwrap()).to_string();
+        let upload_id = xml
+            .lines()
+            .find(|l| l.contains("<UploadId>"))
+            .map(|l| l.trim().trim_start_matches("<UploadId>").trim_end_matches("</UploadId>").to_string())
+            .expect("UploadId in initiate response");
+
+        // Upload two parts with distinguishable sizes
+        let part1: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect(); // 1 KB
+        let part2: Vec<u8> = (0..2048).map(|i| (i % 199) as u8).collect(); // 2 KB
+        for (n, data) in [(1, &part1), (2, &part2)].iter() {
+            let req = Request::builder()
+                .method("PUT")
+                .uri(format!("/test-bucket/large.bin?partNumber={}&uploadId={}", n, upload_id))
+                .header("content-length", data.len().to_string())
+                .body(Body::from((*data).clone()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), 200, "UploadPart {} should return 200", n);
+        }
+
+        // ListParts
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/test-bucket/large.bin?uploadId={}", upload_id))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200, "ListParts should return 200");
+        let body = String::from_utf8_lossy(&axum::body::to_bytes(resp.into_body(), 8192).await.unwrap()).to_string();
+
+        // Schema + content assertions
+        assert!(body.contains("ListPartsResult"), "should be ListPartsResult XML");
+        assert!(body.contains(&format!("<UploadId>{}</UploadId>", upload_id)));
+        assert!(body.contains("<PartNumber>1</PartNumber>"));
+        assert!(body.contains("<PartNumber>2</PartNumber>"));
+        assert!(body.contains("<Size>1024</Size>"));
+        assert!(body.contains("<Size>2048</Size>"));
+        assert!(body.contains("<IsTruncated>false</IsTruncated>"));
+    }
+
+    /// ListParts with an unknown upload id must return 404 NoSuchUpload.
+    #[tokio::test]
+    async fn test_s3_list_parts_unknown_upload_returns_404() {
+        use crate::server::s3;
+
+        let app = s3::build_router(build_s3_app().await);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/test-bucket/large.bin?uploadId=nonexistent-upload")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 404, "ListParts for unknown upload should be 404");
+    }
+
     /// UploadPart must consume the request body (regression: previously it
     /// returned without reading the body -> broken pipe). Verify the part is
     /// actually stored by completing and reading it back.
