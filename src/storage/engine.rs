@@ -860,7 +860,7 @@ impl StorageEngine {
 
         // Spawn concurrent chunk downloads. Each task pipes pCloud's HTTP stream
         // page-by-page through a shared channel, followed by an empty sentinel.
-        let (page_tx, page_rx) = tokio::sync::mpsc::unbounded_channel::<(i32, bytes::Bytes)>();
+        let (page_tx, page_rx) = tokio::sync::mpsc::unbounded_channel::<(i32, usize, bytes::Bytes)>();
         let mut spawned = 0u32;
         let dt = self.download_tracker.clone();
 
@@ -914,7 +914,7 @@ impl StorageEngine {
 
                 // Prefetch via the same paged path but without the client channel
                 // receiver — it will populate the page cache and stop there.
-                let (_probe_tx, _probe_rx) = tokio::sync::mpsc::unbounded_channel::<(i32, bytes::Bytes)>();
+                let (_probe_tx, _probe_rx) = tokio::sync::mpsc::unbounded_channel::<(i32, usize, bytes::Bytes)>();
                 tokio::spawn(async move {
                     Self::stream_chunk_paged(cc, cdt, backends_owned, _probe_tx, b, k, acct, ow, idx).await;
                 });
@@ -938,49 +938,58 @@ impl StorageEngine {
         // 65th send blocks against a receiver that is still awaiting this call.
         tokio::spawn(async move {
             let mut stream = UnboundedReceiverStream::new(page_rx);
-            let mut chunk_offset: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+            // Per-chunk page buffers, bounded: we only fully buffer ONE chunk at a
+            // time in order to guarantee client output arrives in strict chunk order
+            // (chunk 0 fully before chunk 1). This keeps the read-back stream-based
+            // (single 32 MiB chunk buffer at most, never the whole object in RAM).
+            let mut chunk_page_buf: std::collections::HashMap<i32, Vec<(usize, bytes::Bytes)>> =
+                std::collections::HashMap::new();
             let mut sentinel_rcvd: std::collections::HashSet<i32> = std::collections::HashSet::new();
-            let mut chunks_done = 0u32;
+            let mut chunks_sent = 0u32;
             let mut next = first_chunk as i32;
 
-            while let Some((idx, page)) = stream.next().await {
-                // Empty page = sentinel (chunk download complete)
+            // Buffer incoming pages; when the current `next` chunk is fully buffered
+            // (its sentinel arrived), emit its pages in page order to the client,
+            // then advance to the next chunk.
+            while let Some((idx, off, page)) = stream.next().await {
+                let ictxi = idx as i32;
+                let entry = chunk_page_buf.entry(ictxi).or_insert_with(Vec::new);
                 if page.is_empty() {
-                    sentinel_rcvd.insert(idx);
-                    chunks_done += 1;
-                    // Advance past any chunks that finished out-of-order.
-                    while sentinel_rcvd.contains(&next) {
-                        next += 1;
-                    }
-                    if chunks_done >= spawned {
-                        break;
-                    }
-                    continue;
+                    sentinel_rcvd.insert(ictxi);
+                } else {
+                    entry.push((off, page));
                 }
 
-                // Skip chunks not in the requested range.
-                if idx < first_chunk as i32 || idx > last_chunk as i32 {
-                    continue;
-                }
-
-                // This chunk's global byte offset.
-                let co = idx as usize * chunk_size;
-                // Running byte offset of this chunk's accumulated pages so far.
-                let cur = *chunk_offset.entry(idx).or_insert(0);
-                // Advance this chunk's offset BEFORE computing the slice.
-                chunk_offset.insert(idx, cur + page.len());
-
-                // This page occupies global bytes [co+cur, co+cur+page.len()).
-                // Requested window is [req_start, req_end). Forward only the overlap.
-                let s = cur.max(req_start.saturating_sub(co));
-                let e = (cur + page.len()).min(req_end.saturating_sub(co));
-                if s < e {
-                    let slice = &page[s - cur..e - cur];
-                    for page_chunk in slice.chunks(65536) {
-                        if tx.send(Ok(bytes::Bytes::copy_from_slice(page_chunk))).await.is_err() {
-                            return;
+                // Drain chunks strictly in order: emit buffered pages of `next` and
+                // advance as long as that chunk's sentinel has arrived.
+                while sentinel_rcvd.contains(&next) {
+                    if let Some(buf) = chunk_page_buf.get_mut(&next) {
+                        let co = next as usize * chunk_size;
+                        // Sort pages by byte offset so assembly is deterministic from
+                        // the requested range, not from arrival order.
+                        buf.sort_by_key(|(o, _)| *o);
+                        let mut cur = 0usize;
+                        for (off, page) in buf.iter() {
+                            let s = cur.max(req_start.saturating_sub(co));
+                            let e = (cur + page.len()).min(req_end.saturating_sub(co));
+                            if s < e {
+                                let slice = &page[s - cur..e - cur];
+                                for page_chunk in slice.chunks(65536) {
+                                    if tx.send(Ok(bytes::Bytes::copy_from_slice(page_chunk))).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            cur = *off + page.len();
                         }
+                        chunk_page_buf.remove(&next);
+                        chunks_sent += 1;
                     }
+                    next += 1;
+                }
+
+                if chunks_sent >= spawned {
+                    break;
                 }
             }
         });
@@ -994,7 +1003,7 @@ impl StorageEngine {
         cc: Arc<PageCache>,
         cdt: Arc<DownloadTracker>,
         backends: Arc<Vec<BackendHandle>>,
-        pt: tokio::sync::mpsc::UnboundedSender<(i32, bytes::Bytes)>,
+        pt: tokio::sync::mpsc::UnboundedSender<(i32, usize, bytes::Bytes)>,
         b: String, k: String, acct: String, ow: String, idx: i32,
     ) {
         let page_size = page_cache::PAGE_SIZE;
@@ -1005,11 +1014,11 @@ impl StorageEngine {
             let total_pages = (CHUNK_SIZE + page_size - 1) / page_size;
             for pn in 0..total_pages {
                 if let Some(page) = cc.get_page(&b, &k, idx, pn, CHUNK_SIZE).await {
-                    if pt.send((idx, bytes::Bytes::from(page))).is_err() { return; }
+                    if pt.send((idx, pn * page_size, bytes::Bytes::from(page))).is_err() { return; }
                 }
             }
             // Sentinel: signal chunk complete
-            let _ = pt.send((idx, bytes::Bytes::new()));
+            let _ = pt.send((idx, 0usize, bytes::Bytes::new()));
             return;
         }
 
@@ -1033,7 +1042,7 @@ impl StorageEngine {
                         let len = p.len();
                         cc.put_pages(&b, &k, idx, offset, &p, CHUNK_SIZE).await;
                         offset += len;
-                        if pt.send((idx, p)).is_err() { break; }
+                        if pt.send((idx, offset - len, p)).is_err() { break; }
                     }
                     Err(e) => {
                         tracing::warn!("Chunk download error for {}/{} chunk {}: {}", b, k, idx, e);
@@ -1046,7 +1055,7 @@ impl StorageEngine {
         }
         // Always send sentinel — even on failure, so the assembly pipeline doesn't hang.
         // The upload fix ensures chunks always exist on pCloud, making this safe.
-        let _ = pt.send((idx, bytes::Bytes::new()));
+        let _ = pt.send((idx, 0usize, bytes::Bytes::new()));
     }
 
     pub async fn head_object(&self, bucket: &str, key: &str) -> anyhow::Result<ObjectInfo> {

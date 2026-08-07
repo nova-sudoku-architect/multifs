@@ -1058,6 +1058,52 @@ async fn test_range_bytes_0_dash_triggers_full_file_download() {
     );
 }
 
+/// REGRESSION: full read-back of a MULTI-CHUNK object must be byte-identical to
+/// the original, not just the same length.
+///
+/// BUG: the DOWNLOAD branch of `stream_chunk_paged` emitted raw 64 KiB transport
+/// buffers (from `MockBackend::download_stream` and real pCloud) directly to the
+/// assembly channel, which assumes PAGE_SIZE(16 KiB)-aligned messages. On
+/// multi-chunk reads this corrupted the assembler's global byte-offset bookkeeping,
+/// truncating chunk 0 to its first 2 pages and shifting chunk 1 to byte 32768 —
+/// so the full GET returned corrupt bytes (rclone: "Failed to calculate dst hash" /
+/// "empty response payload / EOF").
+///
+/// Previous tests only asserted byte COUNT; this asserts byte IDENTITY across a
+/// 2-chunk object, which is the case that regressed.
+#[tokio::test]
+async fn test_full_read_multi_chunk_byte_identical() {
+    let (engine, _dir, _b1, _b2) = make_tracked_engine();
+    engine.create_bucket("mtchunk-bucket").await.unwrap();
+
+    // Deterministic 2-chunk payload (33 MiB > 32 MiB CHUNK_SIZE) with varied bytes
+    // so a reordering/truncation is detectable.
+    let mut data = Vec::with_capacity(33 * 1024 * 1024);
+    for i in 0..(33 * 1024 * 1024) {
+        data.push((i % 251) as u8);
+    }
+    engine.put_object("mtchunk-bucket", "payload.bin", &data).await.unwrap();
+
+    // Full read-back (no Range) → stream_chunked_file_full → range(0, size).
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, anyhow::Error>>(256);
+    engine.get_object_stream("mtchunk-bucket", "payload.bin", None, tx).await.unwrap();
+
+    let mut assembled: Vec<u8> = Vec::with_capacity(data.len());
+    let mut saw_err = false;
+    while let Some(res) = rx.recv().await {
+        match res {
+            Ok(chunk) => assembled.extend_from_slice(&chunk),
+            Err(_) => { saw_err = true; break; }
+        }
+    }
+
+    assert!(!saw_err, "stream should not error on a full multi-chunk read");
+    assert_eq!(assembled.len(), data.len(),
+        "full read of {}-byte 2-chunk object returned {} bytes", data.len(), assembled.len());
+    assert_eq!(assembled, data,
+        "full multi-chunk read-back is not byte-identical (chunk boundary corruption)");
+}
+
 /// FLAW 1: stream_chunked_file_full processes ALL chunks sequentially
 /// (original code). For a file with 3+ chunks, this means the function
 /// iterates through every chunk in a for loop with no parallelism.
