@@ -200,6 +200,23 @@ impl MetadataDb {
         // any legacy `objects` rows into them as version 1. Pure metadata
         // migration — no blob is moved, renamed, or deleted.
         if current < 2 {
+            // The pre-MVCC (v0.1.x) schema stored logical objects in `objects`
+            // and physical chunked data in `files` + `chunks`. The new schema
+            // uses `files` (object index) + `versions` (immutable versions) and
+            // stores every object as a single blob. If an old `files` table is
+            // still present (no `current_version` column), preserve it as
+            // `files_legacy` before creating the new schema.
+            if Self::table_exists(conn, "files")? {
+                let file_cols: Vec<String> = conn
+                    .prepare("PRAGMA table_info(files)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                if !file_cols.iter().any(|c| c == "current_version") {
+                    conn.execute_batch("ALTER TABLE files RENAME TO files_legacy;")?;
+                }
+            }
+
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS files (
                     bucket_name      TEXT NOT NULL,
@@ -227,6 +244,13 @@ impl MetadataDb {
                     superseded_at    INTEGER,
                     PRIMARY KEY (bucket_name, key, version)
                 );",
+            )?;
+
+            // Re-point the bucket index at the new `files` table (it may have
+            // been created on the old schema before the rename above).
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS idx_files_bucket;
+                 CREATE INDEX IF NOT EXISTS idx_files_bucket ON files(bucket_name);",
             )?;
 
             if Self::table_exists(conn, "objects")? {
