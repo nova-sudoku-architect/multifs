@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::Stream;
 
 /// File entry returned by list operations
 #[derive(Debug, Clone)]
@@ -20,10 +22,18 @@ pub trait StorageBackend: Send + Sync {
     /// Check account usage. Returns (used_bytes, total_bytes).
     async fn check_quota(&self) -> anyhow::Result<(i64, i64)>;
 
-    /// Upload a file. Returns (remote_path, file_id).
+    /// Upload a file from an in-memory buffer. Returns (remote_path, file_id).
     async fn upload(&self, remote_path: &str, data: &[u8]) -> anyhow::Result<(String, i64)>;
 
-    /// Download a file's content.
+    /// Upload a file from a streaming source, computing the SHA-256 ETag
+    /// on-the-fly. Returns (remote_path, file_id, sha256_etag, file_size).
+    async fn upload_stream(
+        &self,
+        remote_path: &str,
+        stream: Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send + Unpin>,
+    ) -> anyhow::Result<(String, i64, String, i64)>;
+
+    /// Download a file's complete content.
     async fn download(&self, remote_path: &str) -> anyhow::Result<Vec<u8>>;
 
     /// Download a file, streaming chunks through a channel.
@@ -34,7 +44,7 @@ pub trait StorageBackend: Send + Sync {
         remote_path: &str,
         range_start: Option<u64>,
         range_end: Option<u64>,
-        tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
+        tx: tokio::sync::mpsc::Sender<Result<Bytes, anyhow::Error>>,
     ) -> anyhow::Result<()>;
 
     /// Delete a file.
@@ -45,21 +55,16 @@ pub trait StorageBackend: Send + Sync {
 
     /// Server-side copy (optional). Returns the new remote path if supported.
     /// Returns `None` if the backend doesn't support server-side copy.
-    /// `source_path` is the backend's remote path to copy FROM.
-    /// Returns the destination remote path on success.
-    async fn server_side_copy(&self, _source_path: &str, _dest_path: &str) -> anyhow::Result<Option<String>> {
-        // Default: not supported
+    async fn server_side_copy(
+        &self,
+        _source_path: &str,
+        _dest_path: &str,
+    ) -> anyhow::Result<Option<String>> {
         Ok(None)
-    }
-
-    /// Get a direct download link for a file (optional).
-    /// Returns the URL or an error if not supported.
-    /// Used by the link pre-fetch optimisation in stream_chunked_file_range.
-    async fn get_download_link(&self, _remote_path: &str) -> anyhow::Result<String> {
-        anyhow::bail!("get_download_link not implemented for this backend");
     }
 
     /// Clone this backend into a boxed trait object.
     fn clone_box(&self) -> Box<dyn StorageBackend>;
 }
+
 pub mod pcloud;

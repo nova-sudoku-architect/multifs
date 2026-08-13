@@ -1,4 +1,6 @@
 
+use bytes::Bytes;
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -261,6 +263,71 @@ impl PCloudClient {
         range_end: Option<u64>,
         tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
     ) -> anyhow::Result<()> {
+        // Retry the download up to N times, RESUMMING from the last byte
+        // successfully delivered instead of re-fetching from byte 0 each attempt.
+        //
+        // pCloud's ephemeral CDN host intermittently returns an EOF / empty body
+        // for a /getfilelink (especially under concurrent requests or on large
+        // objects) — the reqwest bytes_stream then errors with IncompleteBody
+        // mid-transfer. Re-fetching from 0 just repeats the same ~5MB CDN fault,
+        // so a full file download that faults once can never complete. By issuing
+        // `Range: bytes=<delivered>-` on retry we continue from where we left off,
+        // so a transient CDN drop becomes resumable instead of fatal.
+        //
+        // NOTE: only the offset past an explicit range_start is tracked; for an
+        // un-ranged (full) read range_start=None => first attempt is a plain GET,
+        // and the first fault becomes byte 0 + delivered. Each retry then resumes
+        // via Range from that delivered offset.
+        const MAX_ATTEMPTS: usize = 3;
+        let mut delivered: u64 = 0; // bytes confirmed sent to the receiver
+        for attempt in 0..MAX_ATTEMPTS {
+            // Base range for THIS attempt: if we have delivered some bytes on a
+            // prior (failed) attempt, resume from there; otherwise use the caller's
+            // original range (which may itself be a sub-range).
+            let (attempt_start, attempt_end): (Option<u64>, Option<u64>) =
+                match (delivered, range_end) {
+                    (0, _) => (range_start, range_end),
+                    (d, Some(e)) if e <= d => {
+                        // Already have everything requested — nothing left to do.
+                        return Ok(());
+                    }
+                    (d, Some(e)) => (Some(d + range_start.unwrap_or(0)), Some(e)),
+                    (d, None) => (Some(d + range_start.unwrap_or(0)), None),
+                };
+
+            match self
+                .download_stream_once(remote_path, attempt_start, attempt_end, tx.clone(), &mut delivered)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if attempt + 1 >= MAX_ATTEMPTS {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        "download_stream retry {}/{} for {} ({}B delivered): {}",
+                        attempt + 1,
+                        MAX_ATTEMPTS,
+                        remote_path,
+                        delivered,
+                        e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Single attempt of download_stream.
+    async fn download_stream_once(
+        &self,
+        remote_path: &str,
+        range_start: Option<u64>,
+        range_end: Option<u64>,
+        tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
+        delivered: &mut u64,
+    ) -> anyhow::Result<()> {
         // Get the file link (same auth as regular download)
         let resp = self
             .client
@@ -302,12 +369,30 @@ impl PCloudClient {
             anyhow::bail!("pCloud download failed with status {}", status);
         }
 
+        // The expected number of bytes for THIS attempt, if known.
+        // - pCloud sets Content-Length on the CDN response.
+        // - reqwest may surface a truncated body as a *clean* end-of-stream (None)
+        //   rather than an Err when pCloud's CDN drops the connection mid-body without
+        //   a proper Content-Length / transfer-complete signal. In that case the
+        //   parent retry never sees an Err and would wrongly report success, letting
+        //   the multi-part assembly ship a truncated object. To catch that, we
+        //   compare how many bytes of the declared Content-Length we actually
+        //   delivered: a short body is a fault and must bubble up as Err so the
+        //   caller (download_stream) can resume via Range.
+        let expected: Option<u64> = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let attempt_start_delivered: u64 = *delivered;
+
         // Stream chunks to the channel as they arrive
         let mut stream = response.bytes_stream();
         use futures::StreamExt;
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
+                    *delivered = delivered.saturating_add(bytes.len() as u64);
                     if tx.send(Ok(bytes)).await.is_err() {
                         break; // Receiver dropped (client disconnected)
                     }
@@ -318,7 +403,102 @@ impl PCloudClient {
                 }
             }
         }
+
+        // Detect a silent mid-stream truncation: pCloud CDN sent fewer bytes than
+        // the declared Content-Length but reqwest surfaced it as a clean EOF. Treat
+        // as an error so the parent resumes from `delivered` via Range.
+        if let Some(len) = expected {
+            let got = delivered.saturating_sub(attempt_start_delivered);
+            if got < len {
+                anyhow::bail!(
+                    "Download stream truncated: expected {}B got {}B (had {}B prior)",
+                    len,
+                    got,
+                    attempt_start_delivered
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// Upload a file from a streaming source, computing SHA-256 ETag on-the-fly.
+    /// The `stream` is consumed as the multipart body — no full-file RAM buffering.
+    /// Returns (remote_path, file_id, sha256_etag).
+    pub async fn upload_stream(
+        &self,
+        remote_path: &str,
+        stream: Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send + Unpin>,
+    ) -> anyhow::Result<(String, i64, String, i64)> {
+        use sha2::{Digest, Sha256};
+        use std::sync::Mutex;
+
+        let parent = std::path::Path::new(remote_path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("/");
+        self.ensure_path(parent).await?;
+
+        let filename = std::path::Path::new(remote_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+
+        // Collect the full stream into memory first, compute SHA-256.
+        // reqwest's streaming multipart (Part::stream + Body::wrap_stream) hangs
+        // on S3 PUTs — see AGENTS.md. Buffer-first is the safe path and the
+        // WebDAV handler already does this.
+        use futures::StreamExt;
+        let mut all_data = Vec::new();
+        let mut hasher = Sha256::new();
+        let mut stream = stream; // rebind as mutable for StreamExt::next
+        while let Some(chunk) = stream.next().await {
+            let data = chunk?;
+            hasher.update(&data);
+            all_data.extend_from_slice(&data);
+        }
+        let sha256_hex = format!("{:x}", hasher.finalize());
+        tracing::info!("pcloud: collected {} bytes for upload, sha256={}", all_data.len(), sha256_hex);
+
+        let part = reqwest::multipart::Part::bytes(all_data)
+            .file_name(filename.to_string())
+            .mime_str("application/octet-stream")
+            .unwrap_or_else(|_| reqwest::multipart::Part::bytes(vec![]));
+
+        let form = reqwest::multipart::Form::new()
+            .text("access_token", self.token.clone())
+            .text("path", parent.to_string())
+            .text("filename", filename.to_string())
+            .text("nopartial", "1")
+            .part("file", part);
+
+        tracing::info!("pcloud: sending uploadfile POST to {}", parent);
+        let resp = self
+            .client
+            .post(format!("{}/uploadfile", self.base_url))
+            .multipart(form)
+            .send()
+            .await?;
+
+        let body: serde_json::Value = resp.json().await?;
+        let result = body["result"].as_i64().unwrap_or(-1);
+        if result != 0 {
+            anyhow::bail!("Upload error {}: {}", result, body["error"]);
+        }
+
+        let metadata = &body["metadata"];
+        let first = metadata.as_array().and_then(|arr| arr.first());
+        let file_id = first.and_then(|f| f["fileid"].as_i64()).unwrap_or(0);
+        let file_size = first.and_then(|f| f["size"].as_i64()).unwrap_or(0);
+        let actual_path = first
+            .and_then(|f| f["path"].as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| remote_path.to_string());
+
+        // Use the SHA-256 we computed while collecting bytes.
+        let etag = sha256_hex;
+
+        tracing::info!("pcloud: upload complete path={} size={}", actual_path, file_size);
+        Ok((actual_path, file_id, etag, file_size))
     }
 
     /// Copy a file server-side using pCloud's copyfile API

@@ -10,11 +10,6 @@ use crate::config::{Config, PlacementStrategy};
 use super::backends::StorageBackend;
 use super::metadata::{MetadataDb, BucketRecord};
 use rusqlite::params;
-use super::chunk_manager;
-use super::page_cache::{self, PageCache};
-use super::download_tracker::DownloadTracker;
-
-pub(crate) const CHUNK_SIZE: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ObjectInfo {
@@ -25,6 +20,7 @@ pub struct ObjectInfo {
     pub content_type: Option<String>,
     pub account_email: String,
     pub remote_path: String,
+    pub version: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -43,8 +39,18 @@ pub struct BackendHandle {
 }
 
 impl BackendHandle {
-    pub fn new(backend: Box<dyn StorageBackend>, mount_prefix: String, label: String, quota_gb: u64) -> Self {
-        Self { backend, mount_prefix, label, quota_gb }
+    pub fn new(
+        backend: Box<dyn StorageBackend>,
+        mount_prefix: String,
+        label: String,
+        quota_gb: u64,
+    ) -> Self {
+        Self {
+            backend,
+            mount_prefix,
+            label,
+            quota_gb,
+        }
     }
 }
 
@@ -55,8 +61,6 @@ pub struct StorageEngine {
     placement: PlacementStrategy,
     next_backend_idx: Arc<AtomicUsize>,
     cached_quotas: Arc<Mutex<CachedQuotas>>,
-    page_cache: Arc<PageCache>,
-    download_tracker: Arc<DownloadTracker>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,29 +69,30 @@ struct CachedQuota {
     total: i64,
 }
 
-/// Quota cache with a time-based refresh window so we don't hit pCloud's
-/// /userinfo on every write. Holds per-backend fill ratios plus the last
-/// refresh timestamp (monotonic seconds).
 #[derive(Debug, Clone)]
 struct CachedQuotas {
     per_backend: Vec<CachedQuota>,
     last_refresh_ms: u128,
 }
 
-/// Minimum interval (ms) between full quota refreshes. Within this window
-/// `refresh_quotas()` is a no-op on pCloud. Makes huge-file copies avoid
-/// N_accounts redundant /userinfo calls per part/chunk.
 const QUOTA_REFRESH_MS: u128 = 60_000;
 
+/// How long a superseded version stays reclaimable before vacuum deletes it
+/// (protects in-flight readers).
+const GRACE_PERIOD_MS: i64 = 10 * 60 * 1000;
+/// How long an abandoned (pending) upload is kept before vacuum sweeps it.
+const PENDING_TIMEOUT_MS: i64 = 60 * 60 * 1000;
+
 impl StorageEngine {
-    /// Construct StorageEngine from a Config (convenience wrapper).
-    /// Backend construction logic lives here; callers wanting DI should use `from_backends`.
     pub fn new(cfg: &Config, meta: MetadataDb) -> anyhow::Result<Self> {
         let handles = Self::build_backends(cfg)?;
-        Ok(Self::from_backends_with_strategy(handles, meta, cfg.storage.placement_strategy))
+        Ok(Self::from_backends_with_strategy(
+            handles,
+            meta,
+            cfg.storage.placement_strategy,
+        ))
     }
 
-    /// Build backend handles from config (extracted for reuse).
     fn build_backends(cfg: &Config) -> anyhow::Result<Vec<BackendHandle>> {
         let mut handles = Vec::new();
         for acct in &cfg.storage.accounts {
@@ -108,26 +113,110 @@ impl StorageEngine {
         Ok(handles)
     }
 
-    /// Construct a StorageEngine from pre-built backends (for testing/DI)
     pub fn from_backends(handles: Vec<BackendHandle>, meta: MetadataDb) -> Self {
         Self::from_backends_with_strategy(handles, meta, PlacementStrategy::Utilization)
     }
 
-    /// Construct with explicit placement strategy (for testing/DI)
     pub fn from_backends_with_strategy(
-        handles: Vec<BackendHandle>, meta: MetadataDb, placement: PlacementStrategy,
+        handles: Vec<BackendHandle>,
+        meta: MetadataDb,
+        placement: PlacementStrategy,
     ) -> Self {
-        let per_backend = handles.iter().map(|_| CachedQuota { fill_ratio: 0.0, total: 1 }).collect();
+        let per_backend = handles
+            .iter()
+            .map(|_| CachedQuota {
+                fill_ratio: 0.0,
+                total: 1,
+            })
+            .collect();
         Self {
             meta,
             placement,
             backends: Arc::new(handles),
             next_backend_idx: Arc::new(AtomicUsize::new(0)),
-            cached_quotas: Arc::new(Mutex::new(CachedQuotas { per_backend, last_refresh_ms: 0 })),
-            page_cache: Arc::new(PageCache::new("/var/cache/multifs/chunks", 10)),
-            download_tracker: Arc::new(DownloadTracker::new()),
+            cached_quotas: Arc::new(Mutex::new(CachedQuotas {
+                per_backend,
+                last_refresh_ms: 0,
+            })),
         }
     }
+
+    // -----------------------------------------------------------------
+    //  Backend selection
+    // -----------------------------------------------------------------
+
+    async fn pick_backend(&self) -> anyhow::Result<usize> {
+        let backends = &*self.backends;
+        if backends.is_empty() {
+            anyhow::bail!("No storage backends configured");
+        }
+        match self.placement {
+            PlacementStrategy::RoundRobin => {
+                let idx = self.next_backend_idx.fetch_add(1, Ordering::Relaxed) % backends.len();
+                Ok(idx)
+            }
+            PlacementStrategy::Utilization => {
+                let cached = self.cached_quotas.lock().await;
+                let (best_idx, _) = cached
+                    .per_backend
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        a.fill_ratio
+                            .partial_cmp(&b.fill_ratio)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("No backends available"))?;
+                Ok(best_idx)
+            }
+        }
+    }
+
+    pub async fn refresh_quotas(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        {
+            let cached = self.cached_quotas.lock().await;
+            if now.saturating_sub(cached.last_refresh_ms) < QUOTA_REFRESH_MS {
+                return;
+            }
+        }
+
+        let backends = &*self.backends;
+        let mut fresh: Vec<CachedQuota> = Vec::with_capacity(backends.len());
+        for handle in backends.iter() {
+            let mut c = CachedQuota {
+                fill_ratio: 0.0,
+                total: 1,
+            };
+            if let Ok((used, total)) = handle.backend.check_quota().await {
+                c.total = total;
+                c.fill_ratio = if total > 0 {
+                    used as f64 / total as f64
+                } else {
+                    0.0
+                };
+            }
+            fresh.push(c);
+        }
+
+        let mut cached = self.cached_quotas.lock().await;
+        cached.per_backend = fresh;
+        cached.last_refresh_ms = now;
+    }
+
+    fn find_backend(&self, label: &str) -> anyhow::Result<&BackendHandle> {
+        self.backends
+            .iter()
+            .find(|b| b.label == label)
+            .ok_or_else(|| anyhow::anyhow!("Backend not found: {}", label))
+    }
+
+    // -----------------------------------------------------------------
+    //  Unified put — in-memory buffer (small files / CLI / tests)
+    // -----------------------------------------------------------------
 
     pub async fn put_object(
         &self,
@@ -148,76 +237,7 @@ impl StorageEngine {
         self.ensure_bucket(bucket)?;
         let etag = hex::encode(Sha256::digest(data));
         let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-        if data.len() <= CHUNK_SIZE {
-            return self.put_whole_file(bucket, key, data, content_type, &etag, &now).await;
-        }
-        self.put_chunked_file(bucket, key, data, content_type, &etag, &now).await
-    }
 
-    /// Pick a backend according to the configured strategy.
-    async fn pick_backend(&self) -> anyhow::Result<usize> {
-        let backends = &*self.backends;
-        if backends.is_empty() {
-            anyhow::bail!("No storage backends configured");
-        }
-        match self.placement {
-            PlacementStrategy::RoundRobin => {
-                let idx = self.next_backend_idx.fetch_add(1, Ordering::Relaxed) % backends.len();
-                Ok(idx)
-            }
-            PlacementStrategy::Utilization => {
-                let cached = self.cached_quotas.lock().await;
-                let (best_idx, _) = cached.per_backend.iter().enumerate()
-                    .min_by(|(_, a), (_, b)| a.fill_ratio.partial_cmp(&b.fill_ratio).unwrap_or(std::cmp::Ordering::Equal))
-                    .ok_or_else(|| anyhow::anyhow!("No backends available"))?;
-                Ok(best_idx)
-            }
-        }
-    }
-
-    /// Refresh the fill-ratio cache by querying each backend's quota.
-    /// TTL-gated: within `QUOTA_REFRESH_MS` of the last refresh this is a no-op
-    /// (no pCloud /userinfo calls). Quotas barely change during a copy, so this
-    /// avoids N_accounts redundant network round-trips per file/part/chunk.
-    pub async fn refresh_quotas(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        {
-            let cached = self.cached_quotas.lock().await;
-            if now.saturating_sub(cached.last_refresh_ms) < QUOTA_REFRESH_MS {
-                return; // fresh enough — no pCloud calls
-            }
-        }
-
-        let backends = &*self.backends;
-        let mut fresh: Vec<CachedQuota> = Vec::with_capacity(backends.len());
-        for handle in backends.iter() {
-            let mut c = CachedQuota { fill_ratio: 0.0, total: 1 };
-            if let Ok((used, total)) = handle.backend.check_quota().await {
-                c.total = total;
-                c.fill_ratio = if total > 0 { used as f64 / total as f64 } else { 0.0 };
-            }
-            fresh.push(c);
-        }
-
-        // Publish the freshly-fetched fill ratios + timestamp. Lock is only held
-        // for the (non-await) swap, never across network I/O.
-        let mut cached = self.cached_quotas.lock().await;
-        cached.per_backend = fresh;
-        cached.last_refresh_ms = now;
-    }
-
-    pub async fn put_whole_file(
-        &self,
-        bucket: &str,
-        key: &str,
-        data: &[u8],
-        content_type: Option<&str>,
-        etag: &str,
-        now: &str,
-    ) -> anyhow::Result<ObjectInfo> {
         let backends = &*self.backends;
         if backends.is_empty() {
             anyhow::bail!("No storage backends configured");
@@ -227,130 +247,44 @@ impl StorageEngine {
         }
         let idx = self.pick_backend().await?;
         let backend = &backends[idx];
-        let remote_path = format!("{}/{}/{}", backend.mount_prefix, bucket, key);
+
+        // MVCC: reserve a fresh version + blob path; never touch the old blob.
+        let (version, remote_path) = self
+            .meta
+            .reserve_version(bucket, key, &backend.label, &backend.mount_prefix)?;
+
         let (remote_path_actual, _) = backend.backend.upload(&remote_path, data).await?;
-        self.meta.put_object(
-            bucket, key, data.len() as i64, etag, now,
-            &backend.label, &remote_path_actual, content_type,
+
+        self.meta.commit_version(
+            bucket,
+            key,
+            version,
+            data.len() as i64,
+            &etag,
+            &now,
+            content_type,
+            &remote_path_actual,
         )?;
+
         Ok(ObjectInfo {
             key: key.to_string(),
             size: data.len() as i64,
-            etag: etag.to_string(),
-            last_modified: now.to_string(),
+            etag,
+            last_modified: now,
             content_type: content_type.map(|s| s.to_string()),
             account_email: backend.label.clone(),
             remote_path: remote_path_actual,
+            version,
         })
     }
 
-    pub async fn put_chunked_file(
-        &self,
-        bucket: &str,
-        key: &str,
-        data: &[u8],
-        content_type: Option<&str>,
-        etag: &str,
-        now: &str,
-    ) -> anyhow::Result<ObjectInfo> {
-        let backends = &*self.backends;
-        if backends.is_empty() {
-            anyhow::bail!("No storage backends configured");
-        }
+    // -----------------------------------------------------------------
+    //  Unified streaming put — S3 / WebDAV write path
+    // -----------------------------------------------------------------
 
-        let data_chunks = chunk_manager::split(data, CHUNK_SIZE);
-
-        #[derive(Debug)]
-        struct ChunkUploadResult {
-            global_index: u32,
-            remote_path: String,
-            checksum: String,
-            size: i64,
-            bucket: String,
-            key: String,
-            account: String,
-        }
-
-        if self.placement == PlacementStrategy::Utilization {
-            let _ = self.refresh_quotas().await;
-        }
-
-        let mut results = Vec::new();
-        for (local_idx, chunk) in data_chunks.iter().enumerate() {
-            let global_idx = local_idx as u32;
-            let bi = self.pick_backend().await?;
-            let chunk_path = format!("{}/{}/{}.ck.{}", backends[bi].mount_prefix, bucket, key, global_idx);
-
-            match backends[bi].backend.upload(&chunk_path, &chunk.data).await {
-                Ok((actual_path, _)) => {
-                    results.push(ChunkUploadResult {
-                        global_index: global_idx,
-                        remote_path: actual_path,
-                        checksum: chunk.checksum.clone(),
-                        size: chunk.data.len() as i64,
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                        account: backends[bi].label.clone(),
-                    });
-                    // Update cache in-memory to reflect new chunk usage immediately
-                    let mut cached = self.cached_quotas.lock().await;
-                    if bi < cached.per_backend.len() && cached.per_backend[bi].total > 0 {
-                        let used = (cached.per_backend[bi].fill_ratio * cached.per_backend[bi].total as f64) + chunk.data.len() as f64;
-                        cached.per_backend[bi].fill_ratio = used / cached.per_backend[bi].total as f64;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to upload chunk {}: {}", global_idx, e);
-                }
-            }
-        }
-
-        self.meta.with_conn(|conn| -> anyhow::Result<()> {
-            conn.execute(
-                "INSERT OR REPLACE INTO files (bucket_name, key, size, etag, last_modified, content_type, storage_type)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'chunked')",
-                rusqlite::params![bucket, key, data.len() as i64, etag, now, content_type],
-            )?;
-
-            for r in &results {
-                conn.execute(
-                    "INSERT OR REPLACE INTO chunks (bucket_name, key, chunk_index, size, checksum, is_parity, account_email, remote_path)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
-                    rusqlite::params![r.bucket, r.key, r.global_index as i32, r.size, r.checksum, r.account, r.remote_path],
-                )?;
-            }
-            Ok(())
-        })?;
-
-        Ok(ObjectInfo {
-            key: key.to_string(),
-            size: data.len() as i64,
-            etag: etag.to_string(),
-            last_modified: now.to_string(),
-            content_type: content_type.map(|s| s.to_string()),
-            account_email: backends[0].label.clone(),
-            remote_path: format!("chunked://{}/{}", bucket, key),
-        })
-    }
-
-    /// Register a new in-progress multipart upload on-disk (wrapper around metadata).
-    pub async fn create_multipart_upload(
-        &self,
-        bucket: &str,
-        key: &str,
-        upload_id: &str,
-        content_type: Option<&str>,
-    ) -> anyhow::Result<()> {
-        self.meta.create_multipart(upload_id, bucket, key, content_type)
-    }
-
-    /// Stream an object write without buffering the whole body.
-    ///
-    /// Reads `S` (a stream of `bytes::Bytes`) and spools it into 32MiB chunks,
-    /// uploading each chunk to pCloud as it fills. This is the S3-parity path
-    /// for huge files: rclone streams the object/part body, we persist chunk by
-    /// chunk instead of holding the entire object in RAM. Returns the object
-    /// metadata (ETag computed over the full SHA-256 of the streamed bytes).
+    /// Stream an object write without full-file RAM buffering.
+    /// Picks one pCloud account and streams the body directly to it,
+    /// computing the SHA-256 ETag on-the-fly via the backend's `upload_stream`.
     pub async fn put_object_stream<S>(
         &self,
         bucket: &str,
@@ -359,11 +293,9 @@ impl StorageEngine {
         stream: S,
     ) -> anyhow::Result<ObjectInfo>
     where
-        S: futures::Stream<Item = Result<bytes::Bytes, anyhow::Error>> + Send + 'static,
+        S: futures::Stream<Item = Result<bytes::Bytes, anyhow::Error>> + Send + Unpin + 'static,
     {
-        use futures::StreamExt;
-        use sha2::{Digest as _, Sha256};
-
+        tracing::info!("engine::put_object_stream bucket={bucket} key={key} content_type={content_type:?}");
         self.ensure_bucket(bucket)?;
         let backends = &*self.backends;
         if backends.is_empty() {
@@ -371,392 +303,137 @@ impl StorageEngine {
         }
 
         if self.placement == PlacementStrategy::Utilization {
+            tracing::info!("engine: calling refresh_quotas");
             let _ = self.refresh_quotas().await;
+            tracing::info!("engine: refresh_quotas done");
         }
+        tracing::info!("engine: picking backend");
+        let idx = self.pick_backend().await?;
+        let backend = &backends[idx];
+        tracing::info!("engine: picked backend={} prefix={}", backend.label, backend.mount_prefix);
 
-        #[derive(Debug)]
-        struct ChunkUploadResult {
-            global_index: u32,
-            remote_path: String,
-            checksum: String,
-            size: i64,
-            bucket: String,
-            key: String,
-            account: String,
-        }
+        // MVCC: reserve a fresh version + blob path; never touch the old blob.
+        let (version, remote_path) = self
+            .meta
+            .reserve_version(bucket, key, &backend.label, &backend.mount_prefix)?;
 
-        let mut results = Vec::new();
-        let mut hasher = Sha256::new();
-        let mut buf: Vec<u8> = Vec::with_capacity(CHUNK_SIZE);
-        let mut total: i64 = 0;
-        let mut global_idx: u32 = 0;
+        tracing::info!("engine: calling upload_stream path={}", remote_path);
+        let (actual_path, _file_id, etag, file_size) = backend
+            .backend
+            .upload_stream(&remote_path, Box::new(stream))
+            .await?;
 
-        let mut pin = Box::pin(stream);
-        while let Some(item) = pin.next().await {
-            let chunk = item?;
-            hasher.update(&chunk);
-            total += chunk.len() as i64;
-            buf.extend_from_slice(&chunk);
-
-            // Upload once we have a full 32MiB chunk (or on end-of-stream below).
-            if buf.len() >= CHUNK_SIZE {
-                let bi = self.pick_backend().await?;
-                let data = std::mem::take(&mut buf);
-                let checksum = hex::encode(Sha256::digest(&data));
-                let chunk_path = format!("{}/{}/{}.ck.{}", backends[bi].mount_prefix, bucket, key, global_idx);
-                match backends[bi].backend.upload(&chunk_path, &data).await {
-                    Ok((actual_path, _)) => {
-                        results.push(ChunkUploadResult {
-                            global_index: global_idx,
-                            remote_path: actual_path,
-                            checksum,
-                            size: data.len() as i64,
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
-                            account: backends[bi].label.clone(),
-                        });
-                        let mut cached = self.cached_quotas.lock().await;
-                        if bi < cached.per_backend.len() && cached.per_backend[bi].total > 0 {
-                            let used = (cached.per_backend[bi].fill_ratio * cached.per_backend[bi].total as f64) + data.len() as f64;
-                            cached.per_backend[bi].fill_ratio = used / cached.per_backend[bi].total as f64;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("stream upload chunk {} failed for {}/{}: {}", global_idx, bucket, key, e);
-                    }
-                }
-                global_idx += 1;
-            }
-        }
-
-        // Flush any trailing partial chunk.
-        if !buf.is_empty() {
-            let bi = self.pick_backend().await?;
-            let data = std::mem::take(&mut buf);
-            let checksum = hex::encode(Sha256::digest(&data));
-            let chunk_path = format!("{}/{}/{}.ck.{}", backends[bi].mount_prefix, bucket, key, global_idx);
-            match backends[bi].backend.upload(&chunk_path, &data).await {
-                Ok((actual_path, _)) => {
-                    results.push(ChunkUploadResult {
-                        global_index: global_idx,
-                        remote_path: actual_path,
-                        checksum,
-                        size: data.len() as i64,
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                        account: backends[bi].label.clone(),
-                    });
-                }
-                Err(e) => {
-                    tracing::error!("stream upload final chunk {} failed for {}/{}: {}", global_idx, bucket, key, e);
-                }
-            }
-        }
-
-        let etag = hex::encode(hasher.finalize());
         let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
-        self.meta.with_conn(|conn| -> anyhow::Result<()> {
-            conn.execute(
-                "INSERT OR REPLACE INTO files (bucket_name, key, size, etag, last_modified, content_type, storage_type)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'chunked')",
-                rusqlite::params![bucket, key, total, etag, now, content_type],
-            )?;
-            for r in &results {
-                conn.execute(
-                    "INSERT OR REPLACE INTO chunks (bucket_name, key, chunk_index, size, checksum, is_parity, account_email, remote_path)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
-                    rusqlite::params![r.bucket, r.key, r.global_index as i32, r.size, r.checksum, r.account, r.remote_path],
-                )?;
-            }
-            Ok(())
-        })?;
+        // Use the actual file size reported by the backend (pCloud includes it
+        // in the upload response metadata).
+        self.meta.commit_version(
+            bucket,
+            key,
+            version,
+            file_size,
+            &etag,
+            &now,
+            content_type,
+            &actual_path,
+        )?;
 
         Ok(ObjectInfo {
             key: key.to_string(),
-            size: total,
+            size: file_size,
             etag,
             last_modified: now,
             content_type: content_type.map(|s| s.to_string()),
-            account_email: backends[0].label.clone(),
-            remote_path: format!("chunked://{}/{}", bucket, key),
+            account_email: backend.label.clone(),
+            remote_path: actual_path,
+            version,
         })
     }
 
-    /// Look up an in-progress multipart upload by id. Returns (bucket, key, content_type).
-    pub async fn get_multipart_upload(&self, upload_id: &str) -> anyhow::Result<Option<(String, String, Option<String>)>> {
-        self.meta.get_multipart(upload_id)
-    }
-
-    /// List the parts recorded for a multipart upload, ordered by part number.
-    /// Returns (part_number, size, part_etag, first_chunk, chunk_count).
-    pub async fn list_multipart_parts_public(&self, upload_id: &str) -> anyhow::Result<Vec<(u64, i64, String, i32, i32)>> {
-        self.meta.list_multipart_parts(upload_id)
-    }
-
-    /// Count how many chunk rows are staged for a part's staging key.
-    pub async fn count_part_chunks(&self, bucket: &str, staging_key: &str) -> anyhow::Result<i32> {
-        let rows = self.meta.list_chunks_for_key(bucket, staging_key)?;
-        Ok(rows.len() as i32)
-    }
-
-    /// Record per-part metadata so Complete can stitch staged chunks in order.
-    pub async fn store_part_meta(
-        &self,
-        upload_id: &str,
-        part_number: u64,
-        size: i64,
-        part_etag: &str,
-        chunk_count: i32,
-    ) -> anyhow::Result<()> {
-        self.meta.store_multipart_part(upload_id, part_number, size, part_etag, 0, chunk_count)
-    }
-
-    /// Stream a single UploadPart's bytes to storage as 32 MiB chunks.
-    ///
-    /// The chunks are staged under a per-part unique key so concurrent parts for
-    /// the same object don't collide in the `chunks` table (whose PK is
-    /// (bucket, key, chunk_index)). Only metadata is recorded on-disk; the part
-    /// bytes are NOT held in RAM and NOT re-uploaded at Complete time.
-    ///
-    /// Returns (staging_key, total_part_size, part_md5).
-    pub async fn upload_part_as_chunks(
-        &self,
-        bucket: &str,
-        upload_id: &str,
-        part_number: u64,
-        data: &[u8],
-    ) -> anyhow::Result<(String, i64, String)> {
-        let backends = &*self.backends;
-        if backends.is_empty() {
-            anyhow::bail!("No storage backends configured");
-        }
-        // Staging key unique per upload+part, so chunk records never collide.
-        let staging_key = format!("__multipart__/{}/{}", upload_id, part_number);
-        let data_chunks = chunk_manager::split(data, CHUNK_SIZE);
-
-        if self.placement == PlacementStrategy::Utilization {
-            let _ = self.refresh_quotas().await;
-        }
-
-        let mut results = Vec::new();
-        for (local_idx, chunk) in data_chunks.iter().enumerate() {
-            let global_idx = local_idx as u32;
-            let bi = self.pick_backend().await?;
-            let chunk_path = format!(
-                "{}/{}/{}.mp.{}",
-                backends[bi].mount_prefix, bucket, staging_key, global_idx
-            );
-            match backends[bi].backend.upload(&chunk_path, &chunk.data).await {
-                Ok((actual_path, _)) => {
-                    results.push((global_idx, actual_path, chunk.checksum.clone(), chunk.data.len() as i64, backends[bi].label.clone()));
-                    let mut cached = self.cached_quotas.lock().await;
-                    if bi < cached.per_backend.len() && cached.per_backend[bi].total > 0 {
-                        let used = (cached.per_backend[bi].fill_ratio * cached.per_backend[bi].total as f64) + chunk.data.len() as f64;
-                        cached.per_backend[bi].fill_ratio = used / cached.per_backend[bi].total as f64;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "multipart part {} chunk {} upload failed for {}/{}: {}",
-                        part_number, global_idx, bucket, staging_key, e
-                    );
-                }
-            }
-        }
-
-        // Record staged chunk metadata under the staging key.
-        self.meta.with_conn(|conn| -> anyhow::Result<()> {
-            for (idx, remote_path, checksum, size, account) in &results {
-                conn.execute(
-                    "INSERT OR REPLACE INTO chunks (bucket_name, key, chunk_index, size, checksum, is_parity, account_email, remote_path)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
-                    rusqlite::params![bucket, staging_key, *idx as i32, *size, checksum, account, remote_path],
-                )?;
-            }
-            Ok(())
-        })?;
-
-        let part_md5 = hex::encode(Md5::digest(data));
-        Ok((staging_key, data.len() as i64, part_md5))
-    }
-
-    /// Stitch a completed multipart upload into a final object.
-    ///
-    /// Reads the ordered part records, maps each part's staged chunks to a
-    /// contiguous global chunk range under the final key, writes the `files`
-    /// row + `chunks` rows, and returns the S3 multipart ETag
-    /// (MD5 of the concatenation of each part's binary MD5).
-    pub async fn stitch_multipart(
-        &self,
-        bucket: &str,
-        upload_id: &str,
-        content_type: Option<&str>,
-    ) -> anyhow::Result<String> {
-        let parts = self.meta.list_multipart_parts(upload_id)?;
-        if parts.is_empty() {
-            anyhow::bail!("No parts recorded for multipart upload {}", upload_id);
-        }
-
-        // Resolve the real object key from the upload record.
-        let (_, real_key, ct) = self.meta.get_multipart(upload_id)?
-            .ok_or_else(|| anyhow::anyhow!("Multipart upload {} not found", upload_id))?;
-        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-        let total_size: i64 = parts.iter().map(|(_, size, _, _, _)| size).sum();
-
-        // S3 multipart ETag: MD5 over the concat of each part's binary MD5.
-        let mut md5_concat = Vec::new();
-        for (_, _, part_etag, _, _) in &parts {
-            let bin = hex::decode(part_etag)?;
-            md5_concat.extend_from_slice(&bin);
-        }
-        let etag = hex::encode(Md5::digest(&md5_concat));
-
-        // Clear stale chunks under the real key, write files row.
-        self.meta.with_conn(|conn| -> anyhow::Result<()> {
-            conn.execute(
-                "DELETE FROM chunks WHERE bucket_name = ?1 AND key = ?2",
-                rusqlite::params![bucket, real_key],
-            )?;
-            conn.execute(
-                "INSERT OR REPLACE INTO files (bucket_name, key, size, etag, last_modified, content_type, storage_type)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'chunked')",
-                rusqlite::params![bucket, real_key, total_size, etag, now, content_type.as_deref().or(ct.as_deref())],
-            )?;
-            Ok(())
-        })?;
-
-        // Re-stitch: map each part's staged chunks into a global sequential
-        // chunk_index under the real key.
-        let mut global_idx: i32 = 0;
-        for (pn, _, _, _, _) in &parts {
-            let staging_key = format!("__multipart__/{}/{}", upload_id, pn);
-            let staged = self.meta.list_chunks_for_key(bucket, &staging_key)?;
-            for (_, size, checksum, account, remote_path) in &staged {
-                self.meta.with_conn(|conn| -> anyhow::Result<()> {
-                    conn.execute(
-                        "INSERT OR REPLACE INTO chunks (bucket_name, key, chunk_index, size, checksum, is_parity, account_email, remote_path)
-                         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
-                        rusqlite::params![bucket, real_key, global_idx, size, checksum, account, remote_path],
-                    )?;
-                    Ok(())
-                })?;
-                global_idx += 1;
-            }
-        }
-
-        // Clean up staged chunk rows + upload record.
-        for (pn, _, _, _, _) in &parts {
-            let staging_key = format!("__multipart__/{}/{}", upload_id, pn);
-            self.meta.with_conn(|conn| -> anyhow::Result<()> {
-                conn.execute(
-                    "DELETE FROM chunks WHERE bucket_name = ?1 AND key = ?2",
-                    rusqlite::params![bucket, staging_key],
-                )?;
-                Ok(())
-            })?;
-        }
-        self.meta.delete_multipart(upload_id)?;
-
-        Ok(etag)
-    }
+    // -----------------------------------------------------------------
+    //  Unified get — non-streaming (collects into Vec)
+    // -----------------------------------------------------------------
 
     pub async fn get_object(&self, bucket: &str, key: &str) -> anyhow::Result<Vec<u8>> {
-        let storage_type: Option<String> = self.meta.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT storage_type FROM files WHERE bucket_name = ?1 AND key = ?2")?;
-            let mut rows = stmt.query(rusqlite::params![bucket, key])?;
-            if let Some(row) = rows.next()? {
-                Ok(Some(row.get::<_, String>(0)?))
-            } else {
-                Ok(None)
-            }
-        })?;
+        let obj = self
+            .meta
+            .get_object(bucket, key)?
+            .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
 
-        match storage_type.as_deref() {
-            Some("chunked") => self.get_chunked_file(bucket, key).await,
-            _ => {
-                let obj = self.meta.get_object(bucket, key)?
-                    .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
-                let backend = self.find_backend(&obj.account_email)?;
-                backend.backend.download(&obj.remote_path).await
-            }
-        }
-    }
-
-    async fn get_chunked_file(&self, bucket: &str, key: &str) -> anyhow::Result<Vec<u8>> {
-        let backends = &*self.backends;
-
-        #[derive(Debug)]
-        struct ChunkInfo {
-            index: i32,
-            _size: i64,
-            checksum: String,
-            account_email: String,
-            remote_path: String,
+        // Detect multipart composite and assemble from persisted parts.
+        if let Some(upload_id) = Self::multipart_upload_id(&obj.remote_path) {
+            return self.get_multipart_object(bucket, key, &upload_id).await;
         }
 
-        let chunks_info: Vec<ChunkInfo> = self.meta.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT chunk_index, size, checksum, account_email, remote_path
-                 FROM chunks WHERE bucket_name = ?1 AND key = ?2 ORDER BY chunk_index"
-            )?;
-            let rows = stmt.query_map(rusqlite::params![bucket, key], |row| {
-                Ok(ChunkInfo {
-                    index: row.get(0)?,
-                    _size: row.get(1)?,
-                    checksum: row.get(2)?,
-                    account_email: row.get(3)?,
-                    remote_path: row.get(4)?,
-                })
-            })?;
-            let mut infos = Vec::new();
-            for row in rows { infos.push(row?); }
-            Ok(infos)
-        })?;
+        let backend = self.find_backend(&obj.account_email)?;
+        let result = backend.backend.download(&obj.remote_path).await?;
 
-        if chunks_info.is_empty() {
-            anyhow::bail!("No chunks found for chunked file: {}/{}", bucket, key);
+        // Verify integrity if size > 0
+        if obj.size > 0 && result.len() as i64 != obj.size {
+            tracing::warn!(
+                "Size mismatch for {}/{}: expected {}, got {}",
+                bucket, key, obj.size, result.len()
+            );
         }
 
-        // Get original file size for truncation
-        let original_size: i64 = self.meta.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT size FROM files WHERE bucket_name = ?1 AND key = ?2")?;
-            let mut rows = stmt.query(rusqlite::params![bucket, key])?;
-            if let Some(row) = rows.next()? {
-                Ok(row.get::<_, i64>(0)?)
-            } else {
-                Ok(0i64)
-            }
-        })?;
-
-        if original_size == 0 {
-            anyhow::bail!("File size not found in metadata for {}/{}", bucket, key);
-        }
-
-        let mut result = Vec::with_capacity(original_size as usize);
-        for ci in &chunks_info {
-            if let Some(backend) = backends.iter().find(|b| b.label == ci.account_email) {
-                let owned_path = if ci.remote_path.is_empty() {
-                    format!("{}/{}/{}.ck.{}", backend.mount_prefix, bucket, key, ci.index)
-                } else {
-                    ci.remote_path.clone()
-                };
-
-                match backend.backend.download(&owned_path).await {
-                    Ok(data) => {
-                        result.extend_from_slice(&data);
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to download chunk {} of {}/{}: {}", ci.index, bucket, key, e);
-                        anyhow::bail!("Failed to download chunk {}: {}", ci.index, e);
-                    }
-                }
-            }
-        }
-        result.truncate(original_size as usize);
         Ok(result)
     }
 
+    /// Assemble a multipart composite object by downloading its persisted parts
+    /// in order and concatenating them into a single buffer (non-streaming).
+    async fn get_multipart_object(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        upload_id: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let parts = self.meta.list_multipart_parts(upload_id)?;
+        if parts.is_empty() {
+            anyhow::bail!("Multipart object {} has no persisted parts", upload_id);
+        }
+        let mut out = Vec::new();
+        for (_pn, _size, _etag, account, path) in &parts {
+            let backend = self.find_backend(account)?;
+            let data = backend.backend.download(path).await?;
+            out.extend_from_slice(&data);
+        }
+        Ok(out)
+    }
+
+    // -----------------------------------------------------------------
+    //  Unified streaming get — Range passthrough to pCloud CDN
+    // -----------------------------------------------------------------
+
+    /// Stream an object's bytes, optionally constrained by a byte range.
+    /// The range is passed directly to the pCloud CDN (via `getfilelink` +
+    /// `Range` header) — no chunk assembly, no page cache coordination.
+    /// Parse a multipart upload_id from a remote_path that carries the staged
+    /// multipart marker `__mp__/multipart-<upload_id>/` (or `.../<upload_id>`).
+    /// Returns Some(upload_id) if the path looks like a multipart composite.
+    fn multipart_upload_id(remote_path: &str) -> Option<String> {
+        // Staged paths look like: /multifs/<acct>/<bucket>/__mp__/multipart-<id>/N
+        // after complete we store the upload dir: /multifs/<acct>/<bucket>/__mp__/multipart-<id>
+        let normalized = remote_path.trim_end_matches('/');
+        let last = normalized.rsplit('/').next().unwrap_or("");
+        if last.starts_with("multipart-") {
+            // strip trailing "/N" part number if present
+            return Some(last.trim_end().to_string());
+        }
+        // Also handle the case where remote_path still ends in the part number:
+        // /multifs/<acct>/<bucket>/__mp__/multipart-<id>/1
+        if let Some(idx) = normalized.rfind("/multipart-") {
+            let base = &normalized[idx + 1..]; // "multipart-<id>/1" or "multipart-<id>"
+            let id = base.split('/').next().unwrap_or("");
+            if id.starts_with("multipart-") {
+                return Some(id.to_string());
+            }
+        }
+        None
+    }
+
+    /// Stream an object's bytes, optionally constrained by a byte range.
+    /// If the object is a multipart composite (parts persisted after Complete),
+    /// streams each part in order with Range slicing across part boundaries.
     pub async fn get_object_stream(
         &self,
         bucket: &str,
@@ -764,331 +441,98 @@ impl StorageEngine {
         range: Option<(usize, usize)>,
         tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
     ) -> anyhow::Result<()> {
-        let storage_type: Option<String> = self.meta.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT storage_type FROM files WHERE bucket_name = ?1 AND key = ?2")?;
-            let mut rows = stmt.query(rusqlite::params![bucket, key])?;
-            if let Some(row) = rows.next()? {
-                Ok(Some(row.get::<_, String>(0)?))
-            } else {
-                Ok(None)
-            }
-        })?;
+        let obj = self
+            .meta
+            .get_object(bucket, key)?
+            .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
 
-        match storage_type.as_deref() {
-            Some("chunked") if range.is_some() => self.stream_chunked_file_range(bucket, key, range.unwrap(), tx).await,
-            Some("chunked") => self.stream_chunked_file_full(bucket, key, tx).await,
-            _ => {
-                let obj = self.meta.get_object(bucket, key)?
-                    .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
-                let backend = self.find_backend(&obj.account_email)?;
-                backend.backend.download_stream(&obj.remote_path, None, None, tx).await
-            }
+        // Detect multipart composite and assemble from parts.
+        if let Some(upload_id) = Self::multipart_upload_id(&obj.remote_path) {
+            return self.get_multipart_object_stream(bucket, key, &upload_id, range, tx).await;
         }
+
+        let backend = self.find_backend(&obj.account_email)?;
+        let (range_start, range_end) = match range {
+            Some((s, e)) => (Some(s as u64), Some(e as u64)),
+            None => (None, None),
+        };
+        backend
+            .backend
+            .download_stream(&obj.remote_path, range_start, range_end, tx)
+            .await
     }
 
-    /// Stream all chunks sequentially (no Range), caching each
-    /// Stream all chunks sequentially (no Range). Delegates to stream_chunked_file_range
-    /// for a single consistent streaming code path.
-    async fn stream_chunked_file_full(
+    /// Assemble a multipart object from its persisted parts, streaming them in
+    /// order. Honors an optional byte range by slicing each part's range to the
+    /// requested global window (correct across part boundaries).
+    async fn get_multipart_object_stream(
         &self,
         bucket: &str,
-        key: &str,
+        _key: &str,
+        upload_id: &str,
+        range: Option<(usize, usize)>,
         tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
     ) -> anyhow::Result<()> {
-        // Get total file size from metadata
-        let file_size: i64 = self.meta.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT size FROM files WHERE bucket_name = ?1 AND key = ?2")?;
-            let mut rows = stmt.query(rusqlite::params![bucket, key])?;
-            if let Some(row) = rows.next()? {
-                Ok(row.get::<_, i64>(0)?)
-            } else {
-                Ok(0i64)
+        let parts = self.meta.list_multipart_parts(upload_id)?;
+        if parts.is_empty() {
+            anyhow::bail!("Multipart object {} has no persisted parts", upload_id);
+        }
+
+        // Global byte offsets.
+        let global_start = range.map(|(s, _)| s as u64).unwrap_or(0);
+        let global_end = range.map(|(_, e)| e as u64).unwrap_or(u64::MAX);
+
+        // Establish the absolute offset of part 1 within the composite. Usually
+        // parts are contiguous from byte 0; we track cumulative offset.
+        let mut offset: u64 = 0;
+        for (pn, size, _etag, account, path) in &parts {
+            let pn = *pn;
+            let size = *size as u64;
+            let part_abs_start = offset;
+            let part_abs_end = offset.saturating_add(size); // exclusive
+            offset = part_abs_end;
+
+            // Compute the requested sub-range of THIS part.
+            let (lo, hi) = (part_abs_start, part_abs_end);
+            let start_in_part = global_start.saturating_sub(lo);
+            if global_end <= lo || global_start >= hi {
+                continue; // this part is entirely outside the requested range
             }
-        })?;
-
-        if file_size == 0 {
-            anyhow::bail!("File size not found for {}/{}", bucket, key);
-        }
-
-        // Unify into the ranged streaming path
-        self.stream_chunked_file_range(bucket, key, (0, file_size as usize), tx).await
-    }
-
-    /// Parallel ranged streaming: spawn concurrent chunk downloads (tracker-deduped),
-    /// pipe pCloud pages directly to VLC as they arrive, in chunk order.
-    /// Each download task sends an empty sentinel page when complete.
-    async fn stream_chunked_file_range(
-        &self,
-        bucket: &str,
-        key: &str,
-        (req_start, req_end): (usize, usize),
-        tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
-    ) -> anyhow::Result<()> {
-        let backends = &*self.backends;
-        let chunk_size = CHUNK_SIZE;
-        let page_size = page_cache::PAGE_SIZE;
-        let first_chunk = req_start / chunk_size;
-        let last_chunk = if req_end == 0 { 0 } else { (req_end - 1) / chunk_size };
-        let num_chunks = (last_chunk - first_chunk + 1) as u32;
-
-        #[derive(Debug)]
-        struct ChunkRec {
-            index: i32,
-            size: i64,
-            checksum: String,
-            account_email: String,
-            remote_path: String,
-        }
-        let chunks_info: Vec<ChunkRec> = self.meta.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT chunk_index, size, checksum, account_email, remote_path
-                 FROM chunks WHERE bucket_name = ?1 AND key = ?2 ORDER BY chunk_index"
-            )?;
-            let rows = stmt.query_map(rusqlite::params![bucket, key], |row| {
-                Ok(ChunkRec {
-                    index: row.get(0)?,
-                    size: row.get(1)?,
-                    checksum: row.get(2)?,
-                    account_email: row.get(3)?,
-                    remote_path: row.get(4)?,
-                })
-            })?;
-            let mut infos = Vec::new();
-            for row in rows { infos.push(row?); }
-            Ok(infos)
-        })?;
-
-        // Spawn concurrent chunk downloads. Each task pipes pCloud's HTTP stream
-        // page-by-page through a shared channel, followed by an empty sentinel.
-        let (page_tx, page_rx) = tokio::sync::mpsc::unbounded_channel::<(i32, usize, bytes::Bytes)>();
-        let mut spawned = 0u32;
-        let dt = self.download_tracker.clone();
-
-        // Adjacent-chunk prefetch: after the requested range, also cache the next
-        // PREFETCH_CHUNKS chunks (N+1, N+2 ...) so VLC/seek-adjacent bytes are warm.
-        // These are downloaded into the page cache but NOT emitted to the client
-        // (they fall outside [req_start, req_end]), matching the design docs.
-        const PREFETCH_CHUNKS: i32 = 2;
-        let prefetch_last = last_chunk as i32 + PREFETCH_CHUNKS;
-
-        for ci in &chunks_info {
-            // In-range chunks are streamed to the client.
-            if ci.index >= first_chunk as i32 && ci.index <= last_chunk as i32 {
-                spawned += 1;
-
-                let backends_owned = self.backends.clone();
-                let cc = self.page_cache.clone();
-                let cdt = dt.clone();
-                let pt = page_tx.clone();
-                let b = bucket.to_string();
-                let k = key.to_string();
-                let acct = ci.account_email.clone();
-                let rp = ci.remote_path.clone();
-                let idx = ci.index;
-
-                // Compute mount path and owned path
-                let mp = self.backends.iter().find(|bh| bh.label == acct).map(|bh| bh.mount_prefix.clone()).unwrap_or_default();
-                let ow = if rp.is_empty() { format!("{}/{}/{}.ck.{}", mp, b, k, idx) } else { rp };
-
-                tokio::spawn(async move {
-                    Self::stream_chunk_paged(cc, cdt, backends_owned, pt, b, k, acct, ow, idx).await;
-                });
+            let end_in_part = if global_end >= hi {
+                hi - lo // full part
+            } else {
+                (global_end - lo) // exclusive end within part
+            };
+            if end_in_part <= start_in_part {
                 continue;
             }
 
-            // Otherwise, prefetch the adjacent chunks that follow the requested
-            // range (N+1 .. N+PREFETCH_CHUNKS) into the page cache. These are not
-            // piped to the client; they only warm the cache for the next seek.
-            if ci.index > last_chunk as i32 && ci.index <= prefetch_last {
-                let backends_owned = self.backends.clone();
-                let cc = self.page_cache.clone();
-                let cdt = dt.clone();
-                let b = bucket.to_string();
-                let k = key.to_string();
-                let acct = ci.account_email.clone();
-                let rp = ci.remote_path.clone();
-                let idx = ci.index;
-
-                let mp = self.backends.iter().find(|bh| bh.label == acct).map(|bh| bh.mount_prefix.clone()).unwrap_or_default();
-                let ow = if rp.is_empty() { format!("{}/{}/{}.ck.{}", mp, b, k, idx) } else { rp };
-
-                // Prefetch via the same paged path but without the client channel
-                // receiver — it will populate the page cache and stop there.
-                let (_probe_tx, _probe_rx) = tokio::sync::mpsc::unbounded_channel::<(i32, usize, bytes::Bytes)>();
-                tokio::spawn(async move {
-                    Self::stream_chunk_paged(cc, cdt, backends_owned, _probe_tx, b, k, acct, ow, idx).await;
-                });
-            }
+            let backend = self.find_backend(account)?;
+            // Range is inclusive for the reader (download_stream takes start..end
+            // as the byte range to fetch). pCloud Range is inclusive of start,
+            // exclusive of end in our read path; pass start..end_in_part.
+            backend
+                .backend
+                .download_stream(
+                    path,
+                    Some(start_in_part),
+                    Some(end_in_part),
+                    tx.clone(),
+                )
+                .await?;
+            let _ = pn;
         }
-        drop(page_tx);
-
-        // Stream pages to VLC in chunk order. Pages accumulate in a buffer per chunk.
-        // When a chunk's sentinel arrives, assemble the chunk data, slice to range,
-        // send it, and advance to the next chunk.
-        use tokio_stream::wrappers::UnboundedReceiverStream;
-        use futures::StreamExt;
-        // Page-level streaming: forward ONLY the pages overlapping the requested
-        // range immediately as they arrive — no whole-32MB-chunk buffering. This
-        // keeps mid-chunk TTFB low and avoids buffering large chunks in memory.
-        //
-        // The assembly loop runs in a background task so this function returns as
-        // soon as the producer tasks are dispatched; the client drains `tx`
-        // concurrently. Without this, a single-chunk range over a channel smaller
-        // than the window (e.g. 5MB window over capacity-64 mpsc) deadlocks: the
-        // 65th send blocks against a receiver that is still awaiting this call.
-        tokio::spawn(async move {
-            let mut stream = UnboundedReceiverStream::new(page_rx);
-            // Per-chunk page buffers, bounded: we only fully buffer ONE chunk at a
-            // time in order to guarantee client output arrives in strict chunk order
-            // (chunk 0 fully before chunk 1). This keeps the read-back stream-based
-            // (single 32 MiB chunk buffer at most, never the whole object in RAM).
-            let mut chunk_page_buf: std::collections::HashMap<i32, Vec<(usize, bytes::Bytes)>> =
-                std::collections::HashMap::new();
-            let mut sentinel_rcvd: std::collections::HashSet<i32> = std::collections::HashSet::new();
-            let mut chunks_sent = 0u32;
-            let mut next = first_chunk as i32;
-
-            // Buffer incoming pages; when the current `next` chunk is fully buffered
-            // (its sentinel arrived), emit its pages in page order to the client,
-            // then advance to the next chunk.
-            while let Some((idx, off, page)) = stream.next().await {
-                let ictxi = idx as i32;
-                let entry = chunk_page_buf.entry(ictxi).or_insert_with(Vec::new);
-                if page.is_empty() {
-                    sentinel_rcvd.insert(ictxi);
-                } else {
-                    entry.push((off, page));
-                }
-
-                // Drain chunks strictly in order: emit buffered pages of `next` and
-                // advance as long as that chunk's sentinel has arrived.
-                while sentinel_rcvd.contains(&next) {
-                    if let Some(buf) = chunk_page_buf.get_mut(&next) {
-                        let co = next as usize * chunk_size;
-                        // Sort pages by byte offset so assembly is deterministic from
-                        // the requested range, not from arrival order.
-                        buf.sort_by_key(|(o, _)| *o);
-                        let mut cur = 0usize;
-                        for (off, page) in buf.iter() {
-                            let s = cur.max(req_start.saturating_sub(co));
-                            let e = (cur + page.len()).min(req_end.saturating_sub(co));
-                            if s < e {
-                                let slice = &page[s - cur..e - cur];
-                                for page_chunk in slice.chunks(65536) {
-                                    if tx.send(Ok(bytes::Bytes::copy_from_slice(page_chunk))).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                            cur = *off + page.len();
-                        }
-                        chunk_page_buf.remove(&next);
-                        chunks_sent += 1;
-                    }
-                    next += 1;
-                }
-
-                if chunks_sent >= spawned {
-                    break;
-                }
-            }
-        });
-
         Ok(())
     }
 
-    /// Helper: download a single chunk as paged pages and forward through pt channel.
-    /// Checks page cache first; if missing, downloads from pCloud and caches each page.
-    async fn stream_chunk_paged(
-        cc: Arc<PageCache>,
-        cdt: Arc<DownloadTracker>,
-        backends: Arc<Vec<BackendHandle>>,
-        pt: tokio::sync::mpsc::UnboundedSender<(i32, usize, bytes::Bytes)>,
-        b: String, k: String, acct: String, ow: String, idx: i32,
-    ) {
-        let page_size = page_cache::PAGE_SIZE;
-        // Check if all pages are cached
-        let missing = cc.missing_ranges(&b, &k, idx, 0, CHUNK_SIZE, CHUNK_SIZE).await;
-        if missing.is_empty() {
-            // All pages cached — stream them sequentially
-            let total_pages = (CHUNK_SIZE + page_size - 1) / page_size;
-            for pn in 0..total_pages {
-                if let Some(page) = cc.get_page(&b, &k, idx, pn, CHUNK_SIZE).await {
-                    if pt.send((idx, pn * page_size, bytes::Bytes::from(page))).is_err() { return; }
-                }
-            }
-            // Sentinel: signal chunk complete
-            let _ = pt.send((idx, 0usize, bytes::Bytes::new()));
-            return;
-        }
-
-        // Register with download tracker for dedup; share result if already registered
-        let _ = cdt.try_register(&b, &k, idx).await;
-        if let Some(backend_idx) = backends.iter().position(|bh| bh.label == acct) {
-            let (dl_tx, mut dl_rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, anyhow::Error>>(64);
-            let dl_path = ow.clone();
-            let dl_tx2 = dl_tx.clone();
-            let be_clone = backends.clone();
-            let dl_handle = tokio::spawn(async move {
-                if let Some(bh) = be_clone.get(backend_idx) {
-                    let _ = bh.backend.download_stream(&dl_path, None, None, dl_tx2).await;
-                }
-            });
-            drop(dl_tx);
-            let mut offset = 0usize;
-            while let Some(res) = dl_rx.recv().await {
-                match res {
-                    Ok(p) => {
-                        let len = p.len();
-                        cc.put_pages(&b, &k, idx, offset, &p, CHUNK_SIZE).await;
-                        offset += len;
-                        if pt.send((idx, offset - len, p)).is_err() { break; }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Chunk download error for {}/{} chunk {}: {}", b, k, idx, e);
-                        break;
-                    }
-                }
-            }
-            let _ = dl_handle.await;
-            cdt.complete(&b, &k, idx, Ok(vec![])).await;
-        }
-        // Always send sentinel — even on failure, so the assembly pipeline doesn't hang.
-        // The upload fix ensures chunks always exist on pCloud, making this safe.
-        let _ = pt.send((idx, 0usize, bytes::Bytes::new()));
-    }
+    // -----------------------------------------------------------------
+    //  Metadata
+    // -----------------------------------------------------------------
 
     pub async fn head_object(&self, bucket: &str, key: &str) -> anyhow::Result<ObjectInfo> {
-        let chunked_meta: Option<(i64, String, String, Option<String>)> = self.meta.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT size, etag, last_modified, content_type FROM files WHERE bucket_name = ?1 AND key = ?2 AND storage_type = 'chunked'"
-            )?;
-            let mut rows = stmt.query(rusqlite::params![bucket, key])?;
-            if let Some(row) = rows.next()? {
-                Ok(Some((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                )))
-            } else {
-                Ok(None)
-            }
-        })?;
-
-        if let Some((size, etag, last_modified, content_type)) = chunked_meta {
-            return Ok(ObjectInfo {
-                key: key.to_string(),
-                size,
-                etag,
-                last_modified,
-                content_type,
-                account_email: String::new(),
-                remote_path: format!("chunked://{}/{}", bucket, key),
-            });
-        }
-
-        let obj = self.meta.get_object(bucket, key)?
+        let obj = self
+            .meta
+            .get_object(bucket, key)?
             .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
         Ok(ObjectInfo {
             key: obj.key,
@@ -1098,75 +542,94 @@ impl StorageEngine {
             content_type: obj.content_type,
             account_email: obj.account_email,
             remote_path: obj.remote_path,
+            version: obj.version,
         })
     }
 
+    // -----------------------------------------------------------------
+    //  Delete
+    // -----------------------------------------------------------------
+
     pub async fn delete_object(&self, bucket: &str, key: &str) -> anyhow::Result<()> {
-        // Check if it's a chunked file first
-        let storage_type: Option<String> = self.meta.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT storage_type FROM files WHERE bucket_name = ?1 AND key = ?2"
-            )?;
-            let mut rows = stmt.query(rusqlite::params![bucket, key])?;
-            if let Some(row) = rows.next()? {
-                Ok(Some(row.get::<_, String>(0)?))
-            } else {
-                Ok(None)
-            }
-        })?;
-
-        match storage_type.as_deref() {
-            Some("chunked") => {
-                // Delete all chunks from backends
-                let chunks_info: Vec<(String, String)> = self.meta.with_conn(|conn| {
-                    let mut stmt = conn.prepare(
-                        "SELECT account_email, remote_path FROM chunks WHERE bucket_name = ?1 AND key = ?2"
-                    )?;
-                    let rows = stmt.query_map(rusqlite::params![bucket, key], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?;
-                    let mut infos = Vec::new();
-                    for row in rows {
-                        infos.push(row?);
-                    }
-                    Ok(infos)
-                })?;
-
-                for (account_email, remote_path) in &chunks_info {
-                    if let Ok(backend) = self.find_backend(account_email) {
-                        let _ = backend.backend.delete(remote_path).await;
-                    }
-                }
-            }
-            _ => {
-                // Whole-file: existing logic
-                let obj = self.meta.get_object(bucket, key)?
-                    .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
-                let backend = self.find_backend(&obj.account_email)?;
-                backend.backend.delete(&obj.remote_path).await?;
-            }
-        }
+        // MVCC: remove the file pointer and mark the current version superseded.
+        // The orphan blob is reclaimed later by `vacuum` (after the grace period).
         self.meta.delete_object(bucket, key)?;
         Ok(())
     }
+
+    // -----------------------------------------------------------------
+    //  Vacuum — reclaim superseded / abandoned versions
+    // -----------------------------------------------------------------
+
+    /// Reclaim garbage: abandoned `pending` uploads and `committed` versions
+    /// that have outlived the grace period. Returns (pending_removed, orphans_removed).
+    pub async fn vacuum(&self, dry_run: bool) -> anyhow::Result<(u64, u64)> {
+        let now = Utc::now().timestamp_millis();
+        let pending = self.meta.list_pending_versions(now - PENDING_TIMEOUT_MS)?;
+        let orphans = self.meta.list_orphan_versions(now - GRACE_PERIOD_MS)?;
+
+        let mut pending_removed = 0u64;
+        for v in &pending {
+            if !dry_run {
+                if let Ok(backend) = self.find_backend(&v.account_email) {
+                    let _ = backend.backend.delete(&v.remote_path).await;
+                }
+                self.meta.delete_version(&v.bucket_name, &v.key, v.version)?;
+            }
+            pending_removed += 1;
+        }
+
+        let mut orphans_removed = 0u64;
+        for v in &orphans {
+            if !dry_run {
+                if let Ok(backend) = self.find_backend(&v.account_email) {
+                    let _ = backend.backend.delete(&v.remote_path).await;
+                }
+                self.meta.delete_version(&v.bucket_name, &v.key, v.version)?;
+            }
+            orphans_removed += 1;
+        }
+
+        Ok((pending_removed, orphans_removed))
+    }
+
+    // -----------------------------------------------------------------
+    //  List
+    // -----------------------------------------------------------------
 
     pub async fn list_objects(
         &self,
         bucket: &str,
         prefix: Option<&str>,
+        start_after: Option<&str>,
         max_keys: i64,
-    ) -> anyhow::Result<Vec<ObjectInfo>> {
-        let records = self.meta.list_objects(bucket, prefix, max_keys)?;
-        Ok(records.into_iter().map(|r| ObjectInfo {
-            key: r.key,
-            size: r.size,
-            etag: r.etag,
-            last_modified: r.last_modified,
-            content_type: r.content_type,
-            account_email: r.account_email,
-            remote_path: r.remote_path,
-        }).collect())
+    ) -> anyhow::Result<(Vec<ObjectInfo>, bool)> {
+        let records = self
+            .meta
+            .list_objects(bucket, prefix, start_after, max_keys + 1)?;
+        let truncated = records.len() as i64 > max_keys;
+        let mut infos: Vec<ObjectInfo> = records
+            .into_iter()
+            .map(|r| ObjectInfo {
+                key: r.key,
+                size: r.size,
+                etag: r.etag,
+                last_modified: r.last_modified,
+                content_type: r.content_type,
+                account_email: r.account_email,
+                remote_path: r.remote_path,
+                version: r.version,
+            })
+            .collect();
+        if truncated {
+            infos.truncate(max_keys as usize);
+        }
+        Ok((infos, truncated))
     }
+
+    // -----------------------------------------------------------------
+    //  Bucket CRUD
+    // -----------------------------------------------------------------
 
     pub async fn bucket_exists(&self, name: &str) -> anyhow::Result<bool> {
         self.meta.bucket_exists(name)
@@ -1177,7 +640,7 @@ impl StorageEngine {
     }
 
     pub async fn delete_bucket(&self, name: &str) -> anyhow::Result<()> {
-        let objects = self.meta.list_objects(name, None, 10000)?;
+        let objects = self.meta.list_objects(name, None, None, 10000)?;
         for obj in &objects {
             let _ = self.delete_object(name, &obj.key).await;
         }
@@ -1188,6 +651,10 @@ impl StorageEngine {
     pub async fn list_all_buckets(&self) -> anyhow::Result<Vec<BucketRecord>> {
         self.meta.list_buckets()
     }
+
+    // -----------------------------------------------------------------
+    //  Shard status
+    // -----------------------------------------------------------------
 
     pub async fn shard_status(&self) -> anyhow::Result<Vec<ShardStatus>> {
         let mut statuses = Vec::new();
@@ -1221,17 +688,165 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn find_backend(&self, label: &str) -> anyhow::Result<&BackendHandle> {
-        self.backends.iter().find(|b| b.label == label)
-            .ok_or_else(|| anyhow::anyhow!("Backend not found: {}", label))
+    // -----------------------------------------------------------------
+    //  Multipart upload (simplified — one blob per part, no chunking)
+    // -----------------------------------------------------------------
+
+    pub async fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        content_type: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.meta
+            .create_multipart(upload_id, bucket, key, content_type)
     }
 
-    /// Rebalance — migrate objects/chunks from over-utilized backends to under-utilized ones.
-    ///
-    /// Per-item strategy: download chunk data from old backend → upload to new backend →
-    /// atomically update SQLite metadata → delete from old backend.
-    /// Works on individual chunks for chunked files, and on whole-object records for small files.
-    /// Returns (migrated_count, total_bytes_moved).
+    pub async fn get_multipart_upload(
+        &self,
+        upload_id: &str,
+    ) -> anyhow::Result<Option<(String, String, Option<String>)>> {
+        self.meta.get_multipart(upload_id)
+    }
+
+    /// Upload a single multipart part as one blob to pCloud.
+    /// Returns (staging_key, part_size, part_md5).
+    pub async fn upload_part(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        part_number: u64,
+        data: &[u8],
+    ) -> anyhow::Result<(String, i64, String)> {
+        let backends = &*self.backends;
+        if backends.is_empty() {
+            anyhow::bail!("No storage backends configured");
+        }
+
+        if self.placement == PlacementStrategy::Utilization {
+            let _ = self.refresh_quotas().await;
+        }
+        let idx = self.pick_backend().await?;
+
+        let staging_key = format!("__mp__/{}/{}", upload_id, part_number);
+        let part_path = format!(
+            "{}/{}/{}",
+            backends[idx].mount_prefix, bucket, staging_key
+        );
+
+        let (actual_path, _file_id) = backends[idx].backend.upload(&part_path, data).await?;
+        let part_md5 = hex::encode(Md5::digest(data));
+        let part_size = data.len() as i64;
+
+        // Record the part so Complete can stitch it.
+        self.meta.store_multipart_part(
+            upload_id,
+            part_number,
+            part_size,
+            &part_md5,
+            &backends[idx].label,
+            &actual_path,
+        )?;
+
+        Ok((staging_key, part_size, part_md5))
+    }
+
+    /// Complete a multipart upload — stitch parts into the final object.
+    /// Each part is already a standalone file on pCloud; we record them
+    /// all under the real object key and clean up staging.
+    pub async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        content_type: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let (_, real_key, ct) = self
+            .meta
+            .get_multipart(upload_id)?
+            .ok_or_else(|| anyhow::anyhow!("Multipart upload {} not found", upload_id))?;
+
+        let parts = self.meta.list_multipart_parts(upload_id)?;
+        if parts.is_empty() {
+            anyhow::bail!("No parts recorded for multipart upload {}", upload_id);
+        }
+
+        let total_size: i64 = parts.iter().map(|(_, size, _, _, _)| *size).sum();
+
+        // S3 multipart ETag: MD5 over the concat of each part's binary MD5.
+        let mut md5_concat = Vec::new();
+        let mut all_parts: Vec<(String, String, i64)> = Vec::new(); // (account, path, size)
+        for (pn, size, part_etag, account, path) in &parts {
+            let bin = hex::decode(part_etag)?;
+            md5_concat.extend_from_slice(&bin);
+            all_parts.push((account.clone(), path.clone(), *size));
+            let _ = pn;
+        }
+        let etag = format!("{}-{}", hex::encode(Md5::digest(&md5_concat)), parts.len());
+
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+
+        // For multipart objects we store them as individual parts under the real
+        // key with a prefix. On download they are assembled back into the object.
+        // The canonical remote_path we record is the upload's staging directory
+        // marker (`__mp__/multipart-<upload_id>/`), from which the read path can
+        // recover the upload_id and list the persisted parts for assembly.
+        let canonical_account = &all_parts[0].0;
+        // Store the multipart staging base path (the upload dir), which the read
+        // path parses to find the persisted parts. This keeps the object linked to
+        // its parts after completion.
+        // The canonical remote_path is the upload staging dir
+        // (/<mount>/<bucket>/__mp__/multipart-<id>). The read path parses the
+        // upload_id from this marker to list and assemble the persisted parts.
+        let canonical_path = all_parts[0]
+            .1
+            .rsplit_once('/')
+            .map(|(dir, _)| dir.to_string())
+            .unwrap_or_else(|| all_parts[0].1.clone());
+
+        let (version, _reserved_path) = self.meta.reserve_version(
+            bucket,
+            &real_key,
+            canonical_account,
+            &self
+                .find_backend(canonical_account)
+                .map(|b| b.mount_prefix.clone())
+                .unwrap_or_else(|_| "/".to_string()),
+        )?;
+        self.meta.commit_version(
+            bucket,
+            &real_key,
+            version,
+            total_size,
+            &etag,
+            &now,
+            content_type.as_deref().or(ct.as_deref()),
+            &canonical_path,
+        )?;
+
+        // IMPORTANT (S3 round-trip fix): keep the multipart_parts rows so GET can
+        // assemble the object from its parts. Previously we called
+        // self.meta.delete_multipart(upload_id) here, which wiped the parts list;
+        // the object then pointed only at part 1, so downloads truncated at the
+        // first part boundary. We now retain the parts (they are keyed by upload_id
+        // and pruned on object delete). Only the transient multipart_uploads row is
+        // removed so the upload session is considered complete.
+        self.meta.delete_multipart_upload(upload_id)?;
+
+        Ok(etag)
+    }
+
+    pub async fn list_multipart_parts(
+        &self,
+        upload_id: &str,
+    ) -> anyhow::Result<Vec<(u64, i64, String, String, String)>> {
+        self.meta.list_multipart_parts(upload_id)
+    }
+
+    // -----------------------------------------------------------------
+    //  Rebalance — move objects from over-full to under-full backends
+    // -----------------------------------------------------------------
+
     pub async fn rebalance(&self, dry_run: bool) -> anyhow::Result<(u64, i64)> {
         let statuses = self.shard_status().await?;
         if statuses.len() < 2 {
@@ -1244,10 +859,13 @@ impl StorageEngine {
         }
         let target_fill = total_used as f64 / total_capacity as f64;
 
-        // Identify which accounts are over-full (should offload data)
-        let over_full_idx: Vec<usize> = statuses.iter().enumerate()
-            .filter(|(_, s)| s.total_bytes > 0
-                && (s.used_bytes as f64 / s.total_bytes as f64) > target_fill + 0.05)
+        let over_full_idx: Vec<usize> = statuses
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.total_bytes > 0
+                    && (s.used_bytes as f64 / s.total_bytes as f64) > target_fill + 0.05
+            })
             .map(|(i, _)| i)
             .collect();
 
@@ -1256,9 +874,12 @@ impl StorageEngine {
             return Ok((0, 0));
         }
 
-        let over_emails: Vec<&str> = over_full_idx.iter().map(|i| statuses[*i].email.as_str()).collect();
-        println!("  Target fill: {:.1}%
-", target_fill * 100.0);
+        let over_emails: Vec<&str> = over_full_idx
+            .iter()
+            .map(|i| statuses[*i].email.as_str())
+            .collect();
+
+        println!("  Target fill: {:.1}%", target_fill * 100.0);
         println!("  Over-full accounts (will migrate from):");
         for i in &over_full_idx {
             let s = &statuses[*i];
@@ -1266,13 +887,11 @@ impl StorageEngine {
             println!("    {} — {:.1}% full", s.email, pct);
         }
 
+        let all_objects = self.meta.list_all_objects()?;
+
         if dry_run {
-            // Dry-run: count how many records would move
             let mut moved: u64 = 0;
             let mut bytes: i64 = 0;
-
-            // Whole-file objects on over-full accounts
-            let all_objects = self.meta.list_all_objects()?;
             for obj in &all_objects {
                 if over_emails.contains(&obj.account_email.as_str()) {
                     let sz = if obj.size > 1_073_741_824 {
@@ -1282,28 +901,18 @@ impl StorageEngine {
                     } else {
                         format!("{} B", obj.size)
                     };
-                    println!("    WOULD MIGRATE: {}/{} ({}) — {}",
-                        obj.bucket_name, obj.key, sz, obj.account_email);
+                    println!(
+                        "    WOULD MIGRATE: {}/{} ({}) — {}",
+                        obj.bucket_name, obj.key, sz, obj.account_email
+                    );
                     moved += 1;
                     bytes += obj.size;
                 }
             }
-
-            // Chunks on over-full accounts
-            let chunk_count = self.meta.with_conn(|conn| -> anyhow::Result<i64> {
-                let mut stmt = conn.prepare(
-                    "SELECT COALESCE(SUM(size), 0), COUNT(*) FROM chunks"
-                )?;
-                Ok(stmt.query_row([], |row| Ok(row.get::<_, i64>(1)?))?)
-            })?;
-            println!("    PLUS {} chunk records (account-level tracking unavailable in dry-run)", chunk_count);
-
-            println!("\n  Would migrate ~{} items ({} bytes total)", moved, bytes);
+            println!("\n  Would migrate {} items ({} bytes total)", moved, bytes);
             return Ok((moved, bytes));
         }
 
-        // --- Whole-file migration ---
-        let all_objects = self.meta.list_all_objects()?;
         let mut migrated: u64 = 0;
         let mut total_bytes: i64 = 0;
 
@@ -1311,130 +920,61 @@ impl StorageEngine {
             if !over_emails.contains(&obj.account_email.as_str()) {
                 continue;
             }
-            // Skip chunked entries (they're in the chunks table, not objects)
-            if obj.remote_path.starts_with("chunked://") {
-                continue;
-            }
 
-            // 1. Download from old backend
             let data = match self.get_object(&obj.bucket_name, &obj.key).await {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!("  ⚠️  {}/{}: download failed ({}), skipping", obj.bucket_name, obj.key, e);
+                    tracing::warn!(
+                        "  ⚠️  {}/{}: download failed ({}), skipping",
+                        obj.bucket_name,
+                        obj.key,
+                        e
+                    );
                     continue;
                 }
             };
 
-            // 2. Upload to least-full backend (fresh quota check via pick_backend)
-            let new_info = match self.put_object_with_content_type(
-                &obj.bucket_name, &obj.key, &data, obj.content_type.as_deref(),
-            ).await {
+            let new_info = match self
+                .put_object_with_content_type(
+                    &obj.bucket_name,
+                    &obj.key,
+                    &data,
+                    obj.content_type.as_deref(),
+                )
+                .await
+            {
                 Ok(info) => info,
                 Err(e) => {
-                    tracing::error!("  ❌ {}/{}: re-upload failed ({}), skipping", obj.bucket_name, obj.key, e);
+                    tracing::error!(
+                        "  ❌ {}/{}: re-upload failed ({}), skipping",
+                        obj.bucket_name,
+                        obj.key,
+                        e
+                    );
                     continue;
                 }
             };
 
-            // If we landed on a different backend, clean up old copy
             if new_info.account_email != obj.account_email {
-                // Delete old pCloud file
                 if let Ok(old_backend) = self.find_backend(&obj.account_email) {
                     let _ = old_backend.backend.delete(&obj.remote_path).await;
                 }
-                // Metadata was already updated by put_object, so old object record
-                // now points to new backend — done.
+                // Remove the old version row now that its blob is gone.
+                let _ = self.meta.delete_version(&obj.bucket_name, &obj.key, obj.version);
                 migrated += 1;
                 total_bytes += obj.size;
                 if migrated % 10 == 0 {
-                    println!("  Progress: {} whole-file objects migrated", migrated);
+                    println!("  Progress: {} objects migrated", migrated);
                 }
             }
         }
 
-        // --- Chunk-level migration ---
-        // For chunked files, migrate individual chunks from over-full accounts
-        let chunks_to_migrate: Vec<(String, String, i32, i64, String, String)> =
-            self.meta.with_conn(|conn| -> anyhow::Result<Vec<_>> {
-                let mut stmt = conn.prepare(
-                    "SELECT bucket_name, key, chunk_index, size, account_email, remote_path
-                     FROM chunks"
-                )?;
-                let rows = stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i32>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })?;
-                let mut v = Vec::new();
-                for r in rows { v.push(r?); }
-                Ok(v)
-            })?;
-
-        let mut chunk_migrated: u64 = 0;
-        for (bucket, key, chunk_index, size, acc_email, remote_path) in &chunks_to_migrate {
-            if !over_emails.contains(&acc_email.as_str()) {
-                continue;
-            }
-
-            // 1. Download chunk from old backend
-            let old_backend = match self.find_backend(acc_email) {
-                Ok(b) => b,
-                Err(_) => {
-                    tracing::warn!("  ⚠️  chunk {}/{}[{}]: backend {} not found, skipping",
-                        bucket, key, chunk_index, acc_email);
-                    continue;
-                }
-            };
-
-            let data = match old_backend.backend.download(remote_path).await {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!("  ⚠️  chunk {}/{}[{}]: download failed ({}), skipping",
-                        bucket, key, chunk_index, e);
-                    continue;
-                }
-            };
-
-            // 2. Upload to least-full backend
-            let bi = self.pick_backend().await?;
-            let new_backend = &self.backends[bi];
-            let new_chunk_path = format!("{}/{}/{}.ck.{}", new_backend.mount_prefix, bucket, key, chunk_index);
-            let (new_remote_path, _) = match new_backend.backend.upload(&new_chunk_path, &data).await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("  ❌ chunk {}/{}[{}]: upload to {} failed ({}), skipping",
-                        bucket, key, chunk_index, new_backend.label, e);
-                    continue;
-                }
-            };
-
-            // 3. Update SQLite: change account_email and remote_path for this chunk
-            self.meta.with_conn(|conn| -> anyhow::Result<()> {
-                conn.execute(
-                    "UPDATE chunks SET account_email = ?1, remote_path = ?2
-                     WHERE bucket_name = ?3 AND key = ?4 AND chunk_index = ?5",
-                    params![new_backend.label, new_remote_path, bucket, key, chunk_index],
-                )?;
-                Ok(())
-            })?;
-
-            // 4. Delete old chunk from old pCloud
-            let _ = old_backend.backend.delete(remote_path).await;
-
-            chunk_migrated += 1;
-            total_bytes += *size;
-            if chunk_migrated % 20 == 0 {
-                println!("  Progress: {} chunks migrated", chunk_migrated);
-            }
-        }
-
-        migrated += chunk_migrated;
-        println!("\n  ✅ Rebalance complete: {} items migrated ({} bytes)", migrated, total_bytes);
+        println!(
+            "\n  ✅ Rebalance complete: {} items migrated ({} bytes)",
+            migrated, total_bytes
+        );
         Ok((migrated, total_bytes))
     }
 }
+
+

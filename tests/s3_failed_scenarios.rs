@@ -318,7 +318,8 @@ fn md5_hex(data: &[u8]) -> String {
     out.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// S3 multipart ETag: hex(MD5( MD5(p1) || MD5(p2) || ... ))
+/// S3 multipart ETag: hex(MD5( MD5(p1) || MD5(p2) || ... )) followed by
+/// "-{part_count}" (the AWS S3 multipart ETag suffix).
 fn multipart_etag(parts: &[&[u8]]) -> String {
     use md5::{Digest, Md5};
     let mut concat: Vec<u8> = Vec::new();
@@ -327,5 +328,5 @@ fn multipart_etag(parts: &[&[u8]]) -> String {
         h.update(p);
         concat.extend_from_slice(&h.finalize()[..]);
     }
-    md5_hex(&concat)
+    format!("{}-{}", md5_hex(&concat), parts.len())
 }

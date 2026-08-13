@@ -51,7 +51,7 @@ pub async fn run(args: ObjectArgs) -> Result<()> {
 
     match args.command {
         ObjectSubcommand::List { bucket, prefix, max_keys } => {
-            let objects = engine.list_objects(&bucket, prefix.as_deref(), max_keys).await?;
+            let (objects, _) = engine.list_objects(&bucket, prefix.as_deref(), None, max_keys).await?;
             if objects.is_empty() {
                 println!("(no objects)");
                 return Ok(());

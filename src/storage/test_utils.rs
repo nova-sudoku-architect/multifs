@@ -1,5 +1,6 @@
-/// In-memory mock backend for testing without real cloud accounts.
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::Stream;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -48,6 +49,27 @@ impl StorageBackend for MockBackend {
         Ok((remote_path.to_string(), data.len() as i64))
     }
 
+    async fn upload_stream(
+        &self,
+        remote_path: &str,
+        stream: Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send + Unpin>,
+    ) -> anyhow::Result<(String, i64, String, i64)> {
+        use sha2::{Digest, Sha256};
+        use futures::StreamExt;
+        let mut all = Vec::new();
+        let mut hasher = Sha256::new();
+        let mut pinned = stream;
+        while let Some(item) = pinned.next().await {
+            let chunk = item?;
+            hasher.update(&chunk);
+            all.extend_from_slice(&chunk);
+        }
+        let etag = hex::encode(hasher.finalize());
+        let size = all.len() as i64;
+        self.files.lock().unwrap().insert(remote_path.to_string(), all);
+        Ok((remote_path.to_string(), 0, etag, size))
+    }
+
     async fn download(&self, remote_path: &str) -> anyhow::Result<Vec<u8>> {
         self.files
             .lock()
@@ -60,13 +82,26 @@ impl StorageBackend for MockBackend {
     async fn download_stream(
         &self,
         remote_path: &str,
-        _range_start: Option<u64>,
-        _range_end: Option<u64>,
+        range_start: Option<u64>,
+        range_end: Option<u64>,
         tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
     ) -> anyhow::Result<()> {
-        // For mock: send the full file in 64KB chunks (no real Range support needed for tests)
+        // Honor the byte range (inclusive start, exclusive end) and stream the
+        // slice in 64KB chunks. Ignoring the range would flood the bounded
+        // channel with the full file and deadlock when the caller awaits the
+        // stream setup before draining.
         let data = self.download(remote_path).await?;
-        for chunk in data.chunks(64 * 1024) {
+        let start = range_start.unwrap_or(0) as usize;
+        let end = range_end
+            .map(|e| e as usize)
+            .unwrap_or(data.len())
+            .min(data.len());
+        let slice = if start < end && start < data.len() {
+            &data[start..end]
+        } else {
+            &[][..]
+        };
+        for chunk in slice.chunks(64 * 1024) {
             if tx.send(Ok(bytes::Bytes::copy_from_slice(chunk))).await.is_err() {
                 break;
             }
@@ -216,6 +251,14 @@ impl StorageBackend for TrackedBackend {
 
     async fn upload(&self, remote_path: &str, data: &[u8]) -> anyhow::Result<(String, i64)> {
         self.inner.upload(remote_path, data).await
+    }
+
+    async fn upload_stream(
+        &self,
+        remote_path: &str,
+        stream: Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send + Unpin>,
+    ) -> anyhow::Result<(String, i64, String, i64)> {
+        self.inner.upload_stream(remote_path, stream).await
     }
 
     async fn download(&self, remote_path: &str) -> anyhow::Result<Vec<u8>> {

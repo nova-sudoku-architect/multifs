@@ -57,18 +57,12 @@ pub struct ServerConfig {
     /// S3 API port
     #[serde(default = "default_s3_port")]
     pub s3_port: u16,
-    /// WebDAV port
-    #[serde(default = "default_webdav_port")]
-    pub webdav_port: u16,
     /// NFS port
     #[serde(default = "default_nfs_port")]
     pub nfs_port: u16,
     /// Whether to enable NFS server
     #[serde(default = "default_true")]
     pub enable_nfs: bool,
-    /// Whether to enable WebDAV server
-    #[serde(default = "default_true")]
-    pub enable_webdav: bool,
     /// Whether to enable S3 server
     #[serde(default = "default_true")]
     pub enable_s3: bool,
@@ -157,7 +151,6 @@ impl AccountConfig {
 // Defaults
 fn default_bind() -> String { "0.0.0.0".to_string() }
 fn default_s3_port() -> u16 { 9000 }
-fn default_webdav_port() -> u16 { 8080 }
 fn default_nfs_port() -> u16 { 2049 }
 fn default_true() -> bool { true }
 fn default_meta_db() -> String {
@@ -175,10 +168,8 @@ impl Default for ServerConfig {
         Self {
             bind: default_bind(),
             s3_port: default_s3_port(),
-            webdav_port: default_webdav_port(),
             nfs_port: default_nfs_port(),
             enable_nfs: true,
-            enable_webdav: true,
             enable_s3: true,
         }
     }

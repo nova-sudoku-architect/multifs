@@ -110,6 +110,9 @@ fn s3_list_objects_xml(
     prefix: Option<&str>,
     objects: &[(String, i64, String, String)],
     is_truncated: bool,
+    next_token: Option<&str>,
+    start_after: Option<&str>,
+    max_keys: i64,
 ) -> String {
     let contents_xml: String = objects
         .iter()
@@ -127,17 +130,31 @@ fn s3_list_objects_xml(
         })
         .collect();
 
+    let key_count_xml = format!("<KeyCount>{}</KeyCount>\n", objects.len());
+    let next_token_xml = match next_token {
+        Some(t) => format!("<NextContinuationToken>{}</NextContinuationToken>\n", t),
+        None => String::new(),
+    };
+    let start_after_xml = match start_after {
+        Some(sa) => format!("<StartAfter>{}</StartAfter>\n", sa),
+        None => String::new(),
+    };
+
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Name>{}</Name>
   <Prefix>{}</Prefix>
-  <MaxKeys>1000</MaxKeys>
-  <IsTruncated>{}</IsTruncated>
+  <MaxKeys>{}</MaxKeys>
+  {}{}{}<IsTruncated>{}</IsTruncated>
   {}
 </ListBucketResult>"#,
         bucket,
         prefix.unwrap_or(""),
+        max_keys,
+        key_count_xml,
+        next_token_xml,
+        start_after_xml,
         if is_truncated { "true" } else { "false" },
         contents_xml
     )
@@ -289,12 +306,21 @@ async fn list_objects(
 
     let prefix = params.prefix.as_deref();
     let delimiter = params.delimiter.as_deref();
-    let max_keys = params.max_keys.unwrap_or(100).min(1000);
+    let max_keys = params.max_keys.unwrap_or(1000).clamp(1, 1000);
+    // ListObjectsV2 continuation token: resume strictly after this key.
+    let start_after = params.continuation_token.as_deref().or(params.marker.as_deref());
 
-    match state.engine.list_objects(&bucket, prefix, max_keys).await {
-        Ok(objects) => {
+    match state.engine.list_objects(&bucket, prefix, start_after, max_keys).await {
+        Ok((objects, is_truncated)) => {
             // If delimiter=/ is requested, group objects into CommonPrefixes
             let has_delimiter = delimiter == Some("/");
+
+            // Next continuation token = last returned key (when truncated).
+            let next_token = if is_truncated {
+                objects.last().map(|o| o.key.clone())
+            } else {
+                None
+            };
 
             if has_delimiter {
                 let (common_prefixes, file_objs) = crate::server::group_objects_by_prefix(&objects, prefix);
@@ -319,18 +345,26 @@ async fn list_objects(
                     .map(|p| format!("<CommonPrefixes>\n    <Prefix>{}</Prefix>\n</CommonPrefixes>", p))
                     .collect();
 
+                let next_token_xml = match &next_token {
+                    Some(t) => format!("<NextContinuationToken>{}</NextContinuationToken>\n", t),
+                    None => String::new(),
+                };
+
                 let xml = format!(
                     r#"<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Name>{}</Name>
   <Prefix>{}</Prefix>
   <Delimiter>/</Delimiter>
-  <MaxKeys>1000</MaxKeys>
-  <IsTruncated>false</IsTruncated>
-  {}{}
+  <MaxKeys>{}</MaxKeys>
+  <IsTruncated>{}</IsTruncated>
+  {}{}{}
 </ListBucketResult>"#,
                     bucket,
                     prefix.unwrap_or(""),
+                    max_keys,
+                    if is_truncated { "true" } else { "false" },
+                    next_token_xml,
                     prefixes_xml,
                     contents_xml
                 );
@@ -340,12 +374,12 @@ async fn list_objects(
                     .body(Body::from(xml))
                     .unwrap()
             } else {
-                // No delimiter: return flat list (original behavior)
+                // No delimiter: return flat list with proper pagination metadata.
                 let obj_tuples: Vec<(String, i64, String, String)> = objects
                     .into_iter()
                     .map(|o| (o.key, o.size, o.etag, o.last_modified))
                     .collect();
-                let xml = s3_list_objects_xml(&bucket, prefix, &obj_tuples, false);
+                let xml = s3_list_objects_xml(&bucket, prefix, &obj_tuples, is_truncated, next_token.as_deref(), start_after, max_keys);
                 Response::builder()
                     .header("Content-Type", "application/xml")
                     .body(Body::from(xml))
@@ -371,6 +405,7 @@ async fn put_object(
     uri: axum::http::Uri,
     body: Body,
 ) -> Response {
+    tracing::info!("S3 PUT /{}/{} (uri={:?})", bucket, key, uri.query());
     // Parse query params manually
     let query_str = uri.query().unwrap_or("");
     let has_uploads = query_str.contains("uploads");
@@ -429,9 +464,8 @@ async fn put_object(
             }
             Ok(Some(_)) => {}
         }
-        // Stitch the staged part chunks into the final object (no RAM reassembly,
-        // no re-upload). Returns the spec-compliant multipart ETag.
-        return match state.engine.stitch_multipart(&bucket, &upload_id, None).await {
+        // Stitch the staged parts into the final object.
+        return match state.engine.complete_multipart_upload(&bucket, &upload_id, None).await {
             Ok(etag) => {
                 let xml = format!(
                     r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -492,31 +526,15 @@ async fn put_object(
                 return Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
             }
         };
-        // Stream the part bytes to storage as chunks (no RAM retention of the
-        // whole object across parts, no re-upload at Complete). Record the part
-        // metadata so Complete can stitch.
-        let (staging_key, part_size, part_md5) =
-            match state.engine.upload_part_as_chunks(&bucket, &upload_id, part_no, &part_data).await {
+        // Upload the part as a single blob and record metadata for stitching.
+        let (_staging_key, _part_size, part_md5) =
+            match state.engine.upload_part(&bucket, &upload_id, part_no, &part_data).await {
                 Ok(t) => t,
                 Err(e) => {
                     let xml = s3_error_xml("InternalError", &e.to_string(), &format!("{}/{}", bucket, key));
                     return Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
                 }
             };
-        // Record per-part metadata for stitching (first_chunk + chunk_count).
-        let chunk_count = state
-            .engine
-            .count_part_chunks(&bucket, &staging_key)
-            .await
-            .unwrap_or(0);
-        if let Err(e) = state
-            .engine
-            .store_part_meta(&upload_id, part_no, part_size, &part_md5, chunk_count)
-            .await
-        {
-            let xml = s3_error_xml("InternalError", &e.to_string(), &format!("{}/{}", bucket, key));
-            return Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).header("Content-Type", "application/xml").body(Body::from(xml)).unwrap();
-        }
         // ETag = MD5 of the actual part bytes (S3-compliant, differs per part).
         return Response::builder()
             .header("ETag", format!("\"{}\"", part_md5))
@@ -537,17 +555,32 @@ async fn put_object(
 
     const CHUNK_SIZE_LIMIT: u64 = 32 * 1024 * 1024; // 32 MB — same as engine's chunk size
 
-    // Stream the request body into storage, spooling 32MiB chunks as they
-    // arrive — no full-object RAM buffering. rclone sends the object/part body
-    // as a stream; this is the S3-parity write path.
-    // `Body::into_data_stream()` yields a `BodyDataStream` (Item = Result<Bytes>).
+    // Buffer the full request body first, then pass as a stream.
+    // Direct `body.into_data_stream()` causes a deadlock: axum/hyper can't
+    // send the response until the request body is fully consumed, but the
+    // engine starts making pCloud API calls BEFORE consuming the stream.
+    // WebDAV doesn't hit this because `Bytes` is extracted eagerly.
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            let xml = s3_error_xml("RequestTimeout", &e.to_string(), &format!("{}/{}", bucket, key));
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap();
+        }
+    };
+    let byte_vec: Vec<u8> = bytes.to_vec();
+    let stream = futures::stream::once(futures::future::ready(Ok(bytes::Bytes::from(byte_vec))));
+    tracing::info!("S3 PUT: body buffered ({} bytes), calling engine", bytes.len());
     let result = state
         .engine
         .put_object_stream(
             &bucket,
             &key,
             content_type.as_deref(),
-            body.into_data_stream().map(|r| r.map_err(|e| anyhow::anyhow!(e.to_string()))),
+            stream,
         )
         .await;
 
@@ -639,8 +672,18 @@ async fn get_object(
     use tokio_stream::wrappers::ReceiverStream;
 
     // Range slicing is handled inside the engine for chunked files.
-    let stream: Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::convert::Infallible>> + Send>> =
-        Box::pin(ReceiverStream::new(rx).filter_map(|r| async move { r.ok() }).map(Ok));
+    //
+    // IMPORTANT: propagate stream errors to the client instead of silently
+    // dropping them. Previously `.filter_map(|r| async move { r.ok() })`
+    // swallowed any Err emitted by the underlying pCloud/chunked read.
+    // The response already declared a full Content-Length, so a dropped Err
+    // left the client with a 200 but a truncated/empty body — which rclone
+    // surfaced as "empty response payload / EOF" / "Failed to calculate dst
+    // hash" and the health-check reported as read=124. We now abort the
+    // stream on the first error so the client sees a truncated body with a
+    // proper terminal error rather than a silently-empty success.
+    let stream: Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, anyhow::Error>> + Send>> =
+        Box::pin(ReceiverStream::new(rx));
 
     let mut response = Response::builder()
         .header("Content-Type", &content_type)
@@ -654,7 +697,7 @@ async fn get_object(
             .status(StatusCode::PARTIAL_CONTENT);
     }
 
-    response.body(Body::from_stream(stream)).unwrap()
+    response.body(axum::body::Body::from_stream(stream)).unwrap()
 }
 
 /// GET /{bucket}/{key}?uploadId=... — ListParts (rclone compatibility).
@@ -699,7 +742,7 @@ async fn list_parts(
         Ok(Some(_)) => {}
     }
 
-    let parts = match state.engine.list_multipart_parts_public(&upload_id).await {
+    let parts = match state.engine.list_multipart_parts(&upload_id).await {
         Ok(p) => p,
         Err(e) => {
             let xml =
@@ -755,7 +798,7 @@ async fn head_object(
             .header("Content-Type", info.content_type.unwrap_or("application/octet-stream".to_string()))
             .header("Content-Length", info.size.to_string())
             .header("ETag", format!("\"{}\"", info.etag))
-            .header("Last-Modified", &info.last_modified)
+            .header("Last-Modified", to_http_date(&info.last_modified))
             .body(Body::empty())
             .unwrap(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
@@ -771,4 +814,15 @@ async fn delete_object(
         Ok(_) => StatusCode::NO_CONTENT,
         Err(_) => StatusCode::NO_CONTENT, // S3 idempotent delete
     }
+}
+
+/// Convert an internal RFC3339/ISO-8601 timestamp (e.g. "2026-08-07T03:44:23.883Z")
+/// into an S3-spec HTTP-date header value (e.g. "Fri, 07 Aug 2026 03:44:23 GMT").
+/// S3 clients (rclone, AWS SDKs) reject RFC3339 AND rfc2822-offset forms in
+/// Last-Modified; the spec requires RFC1123/HTTP-date with a zero-padded day
+/// and "GMT". Falls back to the raw string if it cannot be parsed.
+fn to_http_date(last_modified: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(last_modified)
+        .map(|dt| dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+        .unwrap_or_else(|_| last_modified.to_string())
 }

@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::Stream;
 
 use super::{StorageBackend, StorageFile};
 use crate::config::AccountConfig;
@@ -33,6 +35,14 @@ impl StorageBackend for PCloudBackend {
 
     async fn upload(&self, remote_path: &str, data: &[u8]) -> anyhow::Result<(String, i64)> {
         self.client.upload(remote_path, data).await
+    }
+
+    async fn upload_stream(
+        &self,
+        remote_path: &str,
+        stream: Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send + Unpin>,
+    ) -> anyhow::Result<(String, i64, String, i64)> {
+        self.client.upload_stream(remote_path, stream).await
     }
 
     async fn download(&self, remote_path: &str) -> anyhow::Result<Vec<u8>> {

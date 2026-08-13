@@ -1,6 +1,4 @@
-pub mod chunk_manager;
-pub mod page_cache;
-pub mod download_tracker;
+pub mod stream_hasher;
 pub mod engine;
 pub mod metadata;
 pub mod placement;

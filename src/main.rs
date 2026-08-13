@@ -11,11 +11,11 @@ mod storage;
 #[command(
     name = "multifs",
     version,
-    about = "Multi-cloud storage pool with S3 API, WebDAV, and NFS",
+    about = "Multi-cloud storage pool with S3 API",
     long_about = "multifs is a multi-cloud storage pool that aggregates multiple cloud storage \
                    backends (pCloud, Box.net, S3-compatible, etc). Objects are distributed \
-                   across backends and accounts. The service exposes S3-compatible \
-                   and WebDAV interfaces."
+                   across backends and accounts. The service exposes an S3-compatible \
+                   interface."
 )]
 enum Cli {
     /// Start the pCloudFS daemon
@@ -38,6 +38,8 @@ enum Cli {
     Status,
     /// Audit pCloud accounts — find files not managed by MultiFS
     Audit(cli::audit_cmd::AuditArgs),
+    /// Garbage-collect superseded and abandoned object versions
+    Vacuum(cli::vacuum_cmd::VacuumArgs),
 }
 
 #[tokio::main]
@@ -62,6 +64,7 @@ async fn main() -> Result<()> {
         Cli::Shard(args) => cli::shard_cmd::run(args).await?,
         Cli::Status => cli::status::run_status().await?,
         Cli::Audit(args) => cli::audit_cmd::run(args).await?,
+        Cli::Vacuum(args) => cli::vacuum_cmd::run(args).await?,
     }
 
     Ok(())
