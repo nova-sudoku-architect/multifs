@@ -145,7 +145,11 @@ async fn scan_and_import(args: &ImportArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("No contents array in pCloud response"))?;
 
         for entry in contents {
-            let is_folder = entry.get("isfolder").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+            // pCloud returns `isfolder` as a JSON boolean (true/false), not an integer.
+            let is_folder = entry
+                .get("isfolder")
+                .map(|v| v.as_bool().unwrap_or_else(|| v.as_i64() == Some(1)))
+                .unwrap_or(false);
             let entry_path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
             if is_folder {
                 if !entry_path.is_empty() {

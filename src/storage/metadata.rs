@@ -282,6 +282,36 @@ impl MetadataDb {
             conn.execute("UPDATE schema_version SET version = 2", [])?;
         }
 
+        // Migration 3: add a `checksum` column (SHA-256 of blob content) to
+        // `versions` and `files`. Used to detect accidental in-place
+        // modification of a managed blob. Populated lazily — existing rows get
+        // an empty checksum until `multifs checksum rebuild` computes it.
+        if current < 3 {
+            let vcols: Vec<String> = conn
+                .prepare("PRAGMA table_info(versions)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            if !vcols.iter().any(|c| c == "checksum") {
+                conn.execute_batch(
+                    "ALTER TABLE versions ADD COLUMN checksum TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
+
+            let fcols: Vec<String> = conn
+                .prepare("PRAGMA table_info(files)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            if !fcols.iter().any(|c| c == "checksum") {
+                conn.execute_batch(
+                    "ALTER TABLE files ADD COLUMN checksum TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
+
+            conn.execute("UPDATE schema_version SET version = 3", [])?;
+        }
+
         Ok(())
     }
 
@@ -305,6 +335,7 @@ impl MetadataDb {
                 etag             TEXT NOT NULL,
                 last_modified    TEXT NOT NULL,
                 content_type     TEXT,
+                checksum         TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (bucket_name, key)
             );
 
@@ -321,6 +352,7 @@ impl MetadataDb {
                 status           TEXT NOT NULL,
                 created_at       INTEGER NOT NULL,
                 superseded_at    INTEGER,
+                checksum         TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (bucket_name, key, version)
             );
 
@@ -602,6 +634,42 @@ impl MetadataDb {
 
     /// Return the (bucket, key) under which `remote_path` is already tracked for
     /// `account_email`, if any (committed versions only).
+    /// Store the SHA-256 checksum for a version's blob. Mirrors the value onto
+    /// the `files` row when `version` is that file's current version, so a
+    /// `get_object` can surface the checksum without a second lookup.
+    pub fn set_checksum(
+        &self,
+        bucket: &str,
+        key: &str,
+        version: i64,
+        checksum: &str,
+    ) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE versions SET checksum = ?4 WHERE bucket_name = ?1 AND key = ?2 AND version = ?3",
+                params![bucket, key, version, checksum],
+            )?;
+            conn.execute(
+                "UPDATE files SET checksum = ?3 WHERE bucket_name = ?1 AND key = ?2 AND current_version = ?4",
+                params![bucket, key, checksum, version],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Return the stored checksum for a file's current version, if any.
+    pub fn get_checksum(&self, bucket: &str, key: &str) -> anyhow::Result<Option<String>> {
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT checksum FROM files WHERE bucket_name = ?1 AND key = ?2",
+                    params![bucket, key],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+    }
+
     pub fn find_object_by_remote_path(
         &self,
         account_email: &str,
@@ -1097,7 +1165,7 @@ mod tests {
             .unwrap();
         }
 
-        // Open triggers migration to v2.
+        // Open triggers migration to v3 (current latest).
         let db = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
 
         let version: i64 = db
@@ -1109,7 +1177,7 @@ mod tests {
                 )?)
             })
             .unwrap();
-        assert_eq!(version, 2, "migration should set version to 2");
+        assert_eq!(version, 3, "migration should set version to 3");
 
         // The legacy object became version 1 of a file, with its blob preserved.
         let obj = db.get_object("b", "k.txt").unwrap().expect("object migrated");

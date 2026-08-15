@@ -40,6 +40,8 @@ enum Cli {
     Audit(cli::audit_cmd::AuditArgs),
     /// Import an existing pCloud file into MultiFS (register metadata only)
     Import(cli::import_cmd::ImportArgs),
+    /// Manage content checksums (SHA-256) for managed blobs
+    Checksum(cli::checksum_cmd::ChecksumArgs),
     /// Garbage-collect superseded and abandoned object versions
     Vacuum(cli::vacuum_cmd::VacuumArgs),
 }
@@ -67,6 +69,7 @@ async fn main() -> Result<()> {
         Cli::Status => cli::status::run_status().await?,
         Cli::Audit(args) => cli::audit_cmd::run(args).await?,
         Cli::Import(args) => cli::import_cmd::run(args).await?,
+        Cli::Checksum(args) => cli::checksum_cmd::run(args).await?,
         Cli::Vacuum(args) => cli::vacuum_cmd::run(args).await?,
     }
 

@@ -36,6 +36,7 @@ multifs serve
 | **Tiered placement** — cloud-first, local disk as last resort (per-account `priority`) | ✅ |
 | **`vacuum` garbage collection** — reclaims superseded + abandoned versions + abandoned multipart uploads | ✅ |
 | **`import` command** — register existing pCloud file(s) (metadata only, single-file or `--scan`) | ✅ |
+| **Content checksums** — SHA-256 stored per blob; `checksum rebuild|verify` detects in-place drift | ✅ |
 | **CLI management** — accounts, buckets, objects, shards, audit | ✅ |
 | WebDAV | ❌ Removed |
 | NFS | ❌ Stub (port not exposed) |
@@ -159,6 +160,11 @@ multifs import <email> --scan [--bucket <b>] [--prefix <p>] [--dry-run]
                                   Bulk-import every unmanaged file in the account
 
 multifs vacuum [--dry-run]        GC superseded + abandoned version blobs + abandoned multipart uploads
+
+multifs checksum rebuild [path]    Recompute + store SHA-256 for one object
+multifs checksum rebuild --all     Recompute + store SHA-256 for every object
+multifs checksum verify [path]     Verify stored checksum against live content
+multifs checksum verify --all      Verify every object's checksum
 ```
 
 ## Garbage Collection

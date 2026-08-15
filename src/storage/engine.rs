@@ -333,6 +333,9 @@ impl StorageEngine {
             content_type,
             &remote_path_actual,
         )?;
+        // Single-blob upload: the ETag IS the SHA-256, so record it as the
+        // integrity checksum too.
+        self.meta.set_checksum(bucket, key, version, &etag)?;
 
         Ok(ObjectInfo {
             key: key.to_string(),
@@ -405,6 +408,8 @@ impl StorageEngine {
             content_type,
             &actual_path,
         )?;
+        // Streaming uploads also use SHA-256 as the ETag; record it as the checksum.
+        self.meta.set_checksum(bucket, key, version, &etag)?;
 
         Ok(ObjectInfo {
             key: key.to_string(),
@@ -596,6 +601,49 @@ impl StorageEngine {
     // -----------------------------------------------------------------
     //  Metadata
     // -----------------------------------------------------------------
+
+    /// Compute the SHA-256 checksum of an object's full content by streaming
+    /// it through the read path (handles both single-blob and multipart
+    /// composites). Does not write to the DB — the caller decides.
+    pub async fn compute_checksum(&self, bucket: &str, key: &str) -> anyhow::Result<String> {
+        use sha2::{Digest, Sha256};
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<Result<bytes::Bytes, anyhow::Error>>(16);
+        let b = bucket.to_string();
+        let k = key.to_string();
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let _ = engine.get_object_stream(&b, &k, None, tx).await;
+        });
+        let mut hasher = Sha256::new();
+        while let Some(chunk) = rx.recv().await {
+            let data = chunk?;
+            hasher.update(&data);
+        }
+        Ok(hex::encode(hasher.finalize()))
+    }
+
+    /// Recompute and store the checksum for one object. Returns the checksum.
+    pub async fn rebuild_checksum(&self, bucket: &str, key: &str) -> anyhow::Result<String> {
+        let obj = self
+            .meta
+            .get_object(bucket, key)?
+            .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
+        let checksum = self.compute_checksum(bucket, key).await?;
+        self.meta
+            .set_checksum(bucket, key, obj.version, &checksum)?;
+        Ok(checksum)
+    }
+
+    /// Return the stored checksum for a file's current version, if any.
+    pub fn get_checksum(&self, bucket: &str, key: &str) -> anyhow::Result<Option<String>> {
+        self.meta.get_checksum(bucket, key)
+    }
+
+    /// List every managed object (current versions) across all buckets.
+    pub fn list_all_objects(&self) -> anyhow::Result<Vec<crate::storage::metadata::ObjectRecord>> {
+        self.meta.list_all_objects()
+    }
 
     pub async fn head_object(&self, bucket: &str, key: &str) -> anyhow::Result<ObjectInfo> {
         let obj = self

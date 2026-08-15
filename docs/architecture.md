@@ -22,6 +22,7 @@ blob in place.
 | S3 multipart upload | ✅ Live | Initiate / UploadPart / Complete / ListParts / Abort; parts persisted and assembled |
 | `vacuum` GC | ✅ Live | Reclaims abandoned `pending` and superseded (orphaned) version blobs |
 | `import` command | ✅ Live | Register an existing pCloud file into the DB (metadata only) |
+| Content checksums | ✅ Live | SHA-256 stored per blob; `checksum rebuild|verify` detects in-place drift |
 | Placement | ✅ Live | Tiered: cloud-first, local disk as last resort (per-account `priority`) |
 | Erasure coding | ❌ Stub | Not deployed (single-blob model; each blob lives on one account) |
 | NFS | ❌ Stub | Port 2049 not exposed |
@@ -77,7 +78,7 @@ blob in place.
 
 ## Data Model (SQLite)
 
-Path: `/var/lib/multifs/meta.db` (WAL mode). Schema version **2**.
+Path: `/var/lib/multifs/meta.db` (WAL mode). Schema version **3** (checksum column added in migration 3).
 
 ```sql
 -- Bucket registry
@@ -95,6 +96,7 @@ CREATE TABLE files (
     etag             TEXT NOT NULL,          -- SHA-256 hex (single blob)
     last_modified    TEXT NOT NULL,
     content_type     TEXT,
+    checksum         TEXT NOT NULL DEFAULT '',   -- SHA-256 hex of live content
     PRIMARY KEY (bucket_name, key)
 );
 
@@ -110,6 +112,7 @@ CREATE TABLE versions (
     account_email    TEXT NOT NULL,          -- pCloud account holding the blob
     remote_path      TEXT NOT NULL,          -- the single blob location
     status           TEXT NOT NULL,          -- 'pending' | 'committed'
+    checksum         TEXT NOT NULL DEFAULT '',   -- SHA-256 hex of this blob
     created_at       INTEGER NOT NULL,       -- epoch ms (upload start)
     superseded_at    INTEGER,                -- epoch ms; NULL while current
     PRIMARY KEY (bucket_name, key, version)
