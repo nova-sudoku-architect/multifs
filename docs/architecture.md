@@ -23,6 +23,7 @@ blob in place.
 | `vacuum` GC | ✅ Live | Reclaims abandoned `pending` and superseded (orphaned) version blobs |
 | `import` command | ✅ Live | Register an existing pCloud file into the DB (metadata only) |
 | Content checksums | ✅ Live | SHA-256 stored per blob; `checksum rebuild|verify` detects in-place drift |
+| `fsck` health check | ✅ Live | DB integrity + backend presence/size + optional checksum verify |
 | Placement | ✅ Live | Tiered: cloud-first, local disk as last resort (per-account `priority`) |
 | Erasure coding | ❌ Stub | Not deployed (single-blob model; each blob lives on one account) |
 | NFS | ❌ Stub | Port 2049 not exposed |
@@ -214,6 +215,27 @@ slash stripped; bucket defaults to `video`. `--dry-run` reports without writing.
 
 ---
 
+## Health Check (`fsck`)
+
+`multifs fsck [--checksums] [--fix]` is a read-mostly integrity checker that runs five phases
+and reports them in one pass:
+
+1. **Database integrity** — dangling `files.current_version` pointers (no matching committed
+   version), `files`↔`versions` mirror mismatches (size/etag/checksum), committed versions
+   with no `files` row, and `pending` versions.
+2. **Multipart state** — orphan `multipart_parts` (no upload row *and* unreferenced by any
+   committed version) and abandoned `multipart_uploads` older than 24h.
+3. **Backend presence + size** — `stat` every committed blob against its backend and compare
+   size (cheap; no byte download).
+4. **Content checksums** — optional (`--checksums`): recompute SHA-256 via the read path and
+   compare to the stored checksum (slow; downloads every blob's bytes).
+5. **GC state** — count of superseded versions awaiting `vacuum`.
+
+`--fix` safely reclaims orphan multipart parts (deleting their part blobs) and runs `vacuum`;
+it does **not** touch missing or size-mismatched blobs, which require manual re-linking.
+
+---
+
 ## Garbage Collection (`vacuum`)
 
 Background (the server runs a vacuum every 10 minutes) or on-demand
@@ -265,6 +287,7 @@ pub trait StorageBackend: Send + Sync {
         range_end: Option<u64>, tx: Sender<Result<Bytes, Error>>) -> anyhow::Result<()>;
     async fn delete(&self, remote_path: &str) -> anyhow::Result<()>;
     async fn list(&self, prefix: &str) -> anyhow::Result<Vec<StorageFile>>;
+    async fn stat(&self, remote_path: &str) -> anyhow::Result<Option<i64>>;
     fn clone_box(&self) -> Box<dyn StorageBackend>;
 }
 ```
@@ -319,6 +342,7 @@ multifs import <email> <path> \      Register an existing pCloud file (metadata 
 multifs import <email> --scan \      Bulk-import every unmanaged file in the account
     [--bucket <b>] [--prefix <p>] [--dry-run]
 multifs vacuum [--dry-run]           GC superseded + abandoned version blobs + abandoned multipart uploads
+multifs fsck [--checksums] [--fix]   Verify DB integrity + backend presence/size (+ optional checksums)
 ```
 
 ---
@@ -342,7 +366,7 @@ multifs vacuum [--dry-run]           GC superseded + abandoned version blobs + a
 
 ## Test Coverage
 
-All 111 lib tests pass (`cargo test --lib`). Highlights:
+All 112 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_multipart_part_body_is_consumed_and_stored` — multipart round-trip + assembly.
 - `test_s3_multipart_roundtrip_stores_object` — total size + ETag correctness.
 - `test_concurrent_streaming` — concurrent range streams (range-aware mock).

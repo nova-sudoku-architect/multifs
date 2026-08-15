@@ -74,6 +74,10 @@ impl StorageBackend for PCloudBackend {
         }).collect())
     }
 
+    async fn stat(&self, remote_path: &str) -> anyhow::Result<Option<i64>> {
+        self.client.stat(remote_path).await
+    }
+
     /// Server-side copy using pCloud's copyfile API (instant for same account)
     async fn server_side_copy(&self, source_path: &str, dest_parent: &str) -> anyhow::Result<Option<String>> {
         // Extract filename from source path

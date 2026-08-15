@@ -228,6 +228,16 @@ impl StorageBackend for LocalDiskBackend {
         }
     }
 
+    async fn stat(&self, remote_path: &str) -> anyhow::Result<Option<i64>> {
+        let local = self.to_local(remote_path);
+        match tokio::fs::metadata(&local).await {
+            Ok(m) if m.is_file() => Ok(Some(m.len() as i64)),
+            Ok(_) => Ok(None), // a directory is not a blob
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("Stat {} failed: {}", local.display(), e)),
+        }
+    }
+
     async fn list(&self, prefix: &str) -> anyhow::Result<Vec<StorageFile>> {
         let local_prefix = self.to_local(prefix);
         let files = tokio::task::spawn_blocking({

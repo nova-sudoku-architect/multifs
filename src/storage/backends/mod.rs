@@ -53,6 +53,12 @@ pub trait StorageBackend: Send + Sync {
     /// List files under a prefix (directory).
     async fn list(&self, prefix: &str) -> anyhow::Result<Vec<StorageFile>>;
 
+    /// Check whether a file exists on the backend and return its size in bytes.
+    /// Returns `Ok(Some(size))` if present, `Ok(None)` if not found (or it is a
+    /// directory). Used by `fsck` for cheap presence + size verification without
+    /// downloading the blob.
+    async fn stat(&self, remote_path: &str) -> anyhow::Result<Option<i64>>;
+
     /// Server-side copy (optional). Returns the new remote path if supported.
     /// Returns `None` if the backend doesn't support server-side copy.
     async fn server_side_copy(

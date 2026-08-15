@@ -525,6 +525,38 @@ impl PCloudClient {
         Ok(())
     }
 
+    /// Check whether a file exists on pCloud and return its size in bytes.
+    /// Returns `Ok(Some(size))` if present, `Ok(None)` if not found.
+    pub async fn stat(&self, remote_path: &str) -> anyhow::Result<Option<i64>> {
+        let resp = self
+            .client
+            .post(format!("{}/stat", self.base_url))
+            .form(&[
+                ("access_token", self.token.as_str()),
+                ("path", remote_path),
+            ])
+            .send()
+            .await?;
+
+        let body: serde_json::Value = resp.json().await?;
+        let result = body["result"].as_i64().unwrap_or(-1);
+        // 2002 = "A component of parent directory does not exist."
+        // 2005 = "Directory does not exist."
+        // 2055 = "File or folder not found."
+        // All three mean the blob is not present at this path → treat as missing.
+        if result == 2002 || result == 2005 || result == 2055 {
+            return Ok(None);
+        }
+        if result != 0 {
+            anyhow::bail!("pCloud stat error {}: {}", result, body["error"]);
+        }
+        let md = &body["metadata"];
+        if md.get("isfolder").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Ok(None); // a directory is not a blob
+        }
+        Ok(md.get("size").and_then(|v| v.as_i64()))
+    }
+
     /// Delete a file from pCloud
     pub async fn delete(&self, remote_path: &str) -> anyhow::Result<()> {
         let resp = self

@@ -42,6 +42,8 @@ enum Cli {
     Import(cli::import_cmd::ImportArgs),
     /// Manage content checksums (SHA-256) for managed blobs
     Checksum(cli::checksum_cmd::ChecksumArgs),
+    /// Verify database integrity, backend presence, and (optionally) checksums
+    Fsck(cli::fsck_cmd::FsckArgs),
     /// Garbage-collect superseded and abandoned object versions
     Vacuum(cli::vacuum_cmd::VacuumArgs),
 }
@@ -70,6 +72,7 @@ async fn main() -> Result<()> {
         Cli::Audit(args) => cli::audit_cmd::run(args).await?,
         Cli::Import(args) => cli::import_cmd::run(args).await?,
         Cli::Checksum(args) => cli::checksum_cmd::run(args).await?,
+        Cli::Fsck(args) => cli::fsck_cmd::run(args).await?,
         Cli::Vacuum(args) => cli::vacuum_cmd::run(args).await?,
     }
 

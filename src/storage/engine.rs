@@ -640,6 +640,26 @@ impl StorageEngine {
         self.meta.get_checksum(bucket, key)
     }
 
+    /// Check whether a blob exists on its backend and return its size in bytes.
+    /// Returns `Ok(Some(size))` if present, `Ok(None)` if not found. Used by
+    /// `fsck` for cheap presence + size verification without downloading bytes.
+    pub async fn stat_blob(
+        &self,
+        account_email: &str,
+        remote_path: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        let backend = self.find_backend(account_email)?;
+        backend.backend.stat(remote_path).await
+    }
+
+    /// Delete a blob from its backend (best-effort). Used by `fsck --fix` to
+    /// reclaim orphaned multipart parts. The caller is responsible for deciding
+    /// the blob is safe to delete.
+    pub async fn delete_blob(&self, account_email: &str, remote_path: &str) -> anyhow::Result<()> {
+        let backend = self.find_backend(account_email)?;
+        backend.backend.delete(remote_path).await
+    }
+
     /// List every managed object (current versions) across all buckets.
     pub fn list_all_objects(&self) -> anyhow::Result<Vec<crate::storage::metadata::ObjectRecord>> {
         self.meta.list_all_objects()

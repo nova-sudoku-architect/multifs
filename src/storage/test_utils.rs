@@ -136,6 +136,10 @@ impl StorageBackend for MockBackend {
             .collect())
     }
 
+    async fn stat(&self, remote_path: &str) -> anyhow::Result<Option<i64>> {
+        Ok(self.files.lock().unwrap().get(remote_path).map(|d| d.len() as i64))
+    }
+
     fn clone_box(&self) -> Box<dyn StorageBackend> {
         Box::new(self.clone())
     }
@@ -305,6 +309,10 @@ impl StorageBackend for TrackedBackend {
 
     async fn list(&self, prefix: &str) -> anyhow::Result<Vec<StorageFile>> {
         self.inner.list(prefix).await
+    }
+
+    async fn stat(&self, remote_path: &str) -> anyhow::Result<Option<i64>> {
+        self.inner.stat(remote_path).await
     }
 
     fn clone_box(&self) -> Box<dyn StorageBackend> {

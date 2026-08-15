@@ -835,6 +835,137 @@ impl MetadataDb {
         })
     }
 
+    // ---- Fsck / integrity helpers ----
+
+    /// List every committed version (current and superseded alike). `fsck` uses
+    /// this to verify backend presence + size for every blob, not just the ones
+    /// currently visible through `files`.
+    pub fn list_committed_versions(&self) -> anyhow::Result<Vec<VersionRecord>> {
+        self.with_conn(|conn| {
+            let sql = format!(
+                "SELECT {} FROM versions WHERE status = 'committed' ORDER BY bucket_name, key, version",
+                VERSION_SELECT
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([], version_from_row)?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            Ok(v)
+        })
+    }
+
+    /// Files whose `current_version` has no matching committed version row
+    /// (dangling pointer). Returns (bucket, key, current_version).
+    pub fn list_dangling_files(&self) -> anyhow::Result<Vec<(String, String, i64)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT f.bucket_name, f.key, f.current_version \
+                 FROM files f \
+                 LEFT JOIN versions v ON v.bucket_name = f.bucket_name AND v.key = f.key AND v.version = f.current_version \
+                 WHERE v.version IS NULL \
+                 ORDER BY f.bucket_name, f.key",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Current-version mirror mismatches: `files.*` vs its live `versions` row.
+    /// Returns (bucket, key, field) where field ∈ {"size", "etag", "checksum"}.
+    pub fn list_mirror_mismatches(&self) -> anyhow::Result<Vec<(String, String, String)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT f.bucket_name, f.key, \
+                    CASE \
+                      WHEN f.size != v.size THEN 'size' \
+                      WHEN f.etag != v.etag THEN 'etag' \
+                      ELSE 'checksum' \
+                    END \
+                 FROM files f \
+                 JOIN versions v ON v.bucket_name = f.bucket_name AND v.key = f.key AND v.version = f.current_version \
+                 WHERE f.size != v.size OR f.etag != v.etag OR f.checksum != v.checksum \
+                 ORDER BY f.bucket_name, f.key",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Committed versions with no `files` row at all (unreferenced version).
+    pub fn list_unreferenced_versions(&self) -> anyhow::Result<Vec<(String, String, i64)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT v.bucket_name, v.key, v.version \
+                 FROM versions v \
+                 LEFT JOIN files f ON f.bucket_name = v.bucket_name AND f.key = v.key \
+                 WHERE v.status = 'committed' AND f.key IS NULL \
+                 ORDER BY v.bucket_name, v.key, v.version",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// `multipart_parts` upload_ids with no `multipart_uploads` row. Note: a
+    /// completed multipart object intentionally retains parts without an uploads
+    /// row, so this is only an orphan when no committed version references the
+    /// upload_id either — callers must cross-check `list_committed_versions`.
+    pub fn list_multipart_parts_without_upload(&self) -> anyhow::Result<Vec<String>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT p.upload_id \
+                 FROM multipart_parts p \
+                 LEFT JOIN multipart_uploads u ON u.upload_id = p.upload_id \
+                 WHERE u.upload_id IS NULL \
+                 ORDER BY p.upload_id",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Count committed versions that are superseded (awaiting vacuum reclaim).
+    pub fn count_superseded_versions(&self) -> anyhow::Result<i64> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM versions WHERE superseded_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(anyhow::Error::from)
+        })
+    }
+
+    /// Count versions in `pending` status (abandoned uploads awaiting vacuum).
+    pub fn count_pending_versions(&self) -> anyhow::Result<i64> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM versions WHERE status = 'pending'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(anyhow::Error::from)
+        })
+    }
+
     pub fn delete_all_objects(&self, bucket: &str) -> anyhow::Result<()> {
         self.with_conn(|conn| {
             conn.execute("DELETE FROM files WHERE bucket_name = ?1", params![bucket])?;
@@ -1300,5 +1431,54 @@ mod tests {
         assert_eq!(db.bucket_total_size("test").unwrap(), 300);
         assert_eq!(db.count_objects_for_account("a1").unwrap(), 2);
         assert_eq!(db.account_total_size("a1").unwrap(), 300);
+    }
+
+    #[test]
+    fn test_fsck_integrity_helpers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(dir.path().join("fsck.db").to_str().unwrap()).unwrap();
+        db.create_bucket("b").unwrap();
+
+        let (v, p) = db.reserve_version("b", "k.txt", "acct1", "/mnt/a").unwrap();
+        db.commit_version("b", "k.txt", v, 100, "e1", "2026-01-01", None, &p)
+            .unwrap();
+
+        // Healthy: no dangling, no mirror mismatch, no unreferenced versions.
+        assert!(db.list_dangling_files().unwrap().is_empty());
+        assert!(db.list_mirror_mismatches().unwrap().is_empty());
+        assert!(db.list_unreferenced_versions().unwrap().is_empty());
+        assert_eq!(db.list_committed_versions().unwrap().len(), 1);
+        assert_eq!(db.count_pending_versions().unwrap(), 0);
+        assert_eq!(db.count_superseded_versions().unwrap(), 0);
+
+        // Introduce a dangling file pointer (no matching committed version).
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO files (bucket_name, key, current_version, size, etag, last_modified) \
+                 VALUES ('b', 'ghost.txt', 99, 1, 'e', '2026-01-01')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            db.list_dangling_files().unwrap(),
+            vec![("b".to_string(), "ghost.txt".to_string(), 99)]
+        );
+
+        // Introduce a mirror mismatch (size drift) on the healthy file.
+        db.with_conn(|conn| {
+            conn.execute("UPDATE files SET size = 999 WHERE bucket_name='b' AND key='k.txt'", [])?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            db.list_mirror_mismatches().unwrap(),
+            vec![("b".to_string(), "k.txt".to_string(), "size".to_string())]
+        );
+
+        // Deleting the file supersedes its version.
+        db.delete_object("b", "k.txt").unwrap();
+        assert_eq!(db.count_superseded_versions().unwrap(), 1);
     }
 }

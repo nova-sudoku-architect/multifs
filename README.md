@@ -37,6 +37,7 @@ multifs serve
 | **`vacuum` garbage collection** — reclaims superseded + abandoned versions + abandoned multipart uploads | ✅ |
 | **`import` command** — register existing pCloud file(s) (metadata only, single-file or `--scan`) | ✅ |
 | **Content checksums** — SHA-256 stored per blob; `checksum rebuild|verify` detects in-place drift | ✅ |
+| **`fsck` health check** — DB integrity + backend presence/size + optional checksum verify | ✅ |
 | **CLI management** — accounts, buckets, objects, shards, audit | ✅ |
 | WebDAV | ❌ Removed |
 | NFS | ❌ Stub (port not exposed) |
@@ -165,6 +166,10 @@ multifs checksum rebuild [path]    Recompute + store SHA-256 for one object
 multifs checksum rebuild --all     Recompute + store SHA-256 for every object
 multifs checksum verify [path]     Verify stored checksum against live content
 multifs checksum verify --all      Verify every object's checksum
+
+multifs fsck [--checksums] [--fix] Verify DB integrity, backend presence + size
+                                   (--checksums also verifies content; --fix repairs
+                                   orphan multipart state + runs vacuum)
 ```
 
 ## Garbage Collection
