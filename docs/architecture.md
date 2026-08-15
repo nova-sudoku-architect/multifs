@@ -1,13 +1,13 @@
 # MultiFS — System Architecture
 
-> Version 0.2.0 | 2026-08-13 | Author: Nova Claw
+> Version 0.3.0 | 2026-08-15 | Author: Nova Claw
 
 ## Overview
 
-MultiFS is a multi-cloud storage pool written in Rust that aggregates multiple cloud storage
-backends into a **single S3-compatible API endpoint** (port 9000). Files are distributed across
-8 pCloud OAuth accounts (~39 GB total) using **single-blob storage with copy-on-write MVCC
-versioning**. Every object is stored as one self-contained blob on one account; overwrites create
+MultiFS is a multi-cloud storage pool written in Rust that aggregates multiple storage
+backends into a **single S3-compatible API endpoint** (port 9000). Objects are distributed
+across **8 pCloud OAuth accounts (~49 GB)** plus a **local disk backend (80 GB)** using
+**single-blob storage with copy-on-write MVCC versioning**. Every object is stored as one self-contained blob on one account; overwrites create
 a new version and atomically flip the file's "current version" pointer, never mutating the live
 blob in place.
 
@@ -21,7 +21,8 @@ blob in place.
 | Range streaming | ✅ Live | HTTP Range forwarded to pCloud CDN (start/end) |
 | S3 multipart upload | ✅ Live | Initiate / UploadPart / Complete / ListParts; parts persisted and assembled |
 | `vacuum` GC | ✅ Live | Reclaims abandoned `pending` and superseded (orphaned) version blobs |
-| Placement | ✅ Live | Round-robin or utilization-based backend selection |
+| `import` command | ✅ Live | Register an existing pCloud file into the DB (metadata only) |
+| Placement | ✅ Live | Tiered: cloud-first, local disk as last resort (per-account `priority`) |
 | Erasure coding | ❌ Stub | Not deployed (single-blob model; each blob lives on one account) |
 | NFS | ❌ Stub | Port 2049 not exposed |
 
@@ -52,25 +53,23 @@ blob in place.
 │                       │                                  │
 │           ┌───────────┴───────────┐                     │
 │           ▼                       ▼                      │
-│  ┌──────────────┐       ┌──────────────┐                │
-│  │  MetadataDb  │       │ StorageBackend│               │
-│  │  (SQLite WAL)│       │  trait        │               │
-│  └──────┬───────┘       └──────┬───────┘                │
-│         │                      │                         │
-│         │      ┌───────────────┴───────────────┐        │
-│         │      ▼                               ▼        │
-│         │  ┌──────────────┐  ┌──────────────────┐      │
-│         │  │ PCloudBackend│  │  MockBackend     │      │
-│         │  │ (8 accounts) │  │  (unit tests)    │      │
-│         │  └──────┬───────┘  └──────────────────┘      │
-│         │         │                                     │
-│         │         ▼                                     │
-│         │  ┌────────────────────────┐                   │
-│         │  │  pCloud API (EU)       │                   │
-│         │  │  uploadfile / getfilelink / deletefile     │
-│         │  │  userinfo / createfolder / listfolder      │
-│         │  │  CDN: edef*.pcloud.com  │                   │
-│         │  └────────────────────────┘                   │
+│  ┌──────────────┐       ┌──────────────────────────┐    │
+│  │  MetadataDb  │       │  StorageBackend (trait)  │    │
+│  │  (SQLite WAL)│       └───────────┬──────────────┘    │
+│  └──────────────┘                   │                    │
+│             ┌───────────────┬───────┴──────┬─────────┐  │
+│             ▼               ▼              ▼         │  │
+│    ┌──────────────┐ ┌──────────────┐ ┌─────────────┐ │  │
+│    │ PCloudBackend│ │LocalDiskBack │ │ MockBackend │ │  │
+│    │ (8 accounts) │ │ (80 GB prio1)│ │ (unit tests)│ │  │
+│    └──────┬───────┘ └──────────────┘ └─────────────┘ │  │
+│           ▼                                           │  │
+│    ┌──────────────────────────────┐                   │  │
+│    │  pCloud API (EU)             │                   │  │
+│    │  uploadfile / getfilelink / deletefile           │  │
+│    │  userinfo / createfolder / listfolder            │  │
+│    │  CDN: edef*.pcloud.com        │                   │  │
+│    └──────────────────────────────┘                   │  │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -191,6 +190,21 @@ swept by `vacuum` after the grace period. No explicit blob delete at delete time
 
 ---
 
+## Import (register existing files)
+
+`multifs import <email> <remote-path> --bucket <b> [--key <k>]` registers a file that
+already exists on pCloud (uploaded outside multifs) into the metadata DB — **metadata only,
+no data download or movement**. It fetches size / modified / content-type via pCloud `stat`
+and writes one committed version + file pointer at the existing remote path. Idempotent:
+re-running on an already-managed path is a no-op, and it auto-creates the target bucket so
+the object appears in ListBuckets / ListObjectsV2.
+
+> ⚠️ **Delete-safety:** an imported object's blob is indistinguishable from a multifs-owned
+> blob. Deleting the multifs record (and later `vacuum`) will delete the source file from
+> pCloud. Don't delete the multifs record for files that still matter elsewhere.
+
+---
+
 ## Garbage Collection (`vacuum`)
 
 Background / on-demand (`multifs vacuum [--dry-run]`), idempotent. Two sweeps:
@@ -200,6 +214,12 @@ Background / on-demand (`multifs vacuum [--dry-run]`), idempotent. Two sweeps:
 
 `superseded_at` protects in-flight readers: an old version becomes vacuumable only after
 it has been superseded for the grace window.
+
+> ⚠️ **Abandoned multipart uploads are NOT swept.** An upload initiated but never completed
+> (and never aborted — there is no AbortMultipartUpload handler) leaves its
+> `multipart_uploads` row, any `multipart_parts` rows, and the staged part blobs under
+> `__mp__/{upload_id}/` on pCloud. `vacuum` only reads the `versions` table, so these leak.
+> See Known Issues → High.
 
 ---
 
@@ -244,6 +264,7 @@ pub trait StorageBackend: Send + Sync {
 | Backend | Status | Notes |
 |---------|--------|-------|
 | `PCloudBackend` | ✅ Complete | 8 accounts, EU API |
+| `LocalDiskBackend` | ✅ Complete | Files under a root dir (`path`), used as overflow tier |
 | `MockBackend` | ✅ Complete | In-memory HashMap, honors byte ranges, used by unit tests |
 | `TrackedBackend` | ✅ Complete | Wraps any backend with call tracking + latency simulation |
 
@@ -258,9 +279,16 @@ pub trait StorageBackend: Send + Sync {
 
 ## Placement Strategy
 
-- **Round-Robin** — `AtomicUsize` counter, `idx = counter++ % backends.len()`.
-- **Utilization (default)** — picks the backend with the lowest `fill_ratio =
-  used_bytes / total_bytes`, using a cached quota refresh.
+Placement is driven by `placement_strategy` and a per-account `priority` field (lower =
+preferred). Cloud backends default to `priority = 0`, local disk to `priority = 1`.
+
+- **Utilization (default, tiered)** — distinct priority levels are filled ascending (lowest
+  number first). Within a level, the least-full backend wins (`fill_ratio = used / total`).
+  A level only spills to the next (higher) priority when every backend in the preferred
+  level is full (`fill_ratio ≥ 1.0`, i.e. no free space). Net effect: pCloud absorbs all
+  writes while it has any free space; local disk only receives overflow.
+- **Round-Robin** — `AtomicUsize` counter, `idx = counter++ % backends.len()`, ignoring
+  priority.
 
 ---
 
@@ -275,7 +303,9 @@ multifs account list|add|check       Manage pCloud accounts
 multifs bucket create|list|info      Manage buckets
 multifs object cp|ls|rm|info         Manage objects
 multifs shard status                 Show account fill levels
-multifs audit                        Find files not managed by MultiFS
+multifs audit scan|list-files        Find files not managed by MultiFS
+multifs import <email> <path> \      Register an existing pCloud file (metadata only)
+    --bucket <b> [--key <k>]
 multifs vacuum [--dry-run]           GC superseded + abandoned version blobs
 ```
 
@@ -286,23 +316,26 @@ multifs vacuum [--dry-run]           GC superseded + abandoned version blobs
 ### High
 1. **No erasure coding** — each blob lives on a single account; an account failure
    loses those blobs. (Single-blob model is a deliberate simplification.)
-2. **S3 body buffering** — uploads buffer the body in memory before streaming to pCloud.
+2. **Abandoned multipart uploads leak** — initiated-but-never-completed uploads (and their
+   staged part blobs) are never reclaimed: `vacuum` doesn't scan the `multipart_uploads` /
+   `multipart_parts` tables, and there is no AbortMultipartUpload handler.
+3. **S3 body buffering** — uploads buffer the body in memory before streaming to pCloud.
 
 ### Medium
-3. **No upload retry on pCloud errors** — quota-full (2008), rate limit (429), auth
+4. **No upload retry on pCloud errors** — quota-full (2008), rate limit (429), auth
    failure (2094) all fail immediately.
-4. **Vacuum is on-demand** — no automatic background scheduler wired yet; run `multifs vacuum`
+5. **Vacuum is on-demand** — no automatic background scheduler wired yet; run `multifs vacuum`
    via cron/systemd timer for continuous GC.
 
 ### Low
-5. **Config still references `cache_chunks` / `cache_size_mb`** — legacy from the chunked
+6. **Config still references `cache_chunks` / `cache_size_mb`** — legacy from the chunked
    architecture; harmless but unused.
 
 ---
 
 ## Test Coverage
 
-All 99 lib tests pass (`cargo test --lib`). Highlights:
+All 107 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_multipart_part_body_is_consumed_and_stored` — multipart round-trip + assembly.
 - `test_s3_multipart_roundtrip_stores_object` — total size + ETag correctness.
 - `test_concurrent_streaming` — concurrent range streams (range-aware mock).
@@ -323,7 +356,7 @@ enable_s3 = true
 
 [storage]
 meta_db_path = "/var/lib/multifs/meta.db"
-placement_strategy = "Utilization"
+placement_strategy = "utilization"
 
 [[storage.accounts]]
 email = "nova-video-01@agentmail.to"
@@ -331,7 +364,15 @@ backend_type = "pcloud"
 token_env = "PCLOUD_TOKEN_VIDEO_01"
 mount_prefix = "/multifs/01"
 quota_gb = 10
-# ... 7 more accounts
+# ... 7 more pCloud accounts ...
+
+[[storage.accounts]]
+email = "local-disk"
+backend_type = "local"
+mount_prefix = "/multifs/local"
+path = "/var/lib/multifs/disk"
+quota_gb = 80
+priority = 1
 ```
 
 ### Deploy

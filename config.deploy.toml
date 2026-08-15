@@ -1,9 +1,11 @@
+# MultiFS — Deployed Configuration
+# Mirrors /etc/multifs.toml on vmi3137694.
+
 [server]
 bind = "100.100.30.59"
 s3_port = 9000
-webdav_port = 8080
+nfs_port = 2049
 enable_nfs = false
-enable_webdav = true
 enable_s3 = true
 
 [tls]
@@ -16,32 +18,69 @@ domain = "vmi3137694.tailb9bfd3.ts.net"
 meta_db_path = "/var/lib/multifs/meta.db"
 cache_path = "/var/cache/multifs"
 cache_size_mb = 512
-placement_strategy = "utilization"
+cache_chunks = 10
+placement_strategy = "Utilization"
 
 [[storage.accounts]]
+email = "nova-video-01@agentmail.to"
 backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_VIDEO_01"
+mount_prefix = "/multifs/01"
+quota_gb = 10
+
+[[storage.accounts]]
+email = "nova-video-02@agentmail.to"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_VIDEO_02"
+mount_prefix = "/multifs/02"
+quota_gb = 9
+
+[[storage.accounts]]
+email = "nova-video-10@agentmail.to"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_VIDEO_10"
+mount_prefix = "/multifs/10"
+quota_gb = 6
+
+[[storage.accounts]]
+email = "nova-video-11@agentmail.to"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_VIDEO_11"
+mount_prefix = "/multifs/11"
+quota_gb = 5
+
+[[storage.accounts]]
 email = "nova-video-12@agentmail.to"
+backend_type = "pcloud"
 token_env = "PCLOUD_TOKEN_VIDEO_12"
 mount_prefix = "/multifs/12"
 quota_gb = 5
 
 [[storage.accounts]]
-backend_type = "pcloud"
 email = "nova-video-20@agentmail.to"
+backend_type = "pcloud"
 token_env = "PCLOUD_TOKEN_VIDEO_20"
 mount_prefix = "/multifs/20"
 quota_gb = 5
 
 [[storage.accounts]]
-backend_type = "pcloud"
 email = "nova-video-21@agentmail.to"
+backend_type = "pcloud"
 token_env = "PCLOUD_TOKEN_VIDEO_21"
 mount_prefix = "/multifs/21"
 quota_gb = 5
 
 [[storage.accounts]]
-backend_type = "pcloud"
 email = "nova-video-22@agentmail.to"
+backend_type = "pcloud"
 token_env = "PCLOUD_TOKEN_VIDEO_22"
 mount_prefix = "/multifs/22"
 quota_gb = 4
+
+[[storage.accounts]]
+email = "local-disk"
+backend_type = "local"
+mount_prefix = "/multifs/local"
+path = "/var/lib/multifs/disk"
+quota_gb = 80
+priority = 1
