@@ -18,17 +18,17 @@ pub async fn run(args: VacuumArgs) -> Result<()> {
     let meta = crate::storage::metadata::MetadataDb::open(&cfg.storage.meta_db_path)?;
     let engine = crate::storage::engine::StorageEngine::new(&cfg, meta)?;
 
-    let (pending, orphans) = engine.vacuum(args.dry_run).await?;
+    let (pending, orphans, multipart) = engine.vacuum(args.dry_run).await?;
 
     if args.dry_run {
         println!(
-            "Dry run — would reclaim {} pending upload(s) and {} superseded version(s)",
-            pending, orphans
+            "Dry run — would reclaim {} pending upload(s), {} superseded version(s), {} abandoned multipart upload(s)",
+            pending, orphans, multipart
         );
     } else {
         println!(
-            "✅ Vacuum complete: {} pending upload(s), {} superseded version(s) reclaimed",
-            pending, orphans
+            "✅ Vacuum complete: {} pending upload(s), {} superseded version(s), {} abandoned multipart upload(s) reclaimed",
+            pending, orphans, multipart
         );
     }
 

@@ -90,6 +90,10 @@ const QUOTA_REFRESH_MS: u128 = 60_000;
 const GRACE_PERIOD_MS: i64 = 10 * 60 * 1000;
 /// How long an abandoned (pending) upload is kept before vacuum sweeps it.
 const PENDING_TIMEOUT_MS: i64 = 60 * 60 * 1000;
+/// How long an in-progress multipart upload is kept before vacuum sweeps it
+/// (abandoned — initiated but never completed). `multipart_uploads.created` is
+/// epoch seconds, unlike the versions table which uses epoch milliseconds.
+const MULTIPART_TIMEOUT_SECS: i64 = 24 * 60 * 60;
 /// Fill ratio at or above which a backend is treated as full (no free space)
 /// for tiered placement. 1.0 = any free space counts as available.
 const FULL_FILL_RATIO: f64 = 1.0;
@@ -625,12 +629,16 @@ impl StorageEngine {
     //  Vacuum — reclaim superseded / abandoned versions
     // -----------------------------------------------------------------
 
-    /// Reclaim garbage: abandoned `pending` uploads and `committed` versions
-    /// that have outlived the grace period. Returns (pending_removed, orphans_removed).
-    pub async fn vacuum(&self, dry_run: bool) -> anyhow::Result<(u64, u64)> {
+    /// Reclaim garbage: abandoned `pending` uploads, `committed` versions
+    /// that have outlived the grace period, and abandoned multipart uploads.
+    /// Returns (pending_removed, orphans_removed, multipart_removed).
+    pub async fn vacuum(&self, dry_run: bool) -> anyhow::Result<(u64, u64, u64)> {
         let now = Utc::now().timestamp_millis();
         let pending = self.meta.list_pending_versions(now - PENDING_TIMEOUT_MS)?;
         let orphans = self.meta.list_orphan_versions(now - GRACE_PERIOD_MS)?;
+        let abandoned = self
+            .meta
+            .list_abandoned_multipart_uploads(now / 1000 - MULTIPART_TIMEOUT_SECS)?;
 
         let mut pending_removed = 0u64;
         for v in &pending {
@@ -654,7 +662,15 @@ impl StorageEngine {
             orphans_removed += 1;
         }
 
-        Ok((pending_removed, orphans_removed))
+        let mut multipart_removed = 0u64;
+        for upload_id in &abandoned {
+            if !dry_run {
+                self.abort_multipart_upload(upload_id).await?;
+            }
+            multipart_removed += 1;
+        }
+
+        Ok((pending_removed, orphans_removed, multipart_removed))
     }
 
     // -----------------------------------------------------------------
@@ -905,6 +921,26 @@ impl StorageEngine {
         upload_id: &str,
     ) -> anyhow::Result<Vec<(u64, i64, String, String, String)>> {
         self.meta.list_multipart_parts(upload_id)
+    }
+
+    /// Abort an in-progress multipart upload — delete its staged part blobs and
+    /// metadata rows. No-op if the upload is already gone (e.g. completed — whose
+    /// `multipart_parts` rows are retained for read assembly and must NOT be
+    /// deleted here).
+    pub async fn abort_multipart_upload(&self, upload_id: &str) -> anyhow::Result<()> {
+        // Only abort in-progress uploads: a completed object retains its parts
+        // (keyed by upload_id) but has no multipart_uploads row.
+        if self.meta.get_multipart(upload_id)?.is_none() {
+            return Ok(());
+        }
+        let parts = self.meta.list_multipart_parts(upload_id)?;
+        for (_pn, _size, _etag, account, path) in &parts {
+            if let Ok(backend) = self.find_backend(account) {
+                let _ = backend.backend.delete(path).await;
+            }
+        }
+        self.meta.delete_multipart(upload_id)?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------

@@ -137,12 +137,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             loop {
                 interval.tick().await;
                 match vacuum_engine.vacuum(false).await {
-                    Ok((pending, orphans)) => {
-                        if pending > 0 || orphans > 0 {
+                    Ok((pending, orphans, multipart)) => {
+                        if pending > 0 || orphans > 0 || multipart > 0 {
                             tracing::info!(
-                                "vacuum: reclaimed {} pending, {} superseded versions",
+                                "vacuum: reclaimed {} pending, {} superseded versions, {} abandoned multipart uploads",
                                 pending,
-                                orphans
+                                orphans,
+                                multipart
                             );
                         }
                     }

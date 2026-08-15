@@ -794,4 +794,155 @@ mod tests {
         let buckets = db.list_buckets().unwrap();
         assert!(buckets.is_empty(), "New DB should have no buckets");
     }
+
+    // ---- Multipart abort + abandoned-upload vacuum ----
+
+    #[tokio::test]
+    async fn test_abort_multipart_upload_removes_upload_and_parts() {
+        let t = make_test_engine();
+        let engine = &t.engine;
+        engine.create_bucket("mp-bucket").await.unwrap();
+
+        let upload_id = "multipart-abort-test";
+        engine
+            .create_multipart_upload("mp-bucket", "big.bin", upload_id, None)
+            .await
+            .unwrap();
+        engine
+            .upload_part("mp-bucket", upload_id, 1, b"part-one")
+            .await
+            .unwrap();
+        engine
+            .upload_part("mp-bucket", upload_id, 2, b"part-two")
+            .await
+            .unwrap();
+
+        assert_eq!(engine.list_multipart_parts(upload_id).await.unwrap().len(), 2);
+        assert!(engine.get_multipart_upload(upload_id).await.unwrap().is_some());
+
+        engine.abort_multipart_upload(upload_id).await.unwrap();
+
+        assert!(engine.get_multipart_upload(upload_id).await.unwrap().is_none());
+        assert!(engine.list_multipart_parts(upload_id).await.unwrap().is_empty());
+
+        // Idempotent: aborting again is a no-op.
+        engine.abort_multipart_upload(upload_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_abort_does_not_delete_completed_object_parts() {
+        let t = make_test_engine();
+        let engine = &t.engine;
+        engine.create_bucket("mp-bucket").await.unwrap();
+
+        let upload_id = "multipart-complete-then-abort";
+        engine
+            .create_multipart_upload("mp-bucket", "big.bin", upload_id, None)
+            .await
+            .unwrap();
+        engine
+            .upload_part("mp-bucket", upload_id, 1, b"aaa")
+            .await
+            .unwrap();
+        engine
+            .upload_part("mp-bucket", upload_id, 2, b"bbb")
+            .await
+            .unwrap();
+
+        let etag = engine
+            .complete_multipart_upload("mp-bucket", upload_id, None)
+            .await
+            .unwrap();
+        assert!(!etag.is_empty());
+
+        // Completed upload has no multipart_uploads row, but parts are retained
+        // for read assembly.
+        assert!(engine.get_multipart_upload(upload_id).await.unwrap().is_none());
+        assert_eq!(engine.list_multipart_parts(upload_id).await.unwrap().len(), 2);
+
+        // Aborting the now-completed upload_id must preserve the retained parts.
+        engine.abort_multipart_upload(upload_id).await.unwrap();
+        assert_eq!(engine.list_multipart_parts(upload_id).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_vacuum_sweeps_abandoned_multipart_upload() {
+        use crate::storage::engine::{BackendHandle, StorageEngine};
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
+
+        let handles = vec![BackendHandle::new(
+            Box::new(MockBackend::new("mock-a")),
+            "/mnt/mock-a".to_string(),
+            "mock-a".to_string(),
+            10,
+        )];
+        let engine = StorageEngine::from_backends(handles, db);
+        engine.create_bucket("mp-bucket").await.unwrap();
+
+        let upload_id = "multipart-abandoned";
+        engine
+            .create_multipart_upload("mp-bucket", "big.bin", upload_id, None)
+            .await
+            .unwrap();
+        engine
+            .upload_part("mp-bucket", upload_id, 1, b"part-one")
+            .await
+            .unwrap();
+
+        // Backdate the in-progress upload beyond the 24h timeout.
+        let old = chrono::Utc::now().timestamp() - (48 * 60 * 60);
+        {
+            let meta = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
+            meta.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE multipart_uploads SET created = ?1 WHERE upload_id = ?2",
+                    rusqlite::params![old, upload_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        let (pending, orphans, multipart) = engine.vacuum(false).await.unwrap();
+        assert_eq!(multipart, 1);
+        assert_eq!(pending, 0);
+        assert_eq!(orphans, 0);
+
+        assert!(engine.get_multipart_upload(upload_id).await.unwrap().is_none());
+        assert!(engine.list_multipart_parts(upload_id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_vacuum_leaves_recent_multipart_upload_alone() {
+        use crate::storage::engine::{BackendHandle, StorageEngine};
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(dir.path().join("test.db").to_str().unwrap()).unwrap();
+
+        let handles = vec![BackendHandle::new(
+            Box::new(MockBackend::new("mock-a")),
+            "/mnt/mock-a".to_string(),
+            "mock-a".to_string(),
+            10,
+        )];
+        let engine = StorageEngine::from_backends(handles, db);
+        engine.create_bucket("mp-bucket").await.unwrap();
+
+        let upload_id = "multipart-recent";
+        engine
+            .create_multipart_upload("mp-bucket", "big.bin", upload_id, None)
+            .await
+            .unwrap();
+        engine
+            .upload_part("mp-bucket", upload_id, 1, b"part-one")
+            .await
+            .unwrap();
+
+        // created = now, so it must NOT be swept.
+        let (pending, orphans, multipart) = engine.vacuum(false).await.unwrap();
+        assert_eq!(multipart, 0);
+        assert!(engine.get_multipart_upload(upload_id).await.unwrap().is_some());
+        assert_eq!(engine.list_multipart_parts(upload_id).await.unwrap().len(), 1);
+    }
 }

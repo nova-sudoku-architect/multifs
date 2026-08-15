@@ -989,6 +989,22 @@ impl MetadataDb {
             Ok(v)
         })
     }
+
+    /// In-progress multipart uploads initiated before `cutoff_sec` (epoch
+    /// seconds) that were never completed — safe to reclaim. Returns upload_ids.
+    pub fn list_abandoned_multipart_uploads(&self, cutoff_sec: i64) -> anyhow::Result<Vec<String>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT upload_id FROM multipart_uploads WHERE created < ?1",
+            )?;
+            let rows = stmt.query_map(params![cutoff_sec], |row| row.get::<_, String>(0))?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            Ok(v)
+        })
+    }
 }
 
 #[cfg(test)]

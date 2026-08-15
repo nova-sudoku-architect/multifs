@@ -805,14 +805,43 @@ async fn head_object(
     }
 }
 
-/// DELETE /{bucket}/{key} — Delete object
+/// DELETE /{bucket}/{key}[?uploadId=...] — Delete object, or abort an in-progress
+/// multipart upload when `uploadId` is present (S3 AbortMultipartUpload).
 async fn delete_object(
     State(state): State<S3State>,
     Path((bucket, key)): Path<(String, String)>,
-) -> StatusCode {
+    uri: axum::http::Uri,
+) -> Response {
+    // AbortMultipartUpload: DELETE /{bucket}/{key}?uploadId=...
+    if let Some(query_str) = uri.query() {
+        if query_str.contains("uploadId=") || query_str.contains("upload_id=") {
+            let q = parse_query(query_str);
+            let upload_id = q
+                .get("uploadId")
+                .or_else(|| q.get("upload_id"))
+                .cloned()
+                .unwrap_or_default();
+            match state.engine.abort_multipart_upload(&upload_id).await {
+                Ok(_) => return StatusCode::NO_CONTENT.into_response(),
+                Err(e) => {
+                    let xml = s3_error_xml(
+                        "InternalError",
+                        &e.to_string(),
+                        &format!("{}/{}", bucket, key),
+                    );
+                    return Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header("Content-Type", "application/xml")
+                        .body(Body::from(xml))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
     match state.engine.delete_object(&bucket, &key).await {
-        Ok(_) => StatusCode::NO_CONTENT,
-        Err(_) => StatusCode::NO_CONTENT, // S3 idempotent delete
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::NO_CONTENT.into_response(), // S3 idempotent delete
     }
 }
 
