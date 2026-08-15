@@ -199,6 +199,12 @@ and writes one committed version + file pointer at the existing remote path. Ide
 re-running on an already-managed path is a no-op, and it auto-creates the target bucket so
 the object appears in ListBuckets / ListObjectsV2.
 
+**Bulk scan:** `multifs import <email> --scan [--bucket <b>] [--prefix <p>] [--dry-run]`
+recursively lists the account (via non-recursive `listfolder` walks, since recursive mode
+omits the per-entry `path`) and imports every file not yet managed. It skips multipart
+staging (`__mp__/`) and already-managed paths. Key = the full pCloud path with the leading
+slash stripped; bucket defaults to `video`. `--dry-run` reports without writing.
+
 > ⚠️ **Delete-safety:** an imported object's blob is indistinguishable from a multifs-owned
 > blob. Deleting the multifs record (and later `vacuum`) will delete the source file from
 > pCloud. Don't delete the multifs record for files that still matter elsewhere.
@@ -307,6 +313,8 @@ multifs shard status                 Show account fill levels
 multifs audit scan|list-files        Find files not managed by MultiFS
 multifs import <email> <path> \      Register an existing pCloud file (metadata only)
     --bucket <b> [--key <k>]
+multifs import <email> --scan \      Bulk-import every unmanaged file in the account
+    [--bucket <b>] [--prefix <p>] [--dry-run]
 multifs vacuum [--dry-run]           GC superseded + abandoned version blobs + abandoned multipart uploads
 ```
 

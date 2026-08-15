@@ -35,7 +35,7 @@ multifs serve
 | **HTTP Range streaming** — Range forwarded to the pCloud CDN (start/end) | ✅ |
 | **Tiered placement** — cloud-first, local disk as last resort (per-account `priority`) | ✅ |
 | **`vacuum` garbage collection** — reclaims superseded + abandoned versions + abandoned multipart uploads | ✅ |
-| **`import` command** — register an existing pCloud file (metadata only, no data movement) | ✅ |
+| **`import` command** — register existing pCloud file(s) (metadata only, single-file or `--scan`) | ✅ |
 | **CLI management** — accounts, buckets, objects, shards, audit | ✅ |
 | WebDAV | ❌ Removed |
 | NFS | ❌ Stub (port not exposed) |
@@ -155,8 +155,10 @@ multifs audit list-files <email>  List all files (managed + orphaned)
 
 multifs import <email> <path> --bucket <b> [--key <k>]
                                   Register an existing pCloud file (metadata only)
+multifs import <email> --scan [--bucket <b>] [--prefix <p>] [--dry-run]
+                                  Bulk-import every unmanaged file in the account
 
-multifs vacuum [--dry-run]        GC superseded + abandoned version blobs
+multifs vacuum [--dry-run]        GC superseded + abandoned version blobs + abandoned multipart uploads
 ```
 
 ## Garbage Collection
