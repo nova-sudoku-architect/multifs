@@ -543,6 +543,84 @@ impl MetadataDb {
         })
     }
 
+    /// Adopt an existing remote file into the object index without moving data.
+    ///
+    /// Creates a committed version row + file pointer in a single transaction,
+    /// pointing at the existing `remote_path`. Used to register files that were
+    /// uploaded to pCloud outside of multifs (e.g. by the video-subtitle pipeline).
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        account_email: &str,
+        remote_path: &str,
+        size: i64,
+        etag: &str,
+        last_modified: &str,
+        content_type: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let result = (|| -> anyhow::Result<()> {
+                let now = chrono::Utc::now().timestamp_millis();
+                let version: i64 = conn.query_row(
+                    "SELECT COALESCE(MAX(version), 0) + 1 FROM versions WHERE bucket_name = ?1 AND key = ?2",
+                    params![bucket, key],
+                    |row| row.get(0),
+                )?;
+                conn.execute(
+                    "INSERT INTO versions (bucket_name, key, version, size, etag, last_modified, content_type, account_email, remote_path, status, created_at, superseded_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'committed', ?10, NULL)",
+                    params![bucket, key, version, size, etag, last_modified, content_type, account_email, remote_path, now],
+                )?;
+                conn.execute(
+                    "INSERT INTO files (bucket_name, key, current_version, size, etag, last_modified, content_type)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(bucket_name, key) DO UPDATE SET
+                       current_version = excluded.current_version,
+                       size = excluded.size,
+                       etag = excluded.etag,
+                       last_modified = excluded.last_modified,
+                       content_type = excluded.content_type",
+                    params![bucket, key, version, size, etag, last_modified, content_type],
+                )?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT;")?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    /// Return the (bucket, key) under which `remote_path` is already tracked for
+    /// `account_email`, if any (committed versions only).
+    pub fn find_object_by_remote_path(
+        &self,
+        account_email: &str,
+        remote_path: &str,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        self.with_conn(|conn| {
+            let found: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT bucket_name, key FROM versions
+                     WHERE account_email = ?1 AND remote_path = ?2 AND status = 'committed'
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![account_email, remote_path],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            Ok(found)
+        })
+    }
+
     pub fn get_object(&self, bucket: &str, key: &str) -> anyhow::Result<Option<ObjectRecord>> {
         self.with_conn(|conn| {
             let sql = format!(

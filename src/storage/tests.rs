@@ -42,6 +42,52 @@ mod tests {
     }
 
     #[test]
+    fn test_import_object_and_find_by_remote_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
+        db.create_bucket("test").unwrap();
+
+        // Import an existing remote file (metadata only).
+        db.import_object(
+            "test",
+            "blor-025.mkv",
+            "acct1",
+            "/video-subtitle/blor-025/blor-025.mkv",
+            12345,
+            "hash123",
+            "2026-07-16T21:24:59.000Z",
+            Some("video/x-matroska"),
+        )
+        .unwrap();
+
+        // It is now resolvable as an object.
+        let obj = db.get_object("test", "blor-025.mkv").unwrap().unwrap();
+        assert_eq!(obj.key, "blor-025.mkv");
+        assert_eq!(obj.size, 12345);
+        assert_eq!(obj.etag, "hash123");
+        assert_eq!(obj.remote_path, "/video-subtitle/blor-025/blor-025.mkv");
+        assert_eq!(obj.account_email, "acct1");
+        assert_eq!(obj.content_type.as_deref(), Some("video/x-matroska"));
+
+        // find_object_by_remote_path resolves it.
+        let found = db
+            .find_object_by_remote_path("acct1", "/video-subtitle/blor-025/blor-025.mkv")
+            .unwrap();
+        assert_eq!(found, Some(("test".to_string(), "blor-025.mkv".to_string())));
+
+        // Unknown path / account returns None.
+        assert!(db
+            .find_object_by_remote_path("acct1", "/nope")
+            .unwrap()
+            .is_none());
+        assert!(db
+            .find_object_by_remote_path("acct2", "/video-subtitle/blor-025/blor-025.mkv")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn test_put_get_object() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");

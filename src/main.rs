@@ -38,6 +38,8 @@ enum Cli {
     Status,
     /// Audit pCloud accounts — find files not managed by MultiFS
     Audit(cli::audit_cmd::AuditArgs),
+    /// Import an existing pCloud file into MultiFS (register metadata only)
+    Import(cli::import_cmd::ImportArgs),
     /// Garbage-collect superseded and abandoned object versions
     Vacuum(cli::vacuum_cmd::VacuumArgs),
 }
@@ -64,6 +66,7 @@ async fn main() -> Result<()> {
         Cli::Shard(args) => cli::shard_cmd::run(args).await?,
         Cli::Status => cli::status::run_status().await?,
         Cli::Audit(args) => cli::audit_cmd::run(args).await?,
+        Cli::Import(args) => cli::import_cmd::run(args).await?,
         Cli::Vacuum(args) => cli::vacuum_cmd::run(args).await?,
     }
 
