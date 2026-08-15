@@ -37,6 +37,7 @@ quick-xml = { version = "0.37", features = ["serialize"] }
 
 # Storage
 rusqlite = { version = "0.34", features = ["bundled"] }
+libc = "0.2"
 
 # Logging
 tracing = "0.1"

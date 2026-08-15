@@ -101,6 +101,10 @@ impl StorageEngine {
                     let b = super::backends::pcloud::PCloudBackend::new(acct)?;
                     Box::new(b)
                 }
+                Some("local") | Some("disk") | Some("local-disk") => {
+                    let b = super::backends::local_disk::LocalDiskBackend::new(acct)?;
+                    Box::new(b)
+                }
                 Some(other) => anyhow::bail!("Unknown backend type: {}", other),
             };
             handles.push(BackendHandle::new(

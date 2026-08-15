@@ -118,16 +118,18 @@ pub struct StorageConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountConfig {
-    /// Email of the pCloud account
+    /// Email of the pCloud account (or a label for non-cloud backends)
     pub email: String,
-    /// Backend type: "pcloud" (default), "box", "s3-compatible", etc
+    /// Backend type: "pcloud" (default), "local" (local disk)
     pub backend_type: Option<String>,
     /// Environment variable name that holds the OAuth token
     pub token_env: Option<String>,
-    /// Base path prefix on pCloud (e.g., "/multifs/00")
+    /// Base path prefix (e.g., "/multifs/00")
     pub mount_prefix: String,
     /// Quota in GB (optional, for display/sharding decisions)
     pub quota_gb: Option<u64>,
+    /// Local disk root directory (required for backend_type = "local")
+    pub path: Option<String>,
     /// Explicit OAuth token (insecure, prefer token_env)
     #[serde(skip)]
     pub token_override: Option<String>,

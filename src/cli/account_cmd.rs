@@ -135,6 +135,7 @@ pub async fn run(args: AccountArgs) -> Result<()> {
                 token_env: Some(token_env.clone()),
                 mount_prefix,
                 quota_gb,
+                path: None,
                 token_override: None,
             };
 
@@ -295,6 +296,7 @@ mod tests {
             token_env: Some(token_env_name(email)),
             mount_prefix: "/mnt/test".to_string(),
             quota_gb: Some(10),
+            path: None,
             token_override: None,
         }
     }

@@ -68,3 +68,4 @@ pub trait StorageBackend: Send + Sync {
 }
 
 pub mod pcloud;
+pub mod local_disk;
