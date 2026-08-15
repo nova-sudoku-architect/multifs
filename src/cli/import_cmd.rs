@@ -115,6 +115,7 @@ async fn scan_and_import(args: &ImportArgs) -> Result<()> {
     // the per-entry `path` field (it only returns `name` + `parentfolderid`).
     let client = reqwest::Client::new();
     let prefix = args.prefix.trim_end_matches('/');
+    let prefix = if prefix.is_empty() { "/" } else { prefix };
     let mut candidates: Vec<(String, i64, String, String, Option<String>)> = Vec::new();
     let mut dirs: Vec<String> = vec![prefix.to_string()];
     while let Some(dir) = dirs.pop() {
