@@ -130,6 +130,10 @@ pub struct AccountConfig {
     pub quota_gb: Option<u64>,
     /// Local disk root directory (required for backend_type = "local")
     pub path: Option<String>,
+    /// Placement priority (lower = preferred). Backends are filled from the
+    /// lowest priority first, falling back to higher priorities only when the
+    /// preferred tiers are full. Defaults: 0 for cloud backends, 1 for "local".
+    pub priority: Option<u32>,
     /// Explicit OAuth token (insecure, prefer token_env)
     #[serde(skip)]
     pub token_override: Option<String>,

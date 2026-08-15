@@ -36,6 +36,7 @@ pub struct BackendHandle {
     pub mount_prefix: String,
     pub label: String,
     pub quota_gb: u64,
+    pub priority: u32,
 }
 
 impl BackendHandle {
@@ -50,7 +51,14 @@ impl BackendHandle {
             mount_prefix,
             label,
             quota_gb,
+            priority: 0,
         }
+    }
+
+    /// Set the placement priority (lower = preferred).
+    pub fn with_priority(mut self, priority: u32) -> Self {
+        self.priority = priority;
+        self
     }
 }
 
@@ -82,6 +90,9 @@ const QUOTA_REFRESH_MS: u128 = 60_000;
 const GRACE_PERIOD_MS: i64 = 10 * 60 * 1000;
 /// How long an abandoned (pending) upload is kept before vacuum sweeps it.
 const PENDING_TIMEOUT_MS: i64 = 60 * 60 * 1000;
+/// Fill ratio at or above which a backend is treated as full (no free space)
+/// for tiered placement. 1.0 = any free space counts as available.
+const FULL_FILL_RATIO: f64 = 1.0;
 
 impl StorageEngine {
     pub fn new(cfg: &Config, meta: MetadataDb) -> anyhow::Result<Self> {
@@ -107,14 +118,34 @@ impl StorageEngine {
                 }
                 Some(other) => anyhow::bail!("Unknown backend type: {}", other),
             };
-            handles.push(BackendHandle::new(
-                backend,
-                acct.mount_prefix.clone(),
-                acct.email.clone(),
-                acct.quota_gb.unwrap_or(10),
-            ));
+            handles.push(
+                BackendHandle::new(
+                    backend,
+                    acct.mount_prefix.clone(),
+                    acct.email.clone(),
+                    acct.quota_gb.unwrap_or(10),
+                )
+                .with_priority(Self::default_priority(acct)),
+            );
         }
         Ok(handles)
+    }
+
+    /// Default placement priority for an account: 0 for cloud backends,
+    /// 1 for local disk (so local disk is the last resort by default).
+    fn default_priority(acct: &crate::config::AccountConfig) -> u32 {
+        if let Some(p) = acct.priority {
+            return p;
+        }
+        let is_local = matches!(
+            acct.backend_type.as_deref(),
+            Some("local") | Some("disk") | Some("local-disk")
+        );
+        if is_local {
+            1
+        } else {
+            0
+        }
     }
 
     pub fn from_backends(handles: Vec<BackendHandle>, meta: MetadataDb) -> Self {
@@ -161,6 +192,35 @@ impl StorageEngine {
             }
             PlacementStrategy::Utilization => {
                 let cached = self.cached_quotas.lock().await;
+                // Distinct priority levels, ascending: lowest number = most
+                // preferred tier. Fill preferred tiers first; spill to a lower
+                // priority only when every preferred tier is full.
+                let mut levels: Vec<u32> = self.backends.iter().map(|h| h.priority).collect();
+                levels.sort_unstable();
+                levels.dedup();
+
+                for level in &levels {
+                    let mut best: Option<usize> = None;
+                    for (i, h) in self.backends.iter().enumerate() {
+                        if h.priority != *level {
+                            continue;
+                        }
+                        let fill = cached.per_backend[i].fill_ratio;
+                        match best {
+                            None => best = Some(i),
+                            Some(b) if fill < cached.per_backend[b].fill_ratio => best = Some(i),
+                            Some(_) => {}
+                        }
+                    }
+                    if let Some(b) = best {
+                        if cached.per_backend[b].fill_ratio < FULL_FILL_RATIO {
+                            return Ok(b);
+                        }
+                        // This tier is full — fall through to the next priority.
+                    }
+                }
+
+                // All tiers full: least-full overall as a best effort.
                 let (best_idx, _) = cached
                     .per_backend
                     .iter()

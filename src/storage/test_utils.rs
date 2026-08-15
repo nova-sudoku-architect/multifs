@@ -9,13 +9,20 @@ use crate::storage::backends::{StorageBackend, StorageFile};
 pub struct MockBackend {
     pub name: String,
     pub files: Mutex<HashMap<String, Vec<u8>>>,
+    pub total: i64,
 }
 
 impl MockBackend {
     pub fn new(name: &str) -> Self {
+        Self::with_total(name, 1_000_000_000)
+    }
+
+    /// Mock backend with a configurable quota total (so a small file can fill it).
+    pub fn with_total(name: &str, total: i64) -> Self {
         Self {
             name: name.to_string(),
             files: Mutex::new(HashMap::new()),
+            total,
         }
     }
 
@@ -29,6 +36,7 @@ impl Clone for MockBackend {
         Self {
             name: self.name.clone(),
             files: Mutex::new(self.files.lock().unwrap().clone()),
+            total: self.total,
         }
     }
 }
@@ -41,7 +49,7 @@ impl StorageBackend for MockBackend {
 
     async fn check_quota(&self) -> anyhow::Result<(i64, i64)> {
         let used: i64 = self.files.lock().unwrap().values().map(|v| v.len() as i64).sum();
-        Ok((used, 1_000_000_000))
+        Ok((used, self.total))
     }
 
     async fn upload(&self, remote_path: &str, data: &[u8]) -> anyhow::Result<(String, i64)> {

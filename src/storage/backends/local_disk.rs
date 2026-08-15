@@ -327,6 +327,7 @@ mod tests {
             mount_prefix: "/multifs/local-test".to_string(),
             quota_gb: None,
             path: Some(tmp.path().to_string_lossy().to_string()),
+            priority: None,
             token_override: None,
         };
         LocalDiskBackend::new(&cfg).unwrap()

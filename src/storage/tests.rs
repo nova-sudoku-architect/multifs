@@ -446,6 +446,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_utilization_prefers_cloud_over_local() {
+        use crate::storage::engine::{BackendHandle, StorageEngine};
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(dir.path().join("test.db").to_str().unwrap()).unwrap();
+
+        // Cloud (priority 0) and local (priority 1) both empty → cloud preferred.
+        let handles = vec![
+            BackendHandle::new(
+                Box::new(MockBackend::new("cloud")),
+                "/cloud".to_string(),
+                "cloud".to_string(),
+                10,
+            )
+            .with_priority(0),
+            BackendHandle::new(
+                Box::new(MockBackend::new("local")),
+                "/local".to_string(),
+                "local".to_string(),
+                10,
+            )
+            .with_priority(1),
+        ];
+        let engine = StorageEngine::from_backends(handles, db);
+        let info = engine.put_object("tier-bucket", "k", b"data").await.unwrap();
+        assert_eq!(info.account_email, "cloud");
+    }
+
+    #[tokio::test]
+    async fn test_utilization_falls_back_to_local_when_cloud_full() {
+        use crate::storage::engine::{BackendHandle, StorageEngine};
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(dir.path().join("test.db").to_str().unwrap()).unwrap();
+
+        // Cloud (priority 0) is full (10/10 bytes); local (priority 1) is empty.
+        let cloud = MockBackend::with_total("cloud", 10);
+        cloud
+            .files
+            .lock()
+            .unwrap()
+            .insert("/full".to_string(), vec![0u8; 10]);
+        let handles = vec![
+            BackendHandle::new(Box::new(cloud), "/cloud".to_string(), "cloud".to_string(), 10)
+                .with_priority(0),
+            BackendHandle::new(
+                Box::new(MockBackend::new("local")),
+                "/local".to_string(),
+                "local".to_string(),
+                10,
+            )
+            .with_priority(1),
+        ];
+        let engine = StorageEngine::from_backends(handles, db);
+        let info = engine.put_object("tier-bucket", "k", b"data").await.unwrap();
+        assert_eq!(info.account_email, "local");
+    }
+
+    #[tokio::test]
     async fn test_engine_delete_bucket_with_mixed_files() {
         let t = make_test_engine();
         let engine = &t.engine;

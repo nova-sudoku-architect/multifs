@@ -136,6 +136,7 @@ pub async fn run(args: AccountArgs) -> Result<()> {
                 mount_prefix,
                 quota_gb,
                 path: None,
+                priority: None,
                 token_override: None,
             };
 
@@ -297,6 +298,7 @@ mod tests {
             mount_prefix: "/mnt/test".to_string(),
             quota_gb: Some(10),
             path: None,
+            priority: None,
             token_override: None,
         }
     }
