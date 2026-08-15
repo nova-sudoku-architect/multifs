@@ -19,7 +19,7 @@ blob in place.
 | Single-blob storage | ✅ Live | Each object = one blob on one pCloud account (no chunking) |
 | MVCC versioned overwrite | ✅ Live | Copy-on-write: new version + atomic pointer flip, old blob kept for grace period |
 | Range streaming | ✅ Live | HTTP Range forwarded to pCloud CDN (start/end) |
-| S3 multipart upload | ✅ Live | Initiate / UploadPart / Complete / ListParts; parts persisted and assembled |
+| S3 multipart upload | ✅ Live | Initiate / UploadPart / Complete / ListParts / Abort; parts persisted and assembled |
 | `vacuum` GC | ✅ Live | Reclaims abandoned `pending` and superseded (orphaned) version blobs |
 | `import` command | ✅ Live | Register an existing pCloud file into the DB (metadata only) |
 | Placement | ✅ Live | Tiered: cloud-first, local disk as last resort (per-account `priority`) |
@@ -207,19 +207,18 @@ the object appears in ListBuckets / ListObjectsV2.
 
 ## Garbage Collection (`vacuum`)
 
-Background / on-demand (`multifs vacuum [--dry-run]`), idempotent. Two sweeps:
+Background (the server runs a vacuum every 10 minutes) or on-demand
+(`multifs vacuum [--dry-run]`), idempotent. Three sweeps:
 
 1. **Pending sweep** — `status='pending' AND now - created_at > 1h` → delete blob + row.
 2. **Orphan sweep** — `superseded_at IS NOT NULL AND now - superseded_at > 10min` → delete blob + row.
+3. **Multipart sweep** — in-progress uploads whose `multipart_uploads.created` (epoch
+   seconds) is older than 24h → `abort_multipart_upload` deletes each part blob, then the
+   `multipart_uploads` + `multipart_parts` rows.
 
 `superseded_at` protects in-flight readers: an old version becomes vacuumable only after
-it has been superseded for the grace window.
-
-> ⚠️ **Abandoned multipart uploads are NOT swept.** An upload initiated but never completed
-> (and never aborted — there is no AbortMultipartUpload handler) leaves its
-> `multipart_uploads` row, any `multipart_parts` rows, and the staged part blobs under
-> `__mp__/{upload_id}/` on pCloud. `vacuum` only reads the `versions` table, so these leak.
-> See Known Issues → High.
+it has been superseded for the grace window. Completed multipart objects (no
+`multipart_uploads` row) are never swept, so their retained parts survive for read assembly.
 
 ---
 
@@ -236,6 +235,8 @@ Each part is stored as one standalone blob under `{mount}/{bucket}/__mp__/{uploa
   subsequent GETs can assemble the object from its parts.
 - **ListParts** (`GET /key?uploadId=X`) → returns the staged part numbers/sizes for
   rclone resume/verify.
+- **Abort** (`DELETE /key?uploadId=X`) → deletes the staged part blobs and the
+  `multipart_uploads` + `multipart_parts` rows. Idempotent; no-op on completed uploads.
 
 ---
 
@@ -306,7 +307,7 @@ multifs shard status                 Show account fill levels
 multifs audit scan|list-files        Find files not managed by MultiFS
 multifs import <email> <path> \      Register an existing pCloud file (metadata only)
     --bucket <b> [--key <k>]
-multifs vacuum [--dry-run]           GC superseded + abandoned version blobs
+multifs vacuum [--dry-run]           GC superseded + abandoned version blobs + abandoned multipart uploads
 ```
 
 ---
@@ -316,26 +317,21 @@ multifs vacuum [--dry-run]           GC superseded + abandoned version blobs
 ### High
 1. **No erasure coding** — each blob lives on a single account; an account failure
    loses those blobs. (Single-blob model is a deliberate simplification.)
-2. **Abandoned multipart uploads leak** — initiated-but-never-completed uploads (and their
-   staged part blobs) are never reclaimed: `vacuum` doesn't scan the `multipart_uploads` /
-   `multipart_parts` tables, and there is no AbortMultipartUpload handler.
-3. **S3 body buffering** — uploads buffer the body in memory before streaming to pCloud.
+2. **S3 body buffering** — uploads buffer the body in memory before streaming to pCloud.
 
 ### Medium
-4. **No upload retry on pCloud errors** — quota-full (2008), rate limit (429), auth
+3. **No upload retry on pCloud errors** — quota-full (2008), rate limit (429), auth
    failure (2094) all fail immediately.
-5. **Vacuum is on-demand** — no automatic background scheduler wired yet; run `multifs vacuum`
-   via cron/systemd timer for continuous GC.
 
 ### Low
-6. **Config still references `cache_chunks` / `cache_size_mb`** — legacy from the chunked
+4. **Config still references `cache_chunks` / `cache_size_mb`** — legacy from the chunked
    architecture; harmless but unused.
 
 ---
 
 ## Test Coverage
 
-All 107 lib tests pass (`cargo test --lib`). Highlights:
+All 111 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_multipart_part_body_is_consumed_and_stored` — multipart round-trip + assembly.
 - `test_s3_multipart_roundtrip_stores_object` — total size + ETag correctness.
 - `test_concurrent_streaming` — concurrent range streams (range-aware mock).

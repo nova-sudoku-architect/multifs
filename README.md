@@ -30,11 +30,11 @@ multifs serve
 | Feature | Status |
 |---------|--------|
 | **S3-compatible API** — ListBuckets, Create/DeleteBucket, Put/Get/Head/Delete Object, ListObjectsV2 | ✅ |
-| **S3 multipart upload** — Initiate / UploadPart / Complete / ListParts (rclone >64 MB) | ✅ |
+| **S3 multipart upload** — Initiate / UploadPart / Complete / ListParts / Abort (rclone >64 MB) | ✅ |
 | **Single-blob MVCC versioning** — copy-on-write overwrite, old version kept for a grace period | ✅ |
 | **HTTP Range streaming** — Range forwarded to the pCloud CDN (start/end) | ✅ |
 | **Tiered placement** — cloud-first, local disk as last resort (per-account `priority`) | ✅ |
-| **`vacuum` garbage collection** — reclaims superseded + abandoned version blobs | ✅ |
+| **`vacuum` garbage collection** — reclaims superseded + abandoned versions + abandoned multipart uploads | ✅ |
 | **`import` command** — register an existing pCloud file (metadata only, no data movement) | ✅ |
 | **CLI management** — accounts, buckets, objects, shards, audit | ✅ |
 | WebDAV | ❌ Removed |
@@ -161,14 +161,17 @@ multifs vacuum [--dry-run]        GC superseded + abandoned version blobs
 
 ## Garbage Collection
 
-`multifs vacuum [--dry-run]` reclaims blobs no live file references:
+`multifs vacuum [--dry-run]` reclaims blobs no live file references (the server also runs
+it automatically every 10 minutes):
 
 1. **Abandoned uploads** — `pending` versions older than 1 hour (reserved but never committed).
 2. **Superseded versions** — committed versions whose `superseded_at` is older than 10 minutes.
+3. **Abandoned multipart uploads** — in-progress uploads initiated more than 24 hours ago:
+   their staged part blobs, `multipart_uploads` and `multipart_parts` rows are all reclaimed.
 
-> ⚠️ **Not yet swept:** abandoned *multipart* uploads (initiated but never completed) leave
-> their `multipart_uploads` / `multipart_parts` rows and staged part blobs on pCloud. See
-> `docs/architecture.md` → Known Issues.
+Completed multipart objects keep their part rows for read assembly and are left untouched.
+In-progress uploads can also be cancelled explicitly via S3 AbortMultipartUpload
+(`DELETE /bucket/key?uploadId=...`).
 
 ## Deploy
 
