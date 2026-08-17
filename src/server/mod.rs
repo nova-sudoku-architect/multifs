@@ -1,5 +1,6 @@
 pub mod s3;
 pub mod nfs;
+pub mod web;
 
 #[cfg(test)]
 mod handler_tests;
@@ -153,17 +154,39 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         });
     }
 
-    // Build S3 app (the only protocol server)
+    // Build protocol server tasks (S3 API + optional read-only web UI).
+    let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
+
     if cfg.server.enable_s3 {
         let s3_app = s3::build_router(engine.clone());
         let s3_addr = format!("{}:{}", cfg.server.bind, cfg.server.s3_port);
         let listener = tokio::net::TcpListener::bind(&s3_addr).await?;
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, s3_app).await
-        });
         tracing::info!("S3 API listening on {}", s3_addr);
-        handle.await?;
+        tasks.push(tokio::spawn(async move {
+            axum::serve(listener, s3_app).await.map_err(anyhow::Error::from)
+        }));
     }
 
-    Ok(())
+    if cfg.server.enable_web {
+        let web_app = web::build_router(engine.clone());
+        let web_addr = format!("{}:{}", cfg.server.bind, cfg.server.web_port);
+        let listener = tokio::net::TcpListener::bind(&web_addr).await?;
+        tracing::info!("Read-only web UI listening on {}", web_addr);
+        tasks.push(tokio::spawn(async move {
+            axum::serve(listener, web_app).await.map_err(anyhow::Error::from)
+        }));
+    }
+
+    if tasks.is_empty() {
+        anyhow::bail!(
+            "no protocol servers enabled: set server.enable_s3 or server.enable_web to true"
+        );
+    }
+
+    // Run all protocol servers concurrently; propagate the first fatal error.
+    let (first, _, _) = futures::future::select_all(tasks).await;
+    match first {
+        Ok(res) => res,
+        Err(join_err) => Err(anyhow::anyhow!("server task panicked: {}", join_err)),
+    }
 }

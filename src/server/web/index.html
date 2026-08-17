@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MultiFS — Read-only Browser</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #161a24; --panel2: #1d2330;
+    --border: #2a3140; --text: #e6e9ef; --muted: #8b93a7;
+    --accent: #4c8dff; --accent2: #6ea8ff;
+    --folder: #e6b95c; --file: #7cc4ff; --size: #9aa3b8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    background: var(--panel); position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  header h1 span { color: var(--accent2); }
+  .crumb {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+    margin-top: 8px; font-size: 13px;
+  }
+  .crumb a { color: var(--accent2); text-decoration: none; cursor: pointer; }
+  .crumb a:hover { text-decoration: underline; }
+  .crumb .sep { color: var(--muted); }
+  .crumb .cur { color: var(--muted); }
+  main { padding: 16px 20px; max-width: 1080px; margin: 0 auto; }
+  .table { width: 100%; border-collapse: collapse; }
+  .table th {
+    text-align: left; font-weight: 500; color: var(--muted);
+    font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
+    padding: 8px 10px; border-bottom: 1px solid var(--border);
+  }
+  .table td { padding: 9px 10px; border-bottom: 1px solid var(--border); }
+  .table tr:hover td { background: var(--panel2); }
+  .row-link { cursor: pointer; }
+  .name { display: flex; align-items: center; gap: 9px; }
+  .ico { font-size: 16px; width: 20px; text-align: center; flex: none; }
+  .name a { color: var(--text); text-decoration: none; }
+  .row-link:hover .name a { color: var(--accent2); }
+  .size { color: var(--size); text-align: right; white-space: nowrap; }
+  .mtime { color: var(--muted); white-space: nowrap; }
+  .empty { padding: 40px 0; text-align: center; color: var(--muted); }
+  .note { color: var(--muted); font-size: 12px; margin-top: 14px; }
+  .badge {
+    display: inline-block; padding: 1px 8px; border-radius: 10px;
+    background: #223; color: var(--muted); font-size: 11px; margin-left: 8px;
+  }
+  a.file-link { color: var(--accent2); }
+  .spinner { color: var(--muted); padding: 40px 0; text-align: center; }
+  .icon-bucket { color: var(--folder); }
+  .icon-folder { color: var(--folder); }
+  .icon-file { color: var(--file); }
+</style>
+</head>
+<body>
+<header>
+  <h1>MultiFS <span>· read-only</span></h1>
+  <div class="crumb" id="crumb"></div>
+</header>
+<main id="main"><div class="spinner">Loading…</div></main>
+
+<script>
+const main = document.getElementById('main');
+const crumb = document.getElementById('crumb');
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
+function fmtSize(n) {
+  if (n == null) return '';
+  if (n < 1024) return n + ' B';
+  const units = ['KB','MB','GB','TB'];
+  let v = n, i = -1;
+  do { v /= 1024; i++; } while (v >= 1024 && i < units.length - 1);
+  return v.toFixed(v >= 100 ? 0 : 1) + ' ' + units[i];
+}
+
+function fmtDate(s) {
+  if (!s) return '';
+  const d = new Date(s.includes('T') ? s : s.replace(' ', 'T') + 'Z');
+  if (isNaN(d)) return s;
+  return d.toLocaleString(undefined, { year:'numeric', month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' });
+}
+
+async function jfetch(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error((await r.json().catch(()=>({}))).error || ('HTTP ' + r.status));
+  return r.json();
+}
+
+function renderCrumb(bucket, prefix) {
+  crumb.innerHTML = '';
+  const root = document.createElement('a');
+  root.textContent = 'Buckets';
+  root.onclick = () => loadBuckets();
+  crumb.appendChild(root);
+  if (bucket) {
+    crumb.appendChild(sep());
+    const b = document.createElement('a');
+    b.textContent = bucket;
+    b.onclick = () => loadList(bucket, '');
+    crumb.appendChild(b);
+    const parts = prefix.split('/').filter(Boolean);
+    let acc = '';
+    for (let i = 0; i < parts.length; i++) {
+      acc += parts[i] + '/';
+      crumb.appendChild(sep());
+      const p = document.createElement('a');
+      p.textContent = parts[i];
+      const target = acc;
+      p.onclick = () => loadList(bucket, target);
+      crumb.appendChild(p);
+    }
+  }
+}
+
+function sep() {
+  const s = document.createElement('span');
+  s.className = 'sep';
+  s.textContent = '›';
+  return s;
+}
+
+async function loadBuckets() {
+  renderCrumb('', '');
+  main.innerHTML = '<div class="spinner">Loading buckets…</div>';
+  try {
+    const data = await jfetch('/api/buckets');
+    const buckets = data.buckets || [];
+    if (!buckets.length) {
+      main.innerHTML = '<div class="empty">No buckets yet.</div>';
+      return;
+    }
+    let html = '<table class="table"><thead><tr><th>Name</th><th>Created</th></tr></thead><tbody>';
+    for (const b of buckets) {
+      html += `<tr class="row-link" data-bucket="${esc(b.name)}">
+        <td><div class="name"><span class="ico icon-bucket">🗂</span><a>${esc(b.name)}</a></div></td>
+        <td class="mtime">${esc(fmtDate(b.created_at))}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    main.innerHTML = html;
+    main.querySelectorAll('tr.row-link').forEach(tr => {
+      tr.onclick = () => loadList(tr.dataset.bucket, '');
+    });
+  } catch (e) {
+    main.innerHTML = `<div class="empty">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+async function loadList(bucket, prefix) {
+  renderCrumb(bucket, prefix);
+  main.innerHTML = '<div class="spinner">Loading…</div>';
+  try {
+    const q = new URLSearchParams({ bucket });
+    if (prefix) q.set('prefix', prefix);
+    const data = await jfetch('/api/list?' + q.toString());
+    const folders = data.prefixes || [];
+    const files = data.files || [];
+
+    if (!folders.length && !files.length) {
+      main.innerHTML = '<div class="empty">This folder is empty.</div>';
+      return;
+    }
+
+    let html = '<table class="table"><thead><tr><th>Name</th><th>Size</th><th>Modified</th></tr></thead><tbody>';
+    for (const f of folders) {
+      const name = f.replace(/\/$/, '').split('/').pop();
+      html += `<tr class="row-link" data-prefix="${esc(f)}">
+        <td><div class="name"><span class="ico icon-folder">📁</span><a>${esc(name)}/</a></div></td>
+        <td class="size"></td><td class="mtime"></td>
+      </tr>`;
+    }
+    for (const f of files) {
+      const name = f.key.split('/').pop();
+      const durl = '/api/download?' + new URLSearchParams({ bucket, key: f.key });
+      html += `<tr>
+        <td><div class="name"><span class="ico icon-file">📄</span><a class="file-link" href="${esc(durl)}">${esc(name)}</a></div></td>
+        <td class="size">${esc(fmtSize(f.size))}</td>
+        <td class="mtime">${esc(fmtDate(f.last_modified))}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    if (data.truncated) html += '<div class="note">⚠ Listing truncated (very large folder).</div>';
+    html += '<div class="note">Read-only — downloads only. Range requests supported for streaming.</div>';
+    main.innerHTML = html;
+    main.querySelectorAll('tr.row-link').forEach(tr => {
+      tr.onclick = () => loadList(bucket, tr.dataset.prefix);
+    });
+  } catch (e) {
+    main.innerHTML = `<div class="empty">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+loadBuckets();
+</script>
+</body>
+</html>

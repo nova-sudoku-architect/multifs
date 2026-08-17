@@ -66,6 +66,12 @@ pub struct ServerConfig {
     /// Whether to enable S3 server
     #[serde(default = "default_true")]
     pub enable_s3: bool,
+    /// Whether to enable the read-only web UI
+    #[serde(default)]
+    pub enable_web: bool,
+    /// Web UI port (read-only browser)
+    #[serde(default = "default_web_port")]
+    pub web_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +163,7 @@ impl AccountConfig {
 // Defaults
 fn default_bind() -> String { "0.0.0.0".to_string() }
 fn default_s3_port() -> u16 { 9000 }
+fn default_web_port() -> u16 { 9001 }
 fn default_nfs_port() -> u16 { 2049 }
 fn default_true() -> bool { true }
 fn default_meta_db() -> String {
@@ -177,6 +184,8 @@ impl Default for ServerConfig {
             nfs_port: default_nfs_port(),
             enable_nfs: true,
             enable_s3: true,
+            enable_web: false,
+            web_port: default_web_port(),
         }
     }
 }

@@ -39,6 +39,7 @@ multifs serve
 | **Content checksums** — SHA-256 stored per blob; `checksum rebuild|verify` detects in-place drift | ✅ |
 | **`fsck` health check** — DB integrity + backend presence/size + optional checksum verify | ✅ |
 | **CLI management** — accounts, buckets, objects, shards, audit | ✅ |
+| **Read-only web UI** — browser file navigator (GET-only: list buckets/objects, download) | ✅ |
 | WebDAV | ❌ Removed |
 | NFS | ❌ Stub (port not exposed) |
 | Erasure coding | ❌ Stub (single-blob model; each blob lives on one account) |
@@ -81,10 +82,12 @@ bind = "0.0.0.0"
 s3_port = 9000
 enable_s3 = true
 enable_nfs = false        # NFS is a stub
+enable_web = false        # read-only web UI (GET-only browser)
+web_port = 9001
 
 [storage]
 meta_db_path = "/var/lib/multifs/meta.db"
-placement_strategy = "utilization"   # or "round-robin"
+placement_strategy = "Utilization"   # or "RoundRobin"
 
 # pCloud account (cloud backends default to priority 0 = preferred)
 [[storage.accounts]]

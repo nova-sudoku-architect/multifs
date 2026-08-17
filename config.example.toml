@@ -10,6 +10,10 @@ nfs_port = 2049        # stub — NFS not implemented
 enable_s3 = true
 enable_nfs = false
 
+# Read-only web UI (browser file navigator; GET-only, no writes/deletes)
+enable_web = false
+web_port = 9001
+
 [tls]
 enabled = false
 # cert_path = "/path/to/server.crt"
@@ -22,7 +26,7 @@ cache_path = "/var/cache/multifs"
 cache_size_mb = 5120
 cache_chunks = 10
 # "utilization" (tiered, default) or "round-robin"
-placement_strategy = "utilization"
+placement_strategy = "Utilization"   # or "RoundRobin"
 
 # ---- pCloud account (cloud backends default to priority 0 = preferred) ----
 [[storage.accounts]]

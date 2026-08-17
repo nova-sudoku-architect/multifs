@@ -25,6 +25,7 @@ blob in place.
 | Content checksums | ✅ Live | SHA-256 stored per blob; `checksum rebuild|verify` detects in-place drift |
 | `fsck` health check | ✅ Live | DB integrity + backend presence/size + optional checksum verify |
 | Placement | ✅ Live | Tiered: cloud-first, local disk as last resort (per-account `priority`) |
+| Read-only web UI | ✅ Live | GET-only browser navigator: list buckets/objects + download (port 9001) |
 | Erasure coding | ❌ Stub | Not deployed (single-blob model; each blob lives on one account) |
 | NFS | ❌ Stub | Port 2049 not exposed |
 
@@ -184,6 +185,24 @@ On error/cancel, the version stays `pending` and is swept by `vacuum`.
   range directly to the pCloud CDN (`download_stream`).
 - Readers resolve the version **once at request start**, so an in-flight GET keeps
   streaming the old blob even after a concurrent commit flips the pointer.
+
+---
+
+## Read-Only Web UI
+
+A browser file navigator (port 9001, **disabled by default**) exposing **GET-only** endpoints over
+the same `StorageEngine` read path as S3. There is no write/delete/upload route, so the page is
+safe to expose to a wider audience (e.g. over Tailscale) without risking data loss.
+
+| Route | Method | Purpose |
+|-------|--------|---------|
+| `/` | GET | Single-file embedded UI (vanilla HTML+JS, no build step) |
+| `/api/buckets` | GET | List buckets (name + created_at) |
+| `/api/list?bucket=&prefix=` | GET | List a folder's direct children (prefixes + files + truncated flag) |
+| `/api/download?bucket=&key=` | GET | Stream a file; honors HTTP Range for seeking/streaming |
+
+Enabled via `server.enable_web = true` + `server.web_port` (default 9001). Folder grouping and
+range slicing reuse `group_objects_by_prefix` and `parse_range` from the shared server module.
 
 ---
 
@@ -366,7 +385,7 @@ multifs fsck [--checksums] [--fix]   Verify DB integrity + backend presence/size
 
 ## Test Coverage
 
-All 112 lib tests pass (`cargo test --lib`). Highlights:
+All 116 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_multipart_part_body_is_consumed_and_stored` — multipart round-trip + assembly.
 - `test_s3_multipart_roundtrip_stores_object` — total size + ETag correctness.
 - `test_concurrent_streaming` — concurrent range streams (range-aware mock).
@@ -384,10 +403,12 @@ Path: `/etc/multifs.toml`
 bind = "0.0.0.0"
 s3_port = 9000
 enable_s3 = true
+enable_web = false        # read-only web UI (GET-only browser)
+web_port = 9001
 
 [storage]
 meta_db_path = "/var/lib/multifs/meta.db"
-placement_strategy = "utilization"
+placement_strategy = "Utilization"
 
 [[storage.accounts]]
 email = "nova-video-01@agentmail.to"
