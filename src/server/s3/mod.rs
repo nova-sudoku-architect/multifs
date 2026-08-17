@@ -84,13 +84,34 @@ fn s3_error_xml(code: &str, message: &str, resource: &str) -> String {
     )
 }
 
+/// Normalize a stored creation timestamp into S3-spec RFC3339.
+/// The buckets table stores `datetime('now')` (e.g. "2026-07-25 00:23:03"),
+/// which S3 clients reject — they require "2026-07-25T00:23:03Z".
+fn to_rfc3339(s: &str) -> String {
+    let s = s.trim();
+    if s.contains('T') {
+        // Already ISO-8601-ish (may or may not carry a zone).
+        if s.ends_with('Z') || s.contains('+') || s.ends_with(']') {
+            s.to_string()
+        } else {
+            format!("{s}Z")
+        }
+    } else {
+        // SQLite datetime('now'): "YYYY-MM-DD HH:MM:SS[.fraction]"
+        s.replacen(' ', "T", 1)
+            .to_string()
+            + "Z"
+    }
+}
+
 fn s3_list_buckets_xml(buckets: &[(String, String)]) -> String {
     let buckets_xml: String = buckets
         .iter()
         .map(|(name, created)| {
             format!(
                 "<Bucket><Name>{}</Name><CreationDate>{}</CreationDate></Bucket>",
-                name, created
+                name,
+                to_rfc3339(created)
             )
         })
         .collect();
@@ -997,4 +1018,31 @@ fn to_http_date(last_modified: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(last_modified)
         .map(|dt| dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
         .unwrap_or_else(|_| last_modified.to_string())
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::to_rfc3339;
+
+    #[test]
+    fn sqlite_datetime_is_normalized_to_rfc3339() {
+        assert_eq!(to_rfc3339("2026-07-25 00:23:03"), "2026-07-25T00:23:03Z");
+        assert_eq!(to_rfc3339("2026-07-25 00:23:03.5"), "2026-07-25T00:23:03.5Z");
+    }
+
+    #[test]
+    fn already_rfc3339_is_unchanged() {
+        assert_eq!(
+            to_rfc3339("2026-08-13T23:09:13.877Z"),
+            "2026-08-13T23:09:13.877Z"
+        );
+    }
+
+    #[test]
+    fn zone_carrying_iso8601_is_preserved() {
+        assert_eq!(
+            to_rfc3339("2026-08-13T23:09:13+08:00"),
+            "2026-08-13T23:09:13+08:00"
+        );
+    }
 }
