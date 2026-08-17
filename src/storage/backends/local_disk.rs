@@ -228,6 +228,15 @@ impl StorageBackend for LocalDiskBackend {
         }
     }
 
+    async fn delete_folder_recursive(&self, remote_path: &str) -> anyhow::Result<Option<u64>> {
+        let local = self.to_local(remote_path);
+        match tokio::fs::remove_dir_all(&local).await {
+            Ok(_) => Ok(Some(0)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Some(0)),
+            Err(e) => Err(anyhow::anyhow!("Delete folder {} failed: {}", local.display(), e)),
+        }
+    }
+
     async fn stat(&self, remote_path: &str) -> anyhow::Result<Option<i64>> {
         let local = self.to_local(remote_path);
         match tokio::fs::metadata(&local).await {

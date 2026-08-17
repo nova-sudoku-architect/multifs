@@ -660,6 +660,18 @@ impl StorageEngine {
         backend.backend.delete(remote_path).await
     }
 
+    /// Delete a folder and all its contents recursively on a backend
+    /// (best-effort). Returns `Ok(Some(files_deleted))` if the backend
+    /// performed the deletion, `Ok(None)` if the backend does not support it.
+    pub async fn delete_folder_recursive(
+        &self,
+        account_email: &str,
+        remote_path: &str,
+    ) -> anyhow::Result<Option<u64>> {
+        let backend = self.find_backend(account_email)?;
+        backend.backend.delete_folder_recursive(remote_path).await
+    }
+
     /// List every managed object (current versions) across all buckets.
     pub fn list_all_objects(&self) -> anyhow::Result<Vec<crate::storage::metadata::ObjectRecord>> {
         self.meta.list_all_objects()
@@ -722,7 +734,41 @@ impl StorageEngine {
         let mut orphans_removed = 0u64;
         for v in &orphans {
             if !dry_run {
-                if let Ok(backend) = self.find_backend(&v.account_email) {
+                // Multipart (chunked) objects store their parts folder as the
+                // version's `remote_path` (`.../__mp__/multipart-<id>`). A plain
+                // `delete` is a `deletefile` on a folder, which silently no-ops,
+                // and the `multipart_parts` rows were never removed — so every
+                // chunked object deletion leaked its parts. Delete the folder
+                // recursively (falling back to per-part deletes) and drop the
+                // parts rows instead.
+                if let Some(upload_id) = Self::multipart_upload_id(&v.remote_path) {
+                    if let Ok(backend) = self.find_backend(&v.account_email) {
+                        let folder_deleted = match backend
+                            .backend
+                            .delete_folder_recursive(&v.remote_path)
+                            .await
+                        {
+                            Ok(Some(_)) => true,
+                            Ok(None) => false,
+                            Err(e) => {
+                                eprintln!(
+                                    "vacuum: recursive delete of {} failed ({}); falling back to per-part delete",
+                                    v.remote_path, e
+                                );
+                                false
+                            }
+                        };
+                        if !folder_deleted {
+                            let parts = self.meta.list_multipart_parts(&upload_id)?;
+                            for (_pn, _sz, _etag, acct, path) in &parts {
+                                if let Ok(b) = self.find_backend(acct) {
+                                    let _ = b.backend.delete(path).await;
+                                }
+                            }
+                        }
+                    }
+                    self.meta.delete_multipart(&upload_id)?;
+                } else if let Ok(backend) = self.find_backend(&v.account_email) {
                     let _ = backend.backend.delete(&v.remote_path).await;
                 }
                 self.meta.delete_version(&v.bucket_name, &v.key, v.version)?;

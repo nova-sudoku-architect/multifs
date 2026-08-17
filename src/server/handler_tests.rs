@@ -695,6 +695,65 @@ mod handler_tests {
         assert_eq!(response.status(), 204);
     }
 
+    /// Test that POST /{bucket}?delete (DeleteObjects) parses the XML body and
+    /// deletes the listed keys, returning a DeleteResult with each key.
+    #[tokio::test]
+    async fn test_s3_delete_objects_batch() {
+        use crate::server::s3;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
+
+        let backends: Vec<BackendHandle> = vec![
+            BackendHandle::new(
+                Box::new(MockBackend::new("mock-a")),
+                "/mnt/mock-a".to_string(),
+                "mock-a".to_string(),
+                10,
+            ),
+        ];
+
+        let engine = Arc::new(StorageEngine::from_backends(backends, db));
+        // Seed two objects directly (no HTTP needed) and confirm they exist.
+        engine.put_object("test-bucket", "a.txt", b"aaa").await.unwrap();
+        engine.put_object("test-bucket", "b.txt", b"bbb").await.unwrap();
+        engine.put_object("test-bucket", "keep.txt", b"kkk").await.unwrap();
+        assert!(engine.head_object("test-bucket", "a.txt").await.is_ok());
+        assert!(engine.head_object("test-bucket", "b.txt").await.is_ok());
+
+        let app = s3::build_router(engine.clone());
+
+        let body = r#"<Delete>
+            <Object><Key>a.txt</Key></Object>
+            <Object><Key>b.txt</Key></Object>
+            <Object><Key>missing.txt</Key></Object>
+        </Delete>"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/test-bucket?delete")
+            .header("Content-Type", "application/xml")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), 200);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let xml = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert!(xml.contains("<Deleted><Key>a.txt</Key></Deleted>"), "xml: {}", xml);
+        assert!(xml.contains("<Deleted><Key>b.txt</Key></Deleted>"), "xml: {}", xml);
+        assert!(xml.contains("<Deleted><Key>missing.txt</Key></Deleted>"), "xml: {}", xml);
+
+        // Listed keys are gone; the unlisted key is untouched.
+        assert!(engine.head_object("test-bucket", "a.txt").await.is_err());
+        assert!(engine.head_object("test-bucket", "b.txt").await.is_err());
+        assert!(engine.head_object("test-bucket", "keep.txt").await.is_ok());
+    }
+
     /// HEAD on a non-existent object returns 404
     #[tokio::test]
     async fn test_s3_head_nonexistent_returns_404() {

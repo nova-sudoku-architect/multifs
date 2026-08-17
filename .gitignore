@@ -6,3 +6,6 @@
 .vscode/
 *.env
 config.toml
+
+# deployment config backups
+config.deploy.toml.bak.*

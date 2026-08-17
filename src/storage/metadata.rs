@@ -670,6 +670,59 @@ impl MetadataDb {
         })
     }
 
+    /// Sync checksum between a file row and its current version when exactly
+    /// one side is populated (the other empty). Returns the number of rows synced.
+    pub fn sync_checksum_mirrors(&self) -> anyhow::Result<usize> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let result = (|| -> anyhow::Result<usize> {
+                // files has a checksum, current version doesn't
+                let n1 = conn.execute(
+                    "UPDATE versions SET checksum = (
+                         SELECT f.checksum FROM files f
+                         WHERE f.bucket_name = versions.bucket_name AND f.key = versions.key
+                           AND f.current_version = versions.version
+                     )
+                     WHERE checksum = ''
+                       AND EXISTS (
+                         SELECT 1 FROM files f
+                         WHERE f.bucket_name = versions.bucket_name AND f.key = versions.key
+                           AND f.current_version = versions.version
+                           AND f.checksum != ''
+                     )",
+                    [],
+                )?;
+                // version has a checksum, files row doesn't
+                let n2 = conn.execute(
+                    "UPDATE files SET checksum = (
+                         SELECT v.checksum FROM versions v
+                         WHERE v.bucket_name = files.bucket_name AND v.key = files.key
+                           AND v.version = files.current_version
+                     )
+                     WHERE checksum = ''
+                       AND EXISTS (
+                         SELECT 1 FROM versions v
+                         WHERE v.bucket_name = files.bucket_name AND v.key = files.key
+                           AND v.version = files.current_version
+                           AND v.checksum != ''
+                     )",
+                    [],
+                )?;
+                Ok(n1 + n2)
+            })();
+            match result {
+                Ok(n) => {
+                    conn.execute_batch("COMMIT;")?;
+                    Ok(n)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(e)
+                }
+            }
+        })
+    }
+
     pub fn find_object_by_remote_path(
         &self,
         account_email: &str,
@@ -1063,6 +1116,42 @@ impl MetadataDb {
                 params![bucket, key, version],
             )?;
             Ok(())
+        })
+    }
+
+    /// Hard-delete a committed version row whose blob is confirmed gone from its
+    /// backend. Also removes the `files` row when this version is the current
+    /// one (the object no longer exists), plus any multipart part/upload rows.
+    /// Returns true if a `files` row was removed (i.e. the object disappeared).
+    pub fn purge_missing_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version: i64,
+    ) -> anyhow::Result<bool> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let result = (|| -> anyhow::Result<bool> {
+                let removed_file = conn.execute(
+                    "DELETE FROM files WHERE bucket_name = ?1 AND key = ?2 AND current_version = ?3",
+                    params![bucket, key, version],
+                )? > 0;
+                conn.execute(
+                    "DELETE FROM versions WHERE bucket_name = ?1 AND key = ?2 AND version = ?3",
+                    params![bucket, key, version],
+                )?;
+                Ok(removed_file)
+            })();
+            match result {
+                Ok(b) => {
+                    conn.execute_batch("COMMIT;")?;
+                    Ok(b)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(e)
+                }
+            }
         })
     }
 

@@ -63,6 +63,10 @@ impl StorageBackend for PCloudBackend {
         self.client.delete(remote_path).await
     }
 
+    async fn delete_folder_recursive(&self, remote_path: &str) -> anyhow::Result<Option<u64>> {
+        Ok(Some(self.client.delete_folder_recursive(remote_path).await?))
+    }
+
     async fn list(&self, prefix: &str) -> anyhow::Result<Vec<StorageFile>> {
         let files = self.client.list_folder(prefix).await?;
         Ok(files.into_iter().map(|f| StorageFile {

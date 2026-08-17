@@ -50,6 +50,14 @@ pub trait StorageBackend: Send + Sync {
     /// Delete a file.
     async fn delete(&self, remote_path: &str) -> anyhow::Result<()>;
 
+    /// Delete a folder and all its contents recursively (server-side).
+    /// Returns `Ok(Some(files_deleted))` if the backend performed the deletion,
+    /// `Ok(None)` if the backend does not support recursive folder deletion
+    /// (the caller should fall back to per-file `delete`).
+    async fn delete_folder_recursive(&self, _remote_path: &str) -> anyhow::Result<Option<u64>> {
+        Ok(None)
+    }
+
     /// List files under a prefix (directory).
     async fn list(&self, prefix: &str) -> anyhow::Result<Vec<StorageFile>>;
 

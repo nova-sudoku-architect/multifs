@@ -28,6 +28,7 @@ impl PCloudClient {
             base_url: "https://eapi.pcloud.com".to_string(),
             client: reqwest::Client::builder()
                 .user_agent("multifs/0.1.0")
+                .connect_timeout(std::time::Duration::from_secs(15))
                 .build()
                 .expect("Failed to build HTTP client"),
             known_dirs: Arc::new(StdMutex::new(HashSet::new())),
@@ -562,6 +563,7 @@ impl PCloudClient {
         let resp = self
             .client
             .post(format!("{}/deletefile", self.base_url))
+            .timeout(std::time::Duration::from_secs(60))
             .form(&[
                 ("access_token", self.token.as_str()),
                 ("path", remote_path),
@@ -577,6 +579,32 @@ impl PCloudClient {
         }
 
         Ok(())
+    }
+
+    /// Delete a folder and all its contents recursively via pCloud's
+    /// `deletefolderrecursive` API. Returns the number of files deleted.
+    /// The caller must ensure the folder is safe to delete (e.g. orphaned
+    /// multipart staging under `__mp__/`).
+    pub async fn delete_folder_recursive(&self, remote_path: &str) -> anyhow::Result<u64> {
+        let resp = self
+            .client
+            .post(format!("{}/deletefolderrecursive", self.base_url))
+            .timeout(std::time::Duration::from_secs(120))
+            .form(&[
+                ("access_token", self.token.as_str()),
+                ("path", remote_path),
+            ])
+            .send()
+            .await?;
+
+        let body: serde_json::Value = resp.json().await?;
+        let result = body["result"].as_i64().unwrap_or(-1);
+
+        if result != 0 {
+            anyhow::bail!("Delete folder error {}: {}", result, body["error"]);
+        }
+
+        Ok(body["deletedfiles"].as_u64().unwrap_or(0))
     }
 
     /// List files in a directory

@@ -11,6 +11,7 @@ use axum::{
 };
 use chrono::Utc;
 use futures::StreamExt;
+use quick_xml::events::Event;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
@@ -48,7 +49,7 @@ pub fn build_router(engine: Arc<StorageEngine>) -> Router {
         // Service operations (MinIO compatibility)
         .route("/", get(list_buckets))
         // Bucket operations
-        .route("/{bucket}", get(list_objects).head(head_bucket).put(create_bucket).delete(delete_bucket))
+        .route("/{bucket}", get(list_objects).head(head_bucket).put(create_bucket).delete(delete_bucket).post(delete_objects))
         // Object operations
         .route("/{bucket}/{*key}", get(get_object).head(head_object).put(put_object).post(put_object).delete(delete_object))
         .layer(CorsLayer::permissive())
@@ -843,6 +844,148 @@ async fn delete_object(
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => StatusCode::NO_CONTENT.into_response(), // S3 idempotent delete
     }
+}
+
+/// Escape XML special characters in a key/value for embedding in response XML.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Parse an S3 DeleteObjects request body (`<Delete><Object><Key>…</Key></Object>…
+/// <Quiet>true</Quiet></Delete>`), returning the list of keys and the quiet flag.
+fn parse_delete_objects(body: &[u8]) -> anyhow::Result<(Vec<String>, bool)> {
+    let mut reader = quick_xml::Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+
+    let mut keys = Vec::new();
+    let mut quiet = false;
+    let mut in_key = false;
+    let mut in_quiet = false;
+    let mut current_key = String::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => match e.local_name().as_ref() {
+                b"Key" => in_key = true,
+                b"Quiet" => in_quiet = true,
+                _ => {}
+            },
+            Ok(Event::Text(t)) => {
+                if in_key {
+                    current_key = t.unescape()?.into_owned();
+                } else if in_quiet {
+                    quiet = t.unescape()?.trim().eq_ignore_ascii_case("true");
+                }
+            }
+            Ok(Event::End(e)) => match e.local_name().as_ref() {
+                b"Key" => {
+                    in_key = false;
+                    keys.push(std::mem::take(&mut current_key));
+                }
+                b"Quiet" => in_quiet = false,
+                _ => {}
+            },
+            Ok(Event::Empty(e)) => {
+                if e.local_name().as_ref() == b"Key" {
+                    keys.push(String::new());
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(anyhow::anyhow!("failed to parse delete request: {}", e)),
+            _ => {}
+        }
+    }
+    Ok((keys, quiet))
+}
+
+/// POST /{bucket}?delete — DeleteObjects (batch delete, XML body).
+async fn delete_objects(
+    State(state): State<S3State>,
+    Path(bucket): Path<String>,
+    uri: axum::http::Uri,
+    body: Body,
+) -> Response {
+    // Require the `delete` subresource (S3 DeleteObjects).
+    let is_delete = uri
+        .query()
+        .map(|q| q.split('&').any(|p| p == "delete" || p.starts_with("delete=")))
+        .unwrap_or(false);
+    if !is_delete {
+        let xml = s3_error_xml(
+            "NotImplemented",
+            "DeleteObjects requires the delete subresource",
+            &bucket,
+        );
+        return Response::builder()
+            .status(StatusCode::NOT_IMPLEMENTED)
+            .header("Content-Type", "application/xml")
+            .body(Body::from(xml))
+            .unwrap();
+    }
+
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            let xml = s3_error_xml("MalformedXML", &format!("failed to read body: {}", e), &bucket);
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap();
+        }
+    };
+
+    let (keys, quiet) = match parse_delete_objects(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            let xml = s3_error_xml("MalformedXML", &e.to_string(), &bucket);
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap();
+        }
+    };
+
+    let mut deleted_xml = String::new();
+    let mut error_xml = String::new();
+
+    for key in keys {
+        match state.engine.delete_object(&bucket, &key).await {
+            Ok(_) => {
+                if !quiet {
+                    deleted_xml.push_str(&format!(
+                        "  <Deleted><Key>{}</Key></Deleted>\n",
+                        xml_escape(&key)
+                    ));
+                }
+            }
+            Err(e) => {
+                error_xml.push_str(&format!(
+                    "  <Error><Key>{}</Key><Code>InternalError</Code><Message>{}</Message></Error>\n",
+                    xml_escape(&key),
+                    xml_escape(&e.to_string())
+                ));
+            }
+        }
+    }
+
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+{}{}</DeleteResult>"#,
+        deleted_xml, error_xml
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/xml")
+        .body(Body::from(xml))
+        .unwrap()
 }
 
 /// Convert an internal RFC3339/ISO-8601 timestamp (e.g. "2026-08-07T03:44:23.883Z")

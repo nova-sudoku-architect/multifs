@@ -24,6 +24,16 @@ pub struct FsckArgs {
     /// `vacuum` to reclaim pending/superseded versions and abandoned uploads.
     #[arg(long)]
     pub fix: bool,
+
+    /// Delete DB rows for committed versions whose blob is confirmed missing
+    /// from its backend (single-blob objects only). Dry-run by default — pass
+    /// `--apply` to actually write.
+    #[arg(long)]
+    pub prune_missing: bool,
+
+    /// Actually write changes (required for `--prune-missing`).
+    #[arg(long)]
+    pub apply: bool,
 }
 
 enum CheckOutcome {
@@ -155,6 +165,7 @@ pub async fn run(args: FsckArgs) -> Result<()> {
     // Multipart composites: verify parts exist and sizes sum correctly.
     let mut missing = 0usize;
     let mut size_mismatch = 0usize;
+    let mut missing_blobs: Vec<(String, String, i64)> = Vec::new();
     for v in &multipart_versions {
         let upload_id = extract_multipart_id(&v.remote_path).unwrap_or_default();
         let parts = meta.list_multipart_parts(&upload_id)?;
@@ -201,6 +212,7 @@ pub async fn run(args: FsckArgs) -> Result<()> {
             }
             Ok(None) => {
                 missing += 1;
+                missing_blobs.push((bucket.clone(), key.clone(), version));
                 eprintln!(
                     "  ❌ {}/{} v{}: blob missing — {}",
                     bucket, key, version, path
@@ -308,16 +320,85 @@ pub async fn run(args: FsckArgs) -> Result<()> {
     // ------------------------------------------------------------------
     // --fix
     // ------------------------------------------------------------------
+    if args.prune_missing {
+        println!("\n--- Prune missing ---");
+        if missing_blobs.is_empty() {
+            println!("  no missing single-blob versions to prune");
+        } else {
+            println!(
+                "  {} missing version(s) would be removed{}",
+                missing_blobs.len(),
+                if args.apply { "" } else { " (dry-run — pass --apply to write)" }
+            );
+            if !args.apply {
+                for (b, k, v) in &missing_blobs {
+                    println!("    - {}/{} v{}", b, k, v);
+                }
+            } else {
+                let mut removed_files = 0usize;
+                for (b, k, v) in &missing_blobs {
+                    match meta.purge_missing_version(b, k, *v) {
+                        Ok(true) => {
+                            removed_files += 1;
+                            println!("  🗑️  removed object {}/{} (v{})", b, k, v);
+                        }
+                        Ok(false) => {
+                            println!("  🧹 removed superseded version {}/{} v{}", b, k, v);
+                        }
+                        Err(e) => eprintln!("  ❌ failed to purge {}/{} v{}: {}", b, k, v, e),
+                    }
+                }
+                println!(
+                    "  done: {} versions purged ({} objects removed)",
+                    missing_blobs.len(),
+                    removed_files
+                );
+            }
+        }
+    }
+
     if args.fix {
         println!("\n--- Fixing ---");
+        let synced = meta.sync_checksum_mirrors()?;
+        if synced > 0 {
+            println!("  🔧 synced {} checksum mirror(s)", synced);
+        } else {
+            println!("  no checksum mirrors to sync");
+        }
+
         if !orphan_parts.is_empty() {
             for id in &orphan_parts {
                 let parts = meta.list_multipart_parts(id)?;
-                for (_pn, _size, _etag, account, path) in &parts {
-                    let _ = engine.delete_blob(account, path).await;
+                // All parts of one multipart upload share a single
+                // `__mp__/<id>/N` folder. Prefer one recursive folder delete;
+                // fall back to per-file deletes when the backend can't do it.
+                let folder = parts
+                    .first()
+                    .and_then(|(_, _, _, _, path)| path.rsplit_once('/').map(|(dir, _)| dir.to_string()));
+                let account = parts
+                    .first()
+                    .map(|(_, _, _, account, _)| account.clone());
+                let mut folder_deleted = false;
+                if let (Some(account), Some(folder)) = (account.as_deref(), folder.as_deref()) {
+                    match engine.delete_folder_recursive(account, folder).await {
+                        Ok(Some(n)) => {
+                            folder_deleted = true;
+                            println!("  🧹 deleted orphan multipart folder {} ({}) — {} file(s)", id, folder, n);
+                        }
+                        Ok(None) => {}
+                        Err(e) => eprintln!(
+                            "  ⚠️  recursive delete of {} failed ({}); falling back to per-file delete",
+                            folder, e
+                        ),
+                    }
+                }
+                if !folder_deleted {
+                    for (_pn, _size, _etag, account, path) in &parts {
+                        let _ = engine.delete_blob(account, path).await;
+                    }
+                    println!("  🧹 deleted orphan multipart parts: {}", id);
                 }
                 meta.delete_multipart(id)?;
-                println!("  🧹 deleted orphan multipart parts: {}", id);
             }
         } else {
             println!("  no orphan multipart parts to delete");
