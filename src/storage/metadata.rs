@@ -17,6 +17,7 @@ pub struct ObjectRecord {
     pub etag: String,
     pub last_modified: String,
     pub content_type: Option<String>,
+    pub charset: Option<String>,
     pub account_email: String,
     pub remote_path: String,
     pub bucket_name: String,
@@ -107,12 +108,13 @@ fn object_from_row(row: &rusqlite::Row) -> rusqlite::Result<ObjectRecord> {
         remote_path: row.get(6)?,
         bucket_name: row.get(7)?,
         version: row.get(8)?,
+        charset: row.get(9)?,
     })
 }
 
 /// Column order shared by object-list queries (files JOIN versions).
 const OBJECT_SELECT: &str = "v.key, v.size, v.etag, v.last_modified, v.content_type, \
-     v.account_email, v.remote_path, v.bucket_name, v.version";
+     v.account_email, v.remote_path, v.bucket_name, v.version, v.charset";
 
 const VERSION_SELECT: &str = "bucket_name, key, version, size, etag, last_modified, \
      content_type, account_email, remote_path, status, created_at, superseded_at";
@@ -312,6 +314,32 @@ impl MetadataDb {
             conn.execute("UPDATE schema_version SET version = 3", [])?;
         }
 
+        // Migration 4: add a `charset` column to `versions` and `files`, so the
+        // read path can advertise the correct `Content-Type; charset=...` for
+        // text objects (e.g. UTF-8 subtitles). Existing rows stay NULL and the
+        // serve path falls back to UTF-8 for text content.
+        if current < 4 {
+            let vcols: Vec<String> = conn
+                .prepare("PRAGMA table_info(versions)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            if !vcols.iter().any(|c| c == "charset") {
+                conn.execute_batch("ALTER TABLE versions ADD COLUMN charset TEXT;")?;
+            }
+
+            let fcols: Vec<String> = conn
+                .prepare("PRAGMA table_info(files)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            if !fcols.iter().any(|c| c == "charset") {
+                conn.execute_batch("ALTER TABLE files ADD COLUMN charset TEXT;")?;
+            }
+
+            conn.execute("UPDATE schema_version SET version = 4", [])?;
+        }
+
         Ok(())
     }
 
@@ -335,6 +363,7 @@ impl MetadataDb {
                 etag             TEXT NOT NULL,
                 last_modified    TEXT NOT NULL,
                 content_type     TEXT,
+                charset          TEXT,
                 checksum         TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (bucket_name, key)
             );
@@ -347,6 +376,7 @@ impl MetadataDb {
                 etag             TEXT NOT NULL,
                 last_modified    TEXT NOT NULL,
                 content_type     TEXT,
+                charset          TEXT,
                 account_email    TEXT NOT NULL,
                 remote_path      TEXT NOT NULL,
                 status           TEXT NOT NULL,
@@ -657,6 +687,28 @@ impl MetadataDb {
         })
     }
 
+    /// Store the detected character set for a version's blob, mirrored onto the
+    /// `files` row when `version` is that file's current version.
+    pub fn set_charset(
+        &self,
+        bucket: &str,
+        key: &str,
+        version: i64,
+        charset: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE versions SET charset = ?4 WHERE bucket_name = ?1 AND key = ?2 AND version = ?3",
+                params![bucket, key, version, charset],
+            )?;
+            conn.execute(
+                "UPDATE files SET charset = ?3 WHERE bucket_name = ?1 AND key = ?2 AND current_version = ?4",
+                params![bucket, key, charset, version],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Return the stored checksum for a file's current version, if any.
     pub fn get_checksum(&self, bucket: &str, key: &str) -> anyhow::Result<Option<String>> {
         self.with_conn(|conn| {
@@ -810,7 +862,7 @@ impl MetadataDb {
                     let pattern = format!("{}%", p);
                     (
                         "SELECT v.key, v.size, v.etag, v.last_modified, v.content_type, \
-                         v.account_email, v.remote_path, v.bucket_name, v.version \
+                         v.account_email, v.remote_path, v.bucket_name, v.version, v.charset \
                          FROM files f JOIN versions v ON v.bucket_name = f.bucket_name AND v.key = f.key AND v.version = f.current_version \
                          WHERE f.bucket_name = ?1 AND f.key LIKE ?2 AND f.key > ?3 \
                          ORDER BY f.key LIMIT ?4",
@@ -826,7 +878,7 @@ impl MetadataDb {
                     let pattern = format!("{}%", p);
                     (
                         "SELECT v.key, v.size, v.etag, v.last_modified, v.content_type, \
-                         v.account_email, v.remote_path, v.bucket_name, v.version \
+                         v.account_email, v.remote_path, v.bucket_name, v.version, v.charset \
                          FROM files f JOIN versions v ON v.bucket_name = f.bucket_name AND v.key = f.key AND v.version = f.current_version \
                          WHERE f.bucket_name = ?1 AND f.key LIKE ?2 \
                          ORDER BY f.key LIMIT ?3",
@@ -839,7 +891,7 @@ impl MetadataDb {
                 }
                 (None, Some(sa)) => (
                     "SELECT v.key, v.size, v.etag, v.last_modified, v.content_type, \
-                     v.account_email, v.remote_path, v.bucket_name, v.version \
+                     v.account_email, v.remote_path, v.bucket_name, v.version, v.charset \
                      FROM files f JOIN versions v ON v.bucket_name = f.bucket_name AND v.key = f.key AND v.version = f.current_version \
                      WHERE f.bucket_name = ?1 AND f.key > ?2 \
                      ORDER BY f.key LIMIT ?3",
@@ -851,7 +903,7 @@ impl MetadataDb {
                 ),
                 (None, None) => (
                     "SELECT v.key, v.size, v.etag, v.last_modified, v.content_type, \
-                     v.account_email, v.remote_path, v.bucket_name, v.version \
+                     v.account_email, v.remote_path, v.bucket_name, v.version, v.charset \
                      FROM files f JOIN versions v ON v.bucket_name = f.bucket_name AND v.key = f.key AND v.version = f.current_version \
                      WHERE f.bucket_name = ?1 \
                      ORDER BY f.key LIMIT ?2",
@@ -1397,7 +1449,7 @@ mod tests {
                 )?)
             })
             .unwrap();
-        assert_eq!(version, 3, "migration should set version to 3");
+        assert_eq!(version, 4, "migration should set version to 4");
 
         // The legacy object became version 1 of a file, with its blob preserved.
         let obj = db.get_object("b", "k.txt").unwrap().expect("object migrated");

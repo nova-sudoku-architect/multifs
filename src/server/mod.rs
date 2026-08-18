@@ -77,6 +77,60 @@ pub fn resolve_content_type(key: &str, client_ct: Option<&str>) -> Option<String
     }
 }
 
+/// Whether a content type represents textual content (benefits from a charset).
+pub fn is_text_content_type(ct: Option<&str>) -> bool {
+    let Some(c) = ct else { return false };
+    let c = c.to_ascii_lowercase();
+    c.starts_with("text/")
+        || c.contains("json")
+        || c.contains("xml")
+        || c.contains("x-subrip") // .srt
+        || c.contains("x-vtt") // .vtt
+        || c.contains("javascript")
+        || c.contains("csv")
+        || c.contains("yaml")
+        || c.contains("x-ass") // .ass/.ssa subtitles
+}
+
+/// Detect a text file's character set from its bytes (BOM first, then UTF-8
+/// validation). Returns a lowercase charset label or `None` when undeterminable.
+pub fn detect_charset(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return Some("utf-8");
+    }
+    if data.starts_with(&[0xFF, 0xFE]) {
+        return Some("utf-16le");
+    }
+    if data.starts_with(&[0xFE, 0xFF]) {
+        return Some("utf-16be");
+    }
+    if std::str::from_utf8(data).is_ok() {
+        return Some("utf-8");
+    }
+    None
+}
+
+/// Resolve the charset to persist at upload time (text content only).
+pub fn resolve_charset(content_type: Option<&str>, data: &[u8]) -> Option<String> {
+    if !is_text_content_type(content_type) {
+        return None;
+    }
+    detect_charset(data).map(|s| s.to_string())
+}
+
+/// Charset to advertise when serving: the stored value, else UTF-8 for text
+/// content, else none.
+pub fn serve_charset(charset: Option<&str>, content_type: Option<&str>) -> Option<String> {
+    if let Some(c) = charset.filter(|c| !c.is_empty()) {
+        return Some(c.to_string());
+    }
+    if is_text_content_type(content_type) {
+        Some("utf-8".to_string())
+    } else {
+        None
+    }
+}
+
 pub fn group_objects_by_prefix<'a>(
     objects: &'a [crate::storage::engine::ObjectInfo],
     prefix: Option<&str>,

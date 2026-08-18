@@ -147,6 +147,12 @@ async fn download(
         .content_type
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
+    // Advertise the charset for text content so UTF-8 subtitles render correctly.
+    let content_type_header = match crate::server::serve_charset(obj_info.charset.as_deref(), Some(&content_type)) {
+        Some(cs) => format!("{}; charset={}", content_type, cs),
+        None => content_type.clone(),
+    };
+
     // Optional Range support (lets browsers seek within a video).
     let range_val = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     let parsed_range = range_val.and_then(|rv| crate::server::parse_range(rv, total_len));
@@ -177,10 +183,15 @@ async fn download(
         .next()
         .unwrap_or(&q.key)
         .to_string();
-    let disposition = format!("attachment; filename=\"{}\"", filename.replace('"', "_"));
+    // Serve text files inline so the browser renders them directly.
+    let disposition = if crate::server::is_text_content_type(Some(&content_type)) {
+        format!("inline; filename=\"{}\"", filename.replace('"', "_"))
+    } else {
+        format!("attachment; filename=\"{}\"", filename.replace('"', "_"))
+    };
 
     let mut response = Response::builder()
-        .header(header::CONTENT_TYPE, &content_type)
+        .header(header::CONTENT_TYPE, &content_type_header)
         .header(header::CONTENT_LENGTH, content_length.to_string())
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_DISPOSITION, disposition);

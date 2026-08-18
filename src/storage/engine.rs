@@ -18,6 +18,7 @@ pub struct ObjectInfo {
     pub etag: String,
     pub last_modified: String,
     pub content_type: Option<String>,
+    pub charset: Option<String>,
     pub account_email: String,
     pub remote_path: String,
     pub version: i64,
@@ -305,6 +306,7 @@ impl StorageEngine {
         self.ensure_bucket(bucket)?;
         let etag = hex::encode(Sha256::digest(data));
         let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        let charset = crate::server::resolve_charset(content_type, data);
 
         let backends = &*self.backends;
         if backends.is_empty() {
@@ -336,6 +338,7 @@ impl StorageEngine {
         // Single-blob upload: the ETag IS the SHA-256, so record it as the
         // integrity checksum too.
         self.meta.set_checksum(bucket, key, version, &etag)?;
+        self.meta.set_charset(bucket, key, version, charset.as_deref())?;
 
         Ok(ObjectInfo {
             key: key.to_string(),
@@ -343,6 +346,7 @@ impl StorageEngine {
             etag,
             last_modified: now,
             content_type: content_type.map(|s| s.to_string()),
+            charset,
             account_email: backend.label.clone(),
             remote_path: remote_path_actual,
             version,
@@ -361,6 +365,7 @@ impl StorageEngine {
         bucket: &str,
         key: &str,
         content_type: Option<&str>,
+        charset: Option<&str>,
         stream: S,
     ) -> anyhow::Result<ObjectInfo>
     where
@@ -410,6 +415,7 @@ impl StorageEngine {
         )?;
         // Streaming uploads also use SHA-256 as the ETag; record it as the checksum.
         self.meta.set_checksum(bucket, key, version, &etag)?;
+        self.meta.set_charset(bucket, key, version, charset)?;
 
         Ok(ObjectInfo {
             key: key.to_string(),
@@ -417,6 +423,7 @@ impl StorageEngine {
             etag,
             last_modified: now,
             content_type: content_type.map(|s| s.to_string()),
+            charset: charset.map(|s| s.to_string()),
             account_email: backend.label.clone(),
             remote_path: actual_path,
             version,
@@ -688,6 +695,7 @@ impl StorageEngine {
             etag: obj.etag,
             last_modified: obj.last_modified,
             content_type: obj.content_type,
+            charset: obj.charset,
             account_email: obj.account_email,
             remote_path: obj.remote_path,
             version: obj.version,
@@ -810,6 +818,7 @@ impl StorageEngine {
                 etag: r.etag,
                 last_modified: r.last_modified,
                 content_type: r.content_type,
+                charset: r.charset,
                 account_email: r.account_email,
                 remote_path: r.remote_path,
                 version: r.version,

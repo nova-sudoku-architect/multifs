@@ -594,6 +594,7 @@ async fn put_object(
         }
     };
     let byte_vec: Vec<u8> = bytes.to_vec();
+    let charset = crate::server::resolve_charset(content_type.as_deref(), &byte_vec);
     let stream = futures::stream::once(futures::future::ready(Ok(bytes::Bytes::from(byte_vec))));
     tracing::info!("S3 PUT: body buffered ({} bytes), calling engine", bytes.len());
     let result = state
@@ -602,6 +603,7 @@ async fn put_object(
             &bucket,
             &key,
             content_type.as_deref(),
+            charset.as_deref(),
             stream,
         )
         .await;
@@ -664,6 +666,10 @@ async fn get_object(
 
     let total_len = obj_info.size as usize;
     let content_type = obj_info.content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+    let content_type_header = match crate::server::serve_charset(obj_info.charset.as_deref(), Some(&content_type)) {
+        Some(cs) => format!("{}; charset={}", content_type, cs),
+        None => content_type.clone(),
+    };
 
     // Parse optional Range header
     let range_val = headers.get(http::header::RANGE).and_then(|v| v.to_str().ok());
@@ -708,7 +714,7 @@ async fn get_object(
         Box::pin(ReceiverStream::new(rx));
 
     let mut response = Response::builder()
-        .header("Content-Type", &content_type)
+        .header("Content-Type", &content_type_header)
         .header("Content-Length", content_length.to_string())
         .header("Accept-Ranges", "bytes")
         .header("ETag", format!("\"{}\"", obj_info.etag));
@@ -816,13 +822,20 @@ async fn head_object(
     Path((bucket, key)): Path<(String, String)>,
 ) -> Response {
     match state.engine.head_object(&bucket, &key).await {
-        Ok(info) => Response::builder()
-            .header("Content-Type", info.content_type.unwrap_or("application/octet-stream".to_string()))
-            .header("Content-Length", info.size.to_string())
-            .header("ETag", format!("\"{}\"", info.etag))
-            .header("Last-Modified", to_http_date(&info.last_modified))
-            .body(Body::empty())
-            .unwrap(),
+        Ok(info) => {
+            let ct = info.content_type.clone().unwrap_or_else(|| "application/octet-stream".to_string());
+            let ct_header = match crate::server::serve_charset(info.charset.as_deref(), Some(&ct)) {
+                Some(cs) => format!("{}; charset={}", ct, cs),
+                None => ct,
+            };
+            Response::builder()
+                .header("Content-Type", ct_header)
+                .header("Content-Length", info.size.to_string())
+                .header("ETag", format!("\"{}\"", info.etag))
+                .header("Last-Modified", to_http_date(&info.last_modified))
+                .body(Body::empty())
+                .unwrap()
+        }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }

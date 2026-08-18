@@ -80,7 +80,7 @@ blob in place.
 
 ## Data Model (SQLite)
 
-Path: `/var/lib/multifs/meta.db` (WAL mode). Schema version **3** (checksum column added in migration 3).
+Path: `/var/lib/multifs/meta.db` (WAL mode). Schema version **4** (charset column added in migration 4).
 
 ```sql
 -- Bucket registry
@@ -98,6 +98,7 @@ CREATE TABLE files (
     etag             TEXT NOT NULL,          -- SHA-256 hex (single blob)
     last_modified    TEXT NOT NULL,
     content_type     TEXT,
+    charset          TEXT,                      -- detected charset for text (e.g. utf-8)
     checksum         TEXT NOT NULL DEFAULT '',   -- SHA-256 hex of live content
     PRIMARY KEY (bucket_name, key)
 );
@@ -111,6 +112,7 @@ CREATE TABLE versions (
     etag             TEXT NOT NULL,
     last_modified    TEXT NOT NULL,
     content_type     TEXT,
+    charset          TEXT,                      -- detected charset for text (e.g. utf-8)
     account_email    TEXT NOT NULL,          -- pCloud account holding the blob
     remote_path      TEXT NOT NULL,          -- the single blob location
     status           TEXT NOT NULL,          -- 'pending' | 'committed'
@@ -204,7 +206,10 @@ safe to expose to a wider audience (e.g. over Tailscale) without risking data lo
 Enabled via `server.enable_web = true` + `server.web_port` (default 9001). Folder grouping and
 range slicing reuse `group_objects_by_prefix` and `parse_range` from the shared server module.
 Image files (`.jpg`/`.png`/`.webp`/`.gif`) in a folder are rendered inline as a thumbnail gallery
-so cover art and frame captures are visible without clicking.
+so cover art and frame captures are visible without clicking. Text files are served with
+`Content-Type; charset=utf-8` and `Content-Disposition: inline`, so UTF-8 subtitles render
+directly in the browser. Charset is detected at upload (BOM / UTF-8 validation) and stored in the
+`charset` column; unset values fall back to UTF-8 for text content.
 
 ---
 
