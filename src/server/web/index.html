@@ -20,8 +20,15 @@
     padding: 14px 20px; border-bottom: 1px solid var(--border);
     background: var(--panel); position: sticky; top: 0; z-index: 10;
   }
+  .toprow { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
   header h1 { margin: 0; font-size: 16px; font-weight: 600; }
   header h1 span { color: var(--accent2); }
+  .mode-switch { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .mode-switch button {
+    background: transparent; color: var(--muted); border: none; cursor: pointer;
+    padding: 6px 14px; font-size: 13px; font-weight: 500;
+  }
+  .mode-switch button.active { background: var(--accent); color: #fff; }
   .crumb {
     display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
     margin-top: 8px; font-size: 13px;
@@ -46,6 +53,7 @@
   .row-link:hover .name a { color: var(--accent2); }
   .size { color: var(--size); text-align: right; white-space: nowrap; }
   .mtime { color: var(--muted); white-space: nowrap; }
+  .ctype { color: var(--muted); font-size: 12px; }
   .empty { padding: 40px 0; text-align: center; color: var(--muted); }
   .note { color: var(--muted); font-size: 12px; margin-top: 14px; }
   .badge {
@@ -57,16 +65,24 @@
   .icon-bucket { color: var(--folder); }
   .icon-folder { color: var(--folder); }
   .icon-file { color: var(--file); }
+  .icon-img { color: var(--accent2); }
   .gallery { display: flex; flex-wrap: wrap; gap: 12px; margin: 4px 0 18px; }
-  .gal-item { display: flex; flex-direction: column; align-items: center; gap: 5px; }
+  .gal-item { display: flex; flex-direction: column; align-items: center; gap: 5px; max-width: 340px; }
   .gal-item a { display: block; }
   .gal-item img { max-height: 220px; max-width: 340px; border: 1px solid var(--border); border-radius: 6px; background: #000; }
   .gal-label { font-size: 11px; color: var(--muted); }
+  .gal-meta { font-size: 11px; color: var(--muted); }
 </style>
 </head>
 <body>
 <header>
-  <h1>MultiFS <span>· read-only</span></h1>
+  <div class="toprow">
+    <h1>MultiFS <span>· read-only</span></h1>
+    <div class="mode-switch" id="modeSwitch">
+      <button id="btnList" class="active" data-mode="list">List</button>
+      <button id="btnPreview" data-mode="preview">Preview</button>
+    </div>
+  </div>
   <div class="crumb" id="crumb"></div>
 </header>
 <main id="main"><div class="spinner">Loading…</div></main>
@@ -74,6 +90,9 @@
 <script>
 const main = document.getElementById('main');
 const crumb = document.getElementById('crumb');
+
+// View state — survives navigation so the chosen mode persists.
+const state = { bucket: '', prefix: '', mode: 'list' };
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({
@@ -147,7 +166,21 @@ function sep() {
   return s;
 }
 
+function setMode(mode) {
+  state.mode = mode;
+  document.getElementById('btnList').classList.toggle('active', mode === 'list');
+  document.getElementById('btnPreview').classList.toggle('active', mode === 'preview');
+  // Re-render the current view under the new mode.
+  if (state.bucket) loadList(state.bucket, state.prefix);
+}
+
+document.getElementById('modeSwitch').addEventListener('click', e => {
+  const btn = e.target.closest('button');
+  if (btn) setMode(btn.dataset.mode);
+});
+
 async function loadBuckets() {
+  state.bucket = ''; state.prefix = '';
   renderCrumb('', '');
   main.innerHTML = '<div class="spinner">Loading buckets…</div>';
   try {
@@ -174,7 +207,64 @@ async function loadBuckets() {
   }
 }
 
+function folderRowHtml(f) {
+  const name = f.replace(/\/$/, '').split('/').pop();
+  return `<tr class="row-link" data-prefix="${esc(f)}">
+    <td><div class="name"><span class="ico icon-folder">📁</span><a>${esc(name)}/</a></div></td>
+    <td class="size"></td><td class="mtime"></td><td class="ctype"></td>
+  </tr>`;
+}
+
+function fileRowHtml(bucket, f, showPreviewCol) {
+  const name = f.key.split('/').pop();
+  const durl = '/api/download?' + new URLSearchParams({ bucket, key: f.key });
+  const ico = isImage(f.key) ? '<span class="ico icon-img">🖼</span>' : '<span class="ico icon-file">📄</span>';
+  const ctype = f.content_type || '';
+  let row = `<tr>
+    <td><div class="name">${ico}<a class="file-link" href="${esc(durl)}">${esc(name)}</a></div></td>
+    <td class="size">${esc(fmtSize(f.size))}</td>
+    <td class="mtime">${esc(fmtDate(f.last_modified))}</td>
+    <td class="ctype">${esc(ctype)}</td>
+  </tr>`;
+  return row;
+}
+
+function renderListMode(bucket, folders, files) {
+  let html = '<table class="table"><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Type</th></tr></thead><tbody>';
+  for (const f of folders) html += folderRowHtml(f);
+  for (const f of files) html += fileRowHtml(bucket, f);
+  html += '</tbody></table>';
+  return html;
+}
+
+function renderPreviewMode(bucket, folders, files) {
+  const images = files.filter(f => isImage(f.key));
+  const others = files.filter(f => !isImage(f.key));
+  let html = '';
+  if (images.length) {
+    html += '<div class="gallery">';
+    for (const f of images) {
+      const name = f.key.split('/').pop();
+      const durl = '/api/download?' + new URLSearchParams({ bucket, key: f.key });
+      html += `<div class="gal-item">
+        <a href="${esc(durl)}" target="_blank"><img src="${esc(durl)}" loading="lazy" alt="${esc(name)}"></a>
+        <div class="gal-label">${esc(friendlyLabel(name))}</div>
+        <div class="gal-meta">${esc(fmtSize(f.size))}</div>
+      </div>`;
+    }
+    html += '</div>';
+  }
+  if (folders.length || others.length) {
+    html += '<table class="table"><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Type</th></tr></thead><tbody>';
+    for (const f of folders) html += folderRowHtml(f);
+    for (const f of others) html += fileRowHtml(bucket, f);
+    html += '</tbody></table>';
+  }
+  return html;
+}
+
 async function loadList(bucket, prefix) {
+  state.bucket = bucket; state.prefix = prefix;
   renderCrumb(bucket, prefix);
   main.innerHTML = '<div class="spinner">Loading…</div>';
   try {
@@ -189,43 +279,10 @@ async function loadList(bucket, prefix) {
       return;
     }
 
-    const images = files.filter(f => isImage(f.key));
-    const others = files.filter(f => !isImage(f.key));
+    let html = state.mode === 'preview'
+      ? renderPreviewMode(bucket, folders, files)
+      : renderListMode(bucket, folders, files);
 
-    let html = '';
-    if (images.length) {
-      html += '<div class="gallery">';
-      for (const f of images) {
-        const name = f.key.split('/').pop();
-        const durl = '/api/download?' + new URLSearchParams({ bucket, key: f.key });
-        html += `<div class="gal-item">
-          <a href="${esc(durl)}" target="_blank"><img src="${esc(durl)}" loading="lazy" alt="${esc(name)}"></a>
-          <div class="gal-label">${esc(friendlyLabel(name))}</div>
-        </div>`;
-      }
-      html += '</div>';
-    }
-
-    if (folders.length || others.length) {
-      html += '<table class="table"><thead><tr><th>Name</th><th>Size</th><th>Modified</th></tr></thead><tbody>';
-      for (const f of folders) {
-        const name = f.replace(/\/$/, '').split('/').pop();
-        html += `<tr class="row-link" data-prefix="${esc(f)}">
-          <td><div class="name"><span class="ico icon-folder">📁</span><a>${esc(name)}/</a></div></td>
-          <td class="size"></td><td class="mtime"></td>
-        </tr>`;
-      }
-      for (const f of others) {
-        const name = f.key.split('/').pop();
-        const durl = '/api/download?' + new URLSearchParams({ bucket, key: f.key });
-        html += `<tr>
-          <td><div class="name"><span class="ico icon-file">📄</span><a class="file-link" href="${esc(durl)}">${esc(name)}</a></div></td>
-          <td class="size">${esc(fmtSize(f.size))}</td>
-          <td class="mtime">${esc(fmtDate(f.last_modified))}</td>
-        </tr>`;
-      }
-      html += '</tbody></table>';
-    }
     if (data.truncated) html += '<div class="note">⚠ Listing truncated (very large folder).</div>';
     html += '<div class="note">Read-only — downloads only. Range requests supported for streaming.</div>';
     main.innerHTML = html;
