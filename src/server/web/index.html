@@ -57,6 +57,11 @@
   .icon-bucket { color: var(--folder); }
   .icon-folder { color: var(--folder); }
   .icon-file { color: var(--file); }
+  .gallery { display: flex; flex-wrap: wrap; gap: 12px; margin: 4px 0 18px; }
+  .gal-item { display: flex; flex-direction: column; align-items: center; gap: 5px; }
+  .gal-item a { display: block; }
+  .gal-item img { max-height: 220px; max-width: 340px; border: 1px solid var(--border); border-radius: 6px; background: #000; }
+  .gal-label { font-size: 11px; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -90,6 +95,17 @@ function fmtDate(s) {
   const d = new Date(s.includes('T') ? s : s.replace(' ', 'T') + 'Z');
   if (isNaN(d)) return s;
   return d.toLocaleString(undefined, { year:'numeric', month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' });
+}
+
+function isImage(key) {
+  return /\.(jpe?g|png|webp|gif)$/i.test(key);
+}
+
+function friendlyLabel(name) {
+  const m = name.match(/frame_(\d{2})(\d{2})(\d{2})/i);
+  if (m) return `${m[1]}:${m[2]}:${m[3]}`;
+  if (/cover/i.test(name)) return 'cover';
+  return name;
 }
 
 async function jfetch(url) {
@@ -173,24 +189,43 @@ async function loadList(bucket, prefix) {
       return;
     }
 
-    let html = '<table class="table"><thead><tr><th>Name</th><th>Size</th><th>Modified</th></tr></thead><tbody>';
-    for (const f of folders) {
-      const name = f.replace(/\/$/, '').split('/').pop();
-      html += `<tr class="row-link" data-prefix="${esc(f)}">
-        <td><div class="name"><span class="ico icon-folder">📁</span><a>${esc(name)}/</a></div></td>
-        <td class="size"></td><td class="mtime"></td>
-      </tr>`;
+    const images = files.filter(f => isImage(f.key));
+    const others = files.filter(f => !isImage(f.key));
+
+    let html = '';
+    if (images.length) {
+      html += '<div class="gallery">';
+      for (const f of images) {
+        const name = f.key.split('/').pop();
+        const durl = '/api/download?' + new URLSearchParams({ bucket, key: f.key });
+        html += `<div class="gal-item">
+          <a href="${esc(durl)}" target="_blank"><img src="${esc(durl)}" loading="lazy" alt="${esc(name)}"></a>
+          <div class="gal-label">${esc(friendlyLabel(name))}</div>
+        </div>`;
+      }
+      html += '</div>';
     }
-    for (const f of files) {
-      const name = f.key.split('/').pop();
-      const durl = '/api/download?' + new URLSearchParams({ bucket, key: f.key });
-      html += `<tr>
-        <td><div class="name"><span class="ico icon-file">📄</span><a class="file-link" href="${esc(durl)}">${esc(name)}</a></div></td>
-        <td class="size">${esc(fmtSize(f.size))}</td>
-        <td class="mtime">${esc(fmtDate(f.last_modified))}</td>
-      </tr>`;
+
+    if (folders.length || others.length) {
+      html += '<table class="table"><thead><tr><th>Name</th><th>Size</th><th>Modified</th></tr></thead><tbody>';
+      for (const f of folders) {
+        const name = f.replace(/\/$/, '').split('/').pop();
+        html += `<tr class="row-link" data-prefix="${esc(f)}">
+          <td><div class="name"><span class="ico icon-folder">📁</span><a>${esc(name)}/</a></div></td>
+          <td class="size"></td><td class="mtime"></td>
+        </tr>`;
+      }
+      for (const f of others) {
+        const name = f.key.split('/').pop();
+        const durl = '/api/download?' + new URLSearchParams({ bucket, key: f.key });
+        html += `<tr>
+          <td><div class="name"><span class="ico icon-file">📄</span><a class="file-link" href="${esc(durl)}">${esc(name)}</a></div></td>
+          <td class="size">${esc(fmtSize(f.size))}</td>
+          <td class="mtime">${esc(fmtDate(f.last_modified))}</td>
+        </tr>`;
+      }
+      html += '</tbody></table>';
     }
-    html += '</tbody></table>';
     if (data.truncated) html += '<div class="note">⚠ Listing truncated (very large folder).</div>';
     html += '<div class="note">Read-only — downloads only. Range requests supported for streaming.</div>';
     main.innerHTML = html;

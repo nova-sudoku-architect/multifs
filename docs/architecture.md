@@ -203,6 +203,8 @@ safe to expose to a wider audience (e.g. over Tailscale) without risking data lo
 
 Enabled via `server.enable_web = true` + `server.web_port` (default 9001). Folder grouping and
 range slicing reuse `group_objects_by_prefix` and `parse_range` from the shared server module.
+Image files (`.jpg`/`.png`/`.webp`/`.gif`) in a folder are rendered inline as a thumbnail gallery
+so cover art and frame captures are visible without clicking.
 
 ---
 

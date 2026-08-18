@@ -7,6 +7,8 @@ s3_port = 9000
 nfs_port = 2049
 enable_nfs = false
 enable_s3 = true
+enable_web = true
+web_port = 9001
 
 [tls]
 enabled = true
@@ -205,6 +207,13 @@ email = "nova-video-016@atomicmail.ai"
 backend_type = "pcloud"
 token_env = "PCLOUD_TOKEN_ATOMIC_016"
 mount_prefix = "/multifs/016"
+quota_gb = 3
+
+[[storage.accounts]]
+email = "nova-video-017@atomicmail.ai"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_ATOMIC_017"
+mount_prefix = "/multifs/017"
 quota_gb = 3
 
 [[storage.accounts]]
