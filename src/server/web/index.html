@@ -20,7 +20,10 @@
     padding: 14px 20px; border-bottom: 1px solid var(--border);
     background: var(--panel); position: sticky; top: 0; z-index: 10;
   }
-  .toprow { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .toprow { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .toprow-right { display: flex; align-items: center; gap: 14px; }
+  .cols-picker { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+  .cols-picker select { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; font-size: 13px; cursor: pointer; }
   header h1 { margin: 0; font-size: 16px; font-weight: 600; }
   header h1 span { color: var(--accent2); }
   .mode-switch { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
@@ -61,26 +64,87 @@
     background: #223; color: var(--muted); font-size: 11px; margin-left: 8px;
   }
   a.file-link { color: var(--accent2); }
+  a.vlc-link { color: #f5a623; font-weight: 600; margin-left: 10px; text-decoration: none; white-space: nowrap; }
+  a.vlc-link:hover { text-decoration: underline; }
   .spinner { color: var(--muted); padding: 40px 0; text-align: center; }
   .icon-bucket { color: var(--folder); }
   .icon-folder { color: var(--folder); }
   .icon-file { color: var(--file); }
   .icon-img { color: var(--accent2); }
-  .gallery { display: flex; flex-wrap: wrap; gap: 12px; margin: 4px 0 18px; }
-  .gal-item { display: flex; flex-direction: column; align-items: center; gap: 5px; max-width: 340px; }
-  .gal-item a { display: block; }
-  .gal-item img { max-height: 220px; max-width: 340px; border: 1px solid var(--border); border-radius: 6px; background: #000; }
+  .name img.fthumb { width: 32px; height: 32px; object-fit: cover; border-radius: 5px; border: 1px solid var(--border); flex: none; background: #000; }
+  .gallery { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin: 4px 0 18px; }
+  .gal-item { display: flex; flex-direction: column; align-items: center; gap: 5px; min-width: 0; }
+  .gal-item a { display: block; width: 100%; }
+  .gal-item img { width: 100%; aspect-ratio: 16 / 10; object-fit: cover; border: 1px solid var(--border); border-radius: 6px; background: #000; }
   .gal-label { font-size: 11px; color: var(--muted); }
   .gal-meta { font-size: 11px; color: var(--muted); }
+  .folder-cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin: 4px 0 18px; }
+  .folder-card { display: flex; flex-direction: column; align-items: center; gap: 6px; cursor: pointer; min-width: 0; }
+  .folder-card .fthumb {
+    width: 100%; aspect-ratio: 1 / 1; display: flex; align-items: center; justify-content: center;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--panel2); overflow: hidden;
+  }
+  .folder-card .fthumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .folder-card .fthumb .folder-big { font-size: clamp(56px, 18vw, 96px); }
+  .folder-card .fname { font-size: 13px; color: var(--text); max-width: 100%; text-align: center; overflow-wrap: anywhere; }
+  .folder-card:hover .fname { color: var(--accent2); }
+  /* Responsive preview grid: 2-up on phones, 3-up on tablets, 4-up on desktop. */
+  @media (min-width: 640px) {
+    .gallery, .folder-cards { grid-template-columns: repeat(3, 1fr); }
+  }
+  @media (min-width: 900px) {
+    .gallery, .folder-cards { grid-template-columns: repeat(4, 1fr); }
+  }
+  /* Manual column override (user-selected images per row, beats the auto media queries). */
+  body[data-cols="1"] .gallery, body[data-cols="1"] .folder-cards { grid-template-columns: repeat(1, 1fr); }
+  body[data-cols="2"] .gallery, body[data-cols="2"] .folder-cards { grid-template-columns: repeat(2, 1fr); }
+  body[data-cols="3"] .gallery, body[data-cols="3"] .folder-cards { grid-template-columns: repeat(3, 1fr); }
+  body[data-cols="4"] .gallery, body[data-cols="4"] .folder-cards { grid-template-columns: repeat(4, 1fr); }
+  body[data-cols="5"] .gallery, body[data-cols="5"] .folder-cards { grid-template-columns: repeat(5, 1fr); }
+  body[data-cols="6"] .gallery, body[data-cols="6"] .folder-cards { grid-template-columns: repeat(6, 1fr); }
+  /* Names-only mode: a dense, responsive grid of just names. */
+  .names-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 2px 14px; margin: 4px 0 18px; }
+  .name-item { padding: 3px 6px; border-radius: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .name-item a { color: var(--text); text-decoration: none; }
+  .name-item:hover { background: var(--panel2); }
+  .name-item.folder a { color: var(--folder); }
+  .name-item.file a { color: var(--accent2); }
+  .slide-nav { display: none; align-items: center; gap: 6px; }
+  .slide-nav button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 7px; padding: 5px 12px; font-size: 13px; cursor: pointer; line-height: 1;
+  }
+  .slide-nav button:hover:not(:disabled) { background: var(--accent); color: #fff; }
+  .slide-nav button:disabled { opacity: .35; cursor: default; }
+  .slide-nav .slide-pos { color: var(--muted); font-size: 12px; min-width: 54px; text-align: center; }
 </style>
 </head>
 <body>
 <header>
   <div class="toprow">
     <h1>MultiFS <span>· read-only</span></h1>
-    <div class="mode-switch" id="modeSwitch">
-      <button id="btnList" class="active" data-mode="list">List</button>
-      <button id="btnPreview" data-mode="preview">Preview</button>
+    <div class="toprow-right">
+      <label class="cols-picker">Cols
+        <select id="colsSelect" title="Images per row in preview mode">
+          <option value="auto">Auto</option>
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+          <option value="5">5</option>
+          <option value="6">6</option>
+        </select>
+      </label>
+      <div class="mode-switch" id="modeSwitch">
+        <button id="btnList" class="active" data-mode="list">List</button>
+        <button id="btnPreview" data-mode="preview">Preview</button>
+        <button id="btnNames" data-mode="names">Names</button>
+      </div>
+      <div class="slide-nav" id="slideNav" title="Previous / next sibling folder">
+        <button id="btnPrev" aria-label="Previous folder">◀</button>
+        <span id="slidePos" class="slide-pos"></span>
+        <button id="btnNext" aria-label="Next folder">▶</button>
+      </div>
     </div>
   </div>
   <div class="crumb" id="crumb"></div>
@@ -90,9 +154,25 @@
 <script>
 const main = document.getElementById('main');
 const crumb = document.getElementById('crumb');
+const slideNav = document.getElementById('slideNav');
+const btnPrev = document.getElementById('btnPrev');
+const btnNext = document.getElementById('btnNext');
+const slidePos = document.getElementById('slidePos');
 
 // View state — survives navigation so the chosen mode persists.
-const state = { bucket: '', prefix: '', mode: 'list' };
+const state = { bucket: '', prefix: '', mode: 'list', cols: loadCols() };
+
+// Sibling-folder slide state (for prev/next folder navigation).
+const siblings = { list: [], index: -1 };
+
+function loadCols() {
+  try { return localStorage.getItem('multifs.cols') || 'auto'; } catch (_) { return 'auto'; }
+}
+
+function applyCols() {
+  if (state.cols === 'auto') document.body.removeAttribute('data-cols');
+  else document.body.setAttribute('data-cols', state.cols);
+}
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({
@@ -120,6 +200,27 @@ function isImage(key) {
   return /\.(jpe?g|png|webp|gif)$/i.test(key);
 }
 
+function isVideo(key) {
+  return /\.(mkv|mp4|avi|mov|webm|m4v|ts|m3u8|flv|wmv)$/i.test(key);
+}
+
+function isIOS() {
+  return /iPhone|iPad|iPod/i.test(navigator.userAgent || '');
+}
+
+// Build a platform-appropriate VLC stream link:
+//   iOS     -> vlc-x-callback://x-callback-url/stream?url=<encoded abs URL>
+//   Windows -> vlc://<absolute download URL>
+function vlcStreamUrl(bucket, key) {
+  const abs = window.location.origin + '/api/download?' + new URLSearchParams({ bucket, key });
+  if (isIOS()) {
+    return 'vlc-x-callback://x-callback-url/stream?url=' + encodeURIComponent(abs);
+  }
+  // Desktop VLC mangles a nested scheme (vlc://http://… -> vlc://http//…), so
+  // percent-encode the whole URL so the http:// scheme survives intact.
+  return 'vlc://' + encodeURIComponent(abs);
+}
+
 function friendlyLabel(name) {
   const m = name.match(/frame_(\d{2})(\d{2})(\d{2})/i);
   if (m) return `${m[1]}:${m[2]}:${m[3]}`;
@@ -137,13 +238,13 @@ function renderCrumb(bucket, prefix) {
   crumb.innerHTML = '';
   const root = document.createElement('a');
   root.textContent = 'Buckets';
-  root.onclick = () => loadBuckets();
+  root.onclick = () => navigate('', '');
   crumb.appendChild(root);
   if (bucket) {
     crumb.appendChild(sep());
     const b = document.createElement('a');
     b.textContent = bucket;
-    b.onclick = () => loadList(bucket, '');
+    b.onclick = () => navigate(bucket, '');
     crumb.appendChild(b);
     const parts = prefix.split('/').filter(Boolean);
     let acc = '';
@@ -153,7 +254,7 @@ function renderCrumb(bucket, prefix) {
       const p = document.createElement('a');
       p.textContent = parts[i];
       const target = acc;
-      p.onclick = () => loadList(bucket, target);
+      p.onclick = () => navigate(bucket, target);
       crumb.appendChild(p);
     }
   }
@@ -166,10 +267,120 @@ function sep() {
   return s;
 }
 
+// --- Sibling-folder slide navigation (prev/next) ---
+// When inside a folder prefix, resolve the sorted list of sibling folders in the
+// same parent, then enable ◀ / ▶ to jump between them (slide through folders).
+function parentOf(prefix) {
+  if (!prefix) return '';
+  const parts = prefix.split('/').filter(Boolean);
+  if (!parts.length) return '';
+  parts.pop();
+  return parts.length ? parts.join('/') + '/' : '';
+}
+
+function siblingOrder(prefix) {
+  // A folder's key is its full prefix (e.g. video-subtitle/blor-116/).
+  // Sort siblings by their final path segment (natural-ish string sort).
+  const parts = prefix.split('/').filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : '';
+}
+
+async function resolveSiblings() {
+  siblings.list = []; siblings.index = -1;
+  slideNav.style.display = 'none';
+  if (!state.bucket || !state.prefix) return;
+
+  const parent = parentOf(state.prefix);
+  const q = new URLSearchParams({ bucket: state.bucket });
+  if (parent) q.set('prefix', parent);
+  try {
+    const data = await jfetch('/api/list?' + q.toString());
+    const folders = (data.prefixes || []).map(p => typeof p === 'string' ? p : p.prefix);
+    // Only folders at the *immediate* child level of `parent`.
+    const depth = parent ? parent.split('/').filter(Boolean).length + 1 : 1;
+    siblings.list = folders.filter(p => {
+      const segs = p.replace(/\/$/, '').split('/').filter(Boolean);
+      return segs.length === depth;
+    }).sort((a, b) => siblingOrder(a).localeCompare(siblingOrder(b), undefined, { numeric: true }));
+    siblings.index = siblings.list.indexOf(state.prefix.replace(/\/$/, '') + '/');
+    if (siblings.index === -1) {
+      // tolerate missing trailing slash
+      siblings.index = siblings.list.findIndex(p => p.replace(/\/$/, '') === state.prefix.replace(/\/$/, ''));
+    }
+    if (siblings.index >= 0) {
+      slideNav.style.display = 'inline-flex';
+      updateSlideButtons();
+    }
+  } catch (_) { /* ignore: prev/next just stays hidden */ }
+}
+
+function updateSlideButtons() {
+  btnPrev.disabled = siblings.index <= 0;
+  btnNext.disabled = siblings.index >= siblings.list.length - 1;
+  slidePos.textContent = `${siblings.index + 1} / ${siblings.list.length}`;
+}
+
+btnPrev.addEventListener('click', () => {
+  if (siblings.index > 0) {
+    navigate(state.bucket, siblings.list[siblings.index - 1]);
+  }
+});
+btnNext.addEventListener('click', () => {
+  if (siblings.index >= 0 && siblings.index < siblings.list.length - 1) {
+    navigate(state.bucket, siblings.list[siblings.index + 1]);
+  }
+});
+
+// --- URL routing (hash-based) ---
+//   #/                          -> bucket list (root)
+//   #/b/<bucket>                -> bucket root
+//   #/b/<bucket>/<prefix/...>   -> folder prefix
+// Lets the browser back/forward buttons and bookmarks work.
+function safeDecode(s) {
+  try { return decodeURIComponent(s); } catch (_) { return s; }
+}
+
+function parseHash() {
+  const raw = window.location.hash.replace(/^#\/?/, '');
+  if (!raw) return { bucket: '', prefix: '' };
+  const parts = raw.split('/');
+  if (parts[0] === 'b' && parts.length >= 2) {
+    const bucket = safeDecode(parts[1]);
+    const prefix = parts.slice(2).map(safeDecode).join('/');
+    return { bucket, prefix };
+  }
+  return { bucket: '', prefix: '' };
+}
+
+function toHash(bucket, prefix) {
+  if (!bucket) return '#/';
+  let h = '#/b/' + encodeURIComponent(bucket);
+  if (prefix) h += '/' + prefix.split('/').filter(Boolean).map(encodeURIComponent).join('/');
+  return h;
+}
+
+function navigate(bucket, prefix) {
+  const h = toHash(bucket, prefix);
+  if (window.location.hash === h) {
+    loadFromHash();           // already on this hash — just (re)render
+  } else {
+    window.location.hash = h; // triggers hashchange -> loadFromHash
+  }
+}
+
+function loadFromHash() {
+  const { bucket, prefix } = parseHash();
+  if (bucket) loadList(bucket, prefix);
+  else loadBuckets();
+}
+
+window.addEventListener('hashchange', loadFromHash);
+
 function setMode(mode) {
   state.mode = mode;
   document.getElementById('btnList').classList.toggle('active', mode === 'list');
   document.getElementById('btnPreview').classList.toggle('active', mode === 'preview');
+  document.getElementById('btnNames').classList.toggle('active', mode === 'names');
   // Re-render the current view under the new mode.
   if (state.bucket) loadList(state.bucket, state.prefix);
 }
@@ -179,9 +390,18 @@ document.getElementById('modeSwitch').addEventListener('click', e => {
   if (btn) setMode(btn.dataset.mode);
 });
 
+document.getElementById('colsSelect').addEventListener('change', e => {
+  state.cols = e.target.value;
+  try { localStorage.setItem('multifs.cols', state.cols); } catch (_) {}
+  applyCols();
+  if (state.bucket) loadList(state.bucket, state.prefix);
+});
+
 async function loadBuckets() {
   state.bucket = ''; state.prefix = '';
   renderCrumb('', '');
+  slideNav.style.display = 'none';
+  siblings.list = []; siblings.index = -1;
   main.innerHTML = '<div class="spinner">Loading buckets…</div>';
   try {
     const data = await jfetch('/api/buckets');
@@ -200,17 +420,27 @@ async function loadBuckets() {
     html += '</tbody></table>';
     main.innerHTML = html;
     main.querySelectorAll('tr.row-link').forEach(tr => {
-      tr.onclick = () => loadList(tr.dataset.bucket, '');
+      tr.onclick = () => navigate(tr.dataset.bucket, '');
     });
   } catch (e) {
     main.innerHTML = `<div class="empty">Error: ${esc(e.message)}</div>`;
   }
 }
 
-function folderRowHtml(f) {
-  const name = f.replace(/\/$/, '').split('/').pop();
-  return `<tr class="row-link" data-prefix="${esc(f)}">
-    <td><div class="name"><span class="ico icon-folder">📁</span><a>${esc(name)}/</a></div></td>
+function folderRowHtml(bucket, f, showThumb) {
+  const prefix = typeof f === 'string' ? f : f.prefix;
+  const name = prefix.replace(/\/$/, '').split('/').pop();
+  // Show the folder's preview image only in preview mode (and only when
+  // recorded + present); otherwise keep the standard folder icon.
+  let ico;
+  if (showThumb && f && f.preview_key) {
+    const purl = '/api/download?' + new URLSearchParams({ bucket, key: f.preview_key });
+    ico = `<img class="fthumb" src="${esc(purl)}" alt="" loading="lazy">`;
+  } else {
+    ico = '<span class="ico icon-folder">📁</span>';
+  }
+  return `<tr class="row-link" data-prefix="${esc(prefix)}">
+    <td><div class="name">${ico}<a>${esc(name)}/</a></div></td>
     <td class="size"></td><td class="mtime"></td><td class="ctype"></td>
   </tr>`;
 }
@@ -220,8 +450,13 @@ function fileRowHtml(bucket, f, showPreviewCol) {
   const durl = '/api/download?' + new URLSearchParams({ bucket, key: f.key });
   const ico = isImage(f.key) ? '<span class="ico icon-img">🖼</span>' : '<span class="ico icon-file">📄</span>';
   const ctype = f.content_type || '';
+  // Always offer a VLC stream link next to video downloads (all devices).
+  let vlc = '';
+  if (isVideo(f.key)) {
+    vlc = `<a class="vlc-link" href="${esc(vlcStreamUrl(bucket, f.key))}" title="Open in VLC">▶ VLC</a>`;
+  }
   let row = `<tr>
-    <td><div class="name">${ico}<a class="file-link" href="${esc(durl)}">${esc(name)}</a></div></td>
+    <td><div class="name">${ico}<a class="file-link" href="${esc(durl)}">${esc(name)}</a>${vlc}</div></td>
     <td class="size">${esc(fmtSize(f.size))}</td>
     <td class="mtime">${esc(fmtDate(f.last_modified))}</td>
     <td class="ctype">${esc(ctype)}</td>
@@ -231,15 +466,33 @@ function fileRowHtml(bucket, f, showPreviewCol) {
 
 function renderListMode(bucket, folders, files) {
   let html = '<table class="table"><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Type</th></tr></thead><tbody>';
-  for (const f of folders) html += folderRowHtml(f);
+  for (const f of folders) html += folderRowHtml(bucket, f, false);
   for (const f of files) html += fileRowHtml(bucket, f);
   html += '</tbody></table>';
+  return html;
+}
+
+function renderNamesMode(bucket, folders, files) {
+  let html = '<div class="names-grid">';
+  for (const f of folders) {
+    const prefix = typeof f === 'string' ? f : f.prefix;
+    const name = prefix.replace(/\/$/, '').split('/').pop();
+    html += `<div class="name-item folder" data-prefix="${esc(prefix)}"><a>${esc(name)}/</a></div>`;
+  }
+  for (const f of files) {
+    const name = f.key.split('/').pop();
+    const durl = '/api/download?' + new URLSearchParams({ bucket, key: f.key });
+    html += `<div class="name-item file"><a class="file-link" href="${esc(durl)}">${esc(name)}</a></div>`;
+  }
+  html += '</div>';
   return html;
 }
 
 function renderPreviewMode(bucket, folders, files) {
   const images = files.filter(f => isImage(f.key));
   const others = files.filter(f => !isImage(f.key));
+  const withPreview = folders.filter(f => f && f.preview_key);
+  const noPreview = folders.filter(f => !(f && f.preview_key));
   let html = '';
   if (images.length) {
     html += '<div class="gallery">';
@@ -254,9 +507,24 @@ function renderPreviewMode(bucket, folders, files) {
     }
     html += '</div>';
   }
-  if (folders.length || others.length) {
+  // Folders with a preview image get large cards (big cover thumbnail).
+  if (withPreview.length) {
+    html += '<div class="folder-cards">';
+    for (const f of withPreview) {
+      const prefix = f.prefix;
+      const name = prefix.replace(/\/$/, '').split('/').pop();
+      const purl = '/api/download?' + new URLSearchParams({ bucket, key: f.preview_key });
+      html += `<div class="folder-card" data-prefix="${esc(prefix)}">
+        <div class="fthumb"><img src="${esc(purl)}" loading="lazy" alt="${esc(name)}"></div>
+        <div class="fname">${esc(name)}</div>
+      </div>`;
+    }
+    html += '</div>';
+  }
+  // Folders without a preview image stay as rows with the folder icon.
+  if (noPreview.length || others.length) {
     html += '<table class="table"><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Type</th></tr></thead><tbody>';
-    for (const f of folders) html += folderRowHtml(f);
+    for (const f of noPreview) html += folderRowHtml(bucket, f, false);
     for (const f of others) html += fileRowHtml(bucket, f);
     html += '</tbody></table>';
   }
@@ -281,20 +549,31 @@ async function loadList(bucket, prefix) {
 
     let html = state.mode === 'preview'
       ? renderPreviewMode(bucket, folders, files)
-      : renderListMode(bucket, folders, files);
+      : state.mode === 'names'
+        ? renderNamesMode(bucket, folders, files)
+        : renderListMode(bucket, folders, files);
 
     if (data.truncated) html += '<div class="note">⚠ Listing truncated (very large folder).</div>';
     html += '<div class="note">Read-only — downloads only. Range requests supported for streaming.</div>';
     main.innerHTML = html;
     main.querySelectorAll('tr.row-link').forEach(tr => {
-      tr.onclick = () => loadList(bucket, tr.dataset.prefix);
+      tr.onclick = () => navigate(bucket, tr.dataset.prefix);
     });
+    main.querySelectorAll('.folder-card').forEach(card => {
+      card.onclick = () => navigate(bucket, card.dataset.prefix);
+    });
+    main.querySelectorAll('.name-item[data-prefix]').forEach(el => {
+      el.onclick = () => navigate(bucket, el.dataset.prefix);
+    });
+    resolveSiblings();
   } catch (e) {
     main.innerHTML = `<div class="empty">Error: ${esc(e.message)}</div>`;
   }
 }
 
-loadBuckets();
+document.getElementById('colsSelect').value = state.cols;
+applyCols();
+loadFromHash();
 </script>
 </body>
 </html>
