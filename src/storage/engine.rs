@@ -339,6 +339,9 @@ impl StorageEngine {
         // integrity checksum too.
         self.meta.set_checksum(bucket, key, version, &etag)?;
         self.meta.set_charset(bucket, key, version, charset.as_deref())?;
+        // Best-effort: if this key is a folder cover image, record it as the
+        // folder's preview. Failures here must not fail the upload.
+        let _ = self.record_cover_preview(bucket, key);
 
         Ok(ObjectInfo {
             key: key.to_string(),
@@ -416,6 +419,9 @@ impl StorageEngine {
         // Streaming uploads also use SHA-256 as the ETag; record it as the checksum.
         self.meta.set_checksum(bucket, key, version, &etag)?;
         self.meta.set_charset(bucket, key, version, charset)?;
+        // Best-effort: if this key is a folder cover image, record it as the
+        // folder's preview. Failures here must not fail the upload.
+        let _ = self.record_cover_preview(bucket, key);
 
         Ok(ObjectInfo {
             key: key.to_string(),
@@ -853,6 +859,43 @@ impl StorageEngine {
 
     pub async fn list_all_buckets(&self) -> anyhow::Result<Vec<BucketRecord>> {
         self.meta.list_buckets()
+    }
+
+    // -----------------------------------------------------------------
+    //  Folder metadata (preview image)
+    // -----------------------------------------------------------------
+
+    /// If `key` is a folder cover image, record it as the preview image of its
+    /// parent folder prefix. No-op for non-cover keys or bucket-root keys.
+    /// Best-effort: the caller decides whether to surface errors.
+    fn record_cover_preview(&self, bucket: &str, key: &str) -> anyhow::Result<()> {
+        if !crate::storage::metadata::is_cover_image_key(key) {
+            return Ok(());
+        }
+        if let Some(prefix) = crate::storage::metadata::parent_prefix(key) {
+            self.meta.set_folder_preview(bucket, &prefix, key)?;
+        }
+        Ok(())
+    }
+
+    /// Resolve, for each folder prefix, its preview image key (only where a
+    /// preview is recorded AND the object still exists). Returns a map of
+    /// prefix -> preview_key. Prefixes without a valid preview are omitted, so
+    /// the UI falls back to the folder icon.
+    pub fn folder_previews(
+        &self,
+        bucket: &str,
+        prefixes: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        let mut out = std::collections::HashMap::new();
+        for p in prefixes {
+            if let Some(pk) = self.meta.get_folder_preview(bucket, p)? {
+                if self.meta.get_object(bucket, &pk)?.is_some() {
+                    out.insert(p.clone(), pk);
+                }
+            }
+        }
+        Ok(out)
     }
 
     // -----------------------------------------------------------------

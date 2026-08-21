@@ -46,6 +46,8 @@ enum Cli {
     Fsck(cli::fsck_cmd::FsckArgs),
     /// Garbage-collect superseded and abandoned object versions
     Vacuum(cli::vacuum_cmd::VacuumArgs),
+    /// Manage per-folder metadata (preview image)
+    Folder(cli::folder_cmd::FolderArgs),
 }
 
 #[tokio::main]
@@ -74,6 +76,7 @@ async fn main() -> Result<()> {
         Cli::Checksum(args) => cli::checksum_cmd::run(args).await?,
         Cli::Fsck(args) => cli::fsck_cmd::run(args).await?,
         Cli::Vacuum(args) => cli::vacuum_cmd::run(args).await?,
+        Cli::Folder(args) => cli::folder_cmd::run(args).await?,
     }
 
     Ok(())

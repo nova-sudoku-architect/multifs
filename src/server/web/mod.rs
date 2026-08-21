@@ -100,7 +100,22 @@ async fn list_objects(
 
     let (prefixes, files) = crate::server::group_objects_by_prefix(&objects, prefix.as_deref());
 
-    let prefixes_json: Vec<String> = prefixes;
+    // Resolve a preview image for each folder prefix (only where recorded AND
+    // the object still exists). Omitted previews → UI falls back to the icon.
+    let previews = state
+        .engine
+        .folder_previews(&bucket, &prefixes)
+        .unwrap_or_default();
+
+    let prefixes_json: Vec<serde_json::Value> = prefixes
+        .into_iter()
+        .map(|p| {
+            json!({
+                "prefix": p,
+                "preview_key": previews.get(&p),
+            })
+        })
+        .collect();
     let files_json: Vec<serde_json::Value> = files
         .into_iter()
         .map(|o: &ObjectInfo| {
@@ -137,7 +152,15 @@ async fn download(
         return json_error(StatusCode::BAD_REQUEST, "missing 'bucket' or 'key' parameter");
     }
 
-    let obj_info = match state.engine.head_object(&q.bucket, &q.key).await {
+    // VLC (and some other clients) append a trailing slash when opening a
+    // stream URL whose path has no file extension (e.g. `/api/download`).
+    // Strip it so the lookup matches the stored object key exactly.
+    let key = q.key.trim_end_matches('/');
+    if key.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "missing 'key' parameter");
+    }
+
+    let obj_info = match state.engine.head_object(&q.bucket, key).await {
         Ok(info) => info,
         Err(e) => return json_error(StatusCode::NOT_FOUND, &e.to_string()),
     };
@@ -166,7 +189,7 @@ async fn download(
     let (tx, rx) = mpsc::channel::<Result<Bytes, anyhow::Error>>(16);
     let engine = state.engine.clone();
     let b = q.bucket.clone();
-    let k = q.key.clone();
+    let k = key.to_string();
 
     tokio::task::spawn(async move {
         if let Err(e) = engine.get_object_stream(&b, &k, parsed_range, tx).await {
@@ -177,11 +200,10 @@ async fn download(
     use tokio_stream::wrappers::ReceiverStream;
     let stream = Box::pin(ReceiverStream::new(rx));
 
-    let filename = q
-        .key
+    let filename = key
         .rsplit('/')
         .next()
-        .unwrap_or(&q.key)
+        .unwrap_or(key)
         .to_string();
     // Serve text files inline so the browser renders them directly.
     let disposition = if crate::server::is_text_content_type(Some(&content_type)) {

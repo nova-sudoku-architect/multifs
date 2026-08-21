@@ -340,6 +340,23 @@ impl MetadataDb {
             conn.execute("UPDATE schema_version SET version = 4", [])?;
         }
 
+        // Migration 5: introduce `folder_meta` so a folder (a key prefix) can
+        // carry metadata — currently just an optional `preview_key` pointing at
+        // a cover image object inside that folder. Folders are not first-class
+        // objects, so this is the first place per-folder metadata can live.
+        if current < 5 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS folder_meta (
+                    bucket_name  TEXT NOT NULL,
+                    prefix       TEXT NOT NULL,
+                    preview_key  TEXT,
+                    updated_at   INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (bucket_name, prefix)
+                );",
+            )?;
+            conn.execute("UPDATE schema_version SET version = 5", [])?;
+        }
+
         Ok(())
     }
 
@@ -406,6 +423,14 @@ impl MetadataDb {
                 pcloud_account TEXT NOT NULL,
                 pcloud_path TEXT NOT NULL,
                 PRIMARY KEY (upload_id, part_number)
+            );
+
+            CREATE TABLE IF NOT EXISTS folder_meta (
+                bucket_name  TEXT NOT NULL,
+                prefix       TEXT NOT NULL,
+                preview_key  TEXT,
+                updated_at   INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (bucket_name, prefix)
             );
             ",
         )?;
@@ -1345,6 +1370,119 @@ impl MetadataDb {
             Ok(v)
         })
     }
+
+    // ---- Folder metadata (preview image) ----
+
+    /// Record (or replace) the preview image key for a folder prefix.
+    pub fn set_folder_preview(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        preview_key: &str,
+    ) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            let now = chrono::Utc::now().timestamp_millis();
+            conn.execute(
+                "INSERT INTO folder_meta (bucket_name, prefix, preview_key, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(bucket_name, prefix) DO UPDATE SET
+                   preview_key = excluded.preview_key,
+                   updated_at = excluded.updated_at",
+                params![bucket, prefix, preview_key, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Return the recorded preview image key for a folder prefix, if any.
+    pub fn get_folder_preview(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> anyhow::Result<Option<String>> {
+        self.with_conn(|conn| {
+            let v: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT preview_key FROM folder_meta WHERE bucket_name = ?1 AND prefix = ?2",
+                    params![bucket, prefix],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+            Ok(v.flatten())
+        })
+    }
+
+    /// Remove the preview image recording for a folder prefix.
+    pub fn clear_folder_preview(&self, bucket: &str, prefix: &str) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM folder_meta WHERE bucket_name = ?1 AND prefix = ?2",
+                params![bucket, prefix],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// List recorded folder metadata as (bucket, prefix, preview_key).
+    /// When `bucket` is `Some`, restrict to that bucket.
+    pub fn list_folder_meta(
+        &self,
+        bucket: Option<&str>,
+    ) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
+        self.with_conn(|conn| {
+            let mut out = Vec::new();
+            if let Some(b) = bucket {
+                let mut stmt = conn.prepare(
+                    "SELECT bucket_name, prefix, preview_key FROM folder_meta \
+                     WHERE bucket_name = ?1 ORDER BY prefix",
+                )?;
+                let rows =
+                    stmt.query_map(params![b], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                for r in rows {
+                    out.push(r?);
+                }
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT bucket_name, prefix, preview_key FROM folder_meta \
+                     ORDER BY bucket_name, prefix",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                for r in rows {
+                    out.push(r?);
+                }
+            }
+            Ok(out)
+        })
+    }
+}
+
+/// Whether a key's basename looks like a folder cover image.
+///
+/// Convention: a literal `cover.jpg` (or any image extension), or a
+/// `<name>.cover.<ext>` file (e.g. `blor-116.cover.jpg`).
+pub fn is_cover_image_key(key: &str) -> bool {
+    let name = key.rsplit('/').next().unwrap_or(key);
+    is_cover_image_name(name)
+}
+
+fn is_cover_image_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "cover.jpg"
+        || n == "cover.jpeg"
+        || n == "cover.png"
+        || n == "cover.webp"
+        || n == "cover.gif"
+        || n.ends_with(".cover.jpg")
+        || n.ends_with(".cover.jpeg")
+        || n.ends_with(".cover.png")
+        || n.ends_with(".cover.webp")
+        || n.ends_with(".cover.gif")
+}
+
+/// Parent prefix of a key (with trailing slash), or `None` if the key sits at
+/// the bucket root (no `/` in it).
+pub fn parent_prefix(key: &str) -> Option<String> {
+    key.rsplit_once('/').map(|(p, _)| format!("{}/", p))
 }
 
 #[cfg(test)]
@@ -1449,7 +1587,7 @@ mod tests {
                 )?)
             })
             .unwrap();
-        assert_eq!(version, 4, "migration should set version to 4");
+        assert_eq!(version, 5, "migration should set version to 5");
 
         // The legacy object became version 1 of a file, with its blob preserved.
         let obj = db.get_object("b", "k.txt").unwrap().expect("object migrated");
