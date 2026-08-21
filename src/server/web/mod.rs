@@ -123,6 +123,7 @@ async fn list_objects(
             }
         })
         .unwrap_or_default();
+    let mut symlink_set: Vec<String> = Vec::new();
     if let Ok(links) = state.engine.symlink_prefixes_under(&bucket, prefix.as_deref()) {
         for sp in links {
             let presented = if effective != link_root {
@@ -133,6 +134,7 @@ async fn list_objects(
             } else {
                 sp.clone()
             };
+            symlink_set.push(presented.clone());
             if !prefixes.contains(&presented) {
                 prefixes.push(presented);
             }
@@ -157,6 +159,7 @@ async fn list_objects(
                 "summary_key": m.and_then(|m| m.summary_key.as_ref()),
                 "preview_gif_key": m.and_then(|m| m.preview_gif_key.as_ref()),
                 "child_count": child_count,
+                "is_symlink": symlink_set.contains(&p),
             })
         })
         .collect();

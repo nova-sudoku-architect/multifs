@@ -63,6 +63,7 @@
     display: inline-block; padding: 1px 8px; border-radius: 10px;
     background: #223; color: var(--muted); font-size: 11px; margin-left: 8px;
   }
+  .symlink-badge { background: rgba(245,166,35,.15); color: #f5a623; }
   a.file-link { color: var(--accent2); }
   a.vlc-link { color: #f5a623; font-weight: 600; margin-left: 10px; text-decoration: none; white-space: nowrap; }
   a.vlc-link:hover { text-decoration: underline; }
@@ -466,7 +467,7 @@ function folderRowHtml(bucket, f, showThumb) {
     ico = '<span class="ico icon-folder">📁</span>';
   }
   return `<tr class="row-link" data-prefix="${esc(prefix)}">
-    <td><div class="name">${ico}<a>${esc(name)}/</a>${childBadge(f)}</div></td>
+    <td><div class="name">${ico}<a>${esc(name)}/</a>${childBadge(f)}${symlinkBadge(f)}</div></td>
     <td class="size"></td><td class="mtime"></td><td class="ctype"></td>
   </tr>`;
 }
@@ -477,6 +478,12 @@ function childBadge(f) {
   if (cc == null) return '';
   const label = cc === 1 ? '1 item' : cc + ' items';
   return `<span class="badge">${label}</span>`;
+}
+
+// Badge marking a folder that is a symlink (tag folder).
+function symlinkBadge(f) {
+  if (!(f && f.is_symlink)) return '';
+  return `<span class="badge symlink-badge" title="Tag folder (symlink)">🔗</span>`;
 }
 
 function fileRowHtml(bucket, f, showPreviewCol) {
@@ -511,7 +518,7 @@ function renderNamesMode(bucket, folders, files) {
   for (const f of folders) {
     const prefix = typeof f === 'string' ? f : f.prefix;
     const name = prefix.replace(/\/$/, '').split('/').pop();
-    html += `<div class="name-item folder" data-prefix="${esc(prefix)}"><a>${esc(name)}/</a>${childBadge(f)}</div>`;
+    html += `<div class="name-item folder" data-prefix="${esc(prefix)}"><a>${esc(name)}/</a>${childBadge(f)}${symlinkBadge(f)}</div>`;
   }
   for (const f of files) {
     const name = f.key.split('/').pop();
@@ -550,7 +557,7 @@ function renderPreviewMode(bucket, folders, files) {
       const purl = '/api/download?' + new URLSearchParams({ bucket, key: f.cover_key });
       html += `<div class="folder-card" data-prefix="${esc(prefix)}">
         <div class="fthumb"><img src="${esc(purl)}" loading="lazy" alt="${esc(name)}"></div>
-        <div class="fname">${esc(name)}${childBadge(f)}</div>
+        <div class="fname">${esc(name)}${childBadge(f)}${symlinkBadge(f)}</div>
       </div>`;
     }
     html += '</div>';
