@@ -109,6 +109,12 @@
   .name-item:hover { background: var(--panel2); }
   .name-item.folder a { color: var(--folder); }
   .name-item.file a { color: var(--accent2); }
+  /* Per-folder preview page (cover → GIF → summary). */
+  .folder-detail { display: flex; flex-direction: column; gap: 14px; margin: 4px 0 18px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); }
+  .folder-detail .fd-head { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 6px; }
+  .folder-detail .fd-cover img { max-width: 100%; max-height: 360px; border-radius: 8px; border: 1px solid var(--border); background: #000; object-fit: contain; display: block; }
+  .folder-detail .fd-gif img { max-width: 100%; max-height: 280px; border-radius: 8px; border: 1px solid var(--border); background: #000; display: block; }
+  .folder-detail .fd-summary { max-height: 320px; overflow: auto; white-space: pre-wrap; font-size: 13px; color: var(--text); background: var(--panel2); padding: 12px; border-radius: 8px; border: 1px solid var(--border); }
   .slide-nav { display: none; align-items: center; gap: 6px; }
   .slide-nav button {
     background: var(--panel2); color: var(--text); border: 1px solid var(--border);
@@ -430,11 +436,11 @@ async function loadBuckets() {
 function folderRowHtml(bucket, f, showThumb) {
   const prefix = typeof f === 'string' ? f : f.prefix;
   const name = prefix.replace(/\/$/, '').split('/').pop();
-  // Show the folder's preview image only in preview mode (and only when
+  // Show the folder's cover image only in preview mode (and only when
   // recorded + present); otherwise keep the standard folder icon.
   let ico;
-  if (showThumb && f && f.preview_key) {
-    const purl = '/api/download?' + new URLSearchParams({ bucket, key: f.preview_key });
+  if (showThumb && f && f.cover_key) {
+    const purl = '/api/download?' + new URLSearchParams({ bucket, key: f.cover_key });
     ico = `<img class="fthumb" src="${esc(purl)}" alt="" loading="lazy">`;
   } else {
     ico = '<span class="ico icon-folder">📁</span>';
@@ -499,8 +505,8 @@ function renderNamesMode(bucket, folders, files) {
 function renderPreviewMode(bucket, folders, files) {
   const images = files.filter(f => isImage(f.key));
   const others = files.filter(f => !isImage(f.key));
-  const withPreview = folders.filter(f => f && f.preview_key);
-  const noPreview = folders.filter(f => !(f && f.preview_key));
+  const withPreview = folders.filter(f => f && f.cover_key);
+  const noPreview = folders.filter(f => !(f && f.cover_key));
   let html = '';
   if (images.length) {
     html += '<div class="gallery">';
@@ -521,7 +527,7 @@ function renderPreviewMode(bucket, folders, files) {
     for (const f of withPreview) {
       const prefix = f.prefix;
       const name = prefix.replace(/\/$/, '').split('/').pop();
-      const purl = '/api/download?' + new URLSearchParams({ bucket, key: f.preview_key });
+      const purl = '/api/download?' + new URLSearchParams({ bucket, key: f.cover_key });
       html += `<div class="folder-card" data-prefix="${esc(prefix)}">
         <div class="fthumb"><img src="${esc(purl)}" loading="lazy" alt="${esc(name)}"></div>
         <div class="fname">${esc(name)}${childBadge(f)}</div>
@@ -539,6 +545,41 @@ function renderPreviewMode(bucket, folders, files) {
   return html;
 }
 
+// Per-folder preview page: render cover image → GIF → summary (skip missing).
+function renderFolderDetail(bucket, folder) {
+  if (!folder) return '';
+  let html = '<div class="folder-detail">';
+  if (folder.cover_key) {
+    const u = '/api/download?' + new URLSearchParams({ bucket, key: folder.cover_key });
+    html += `<div><div class="fd-head">Cover</div><div class="fd-cover"><img src="${esc(u)}" alt="cover"></div></div>`;
+  }
+  if (folder.preview_gif_key) {
+    const u = '/api/download?' + new URLSearchParams({ bucket, key: folder.preview_gif_key });
+    html += `<div><div class="fd-head">Preview</div><div class="fd-gif"><img src="${esc(u)}" alt="preview"></div></div>`;
+  }
+  if (folder.summary_key) {
+    html += `<div><div class="fd-head">Summary</div><div class="fd-summary" id="fdSummary">Loading…</div></div>`;
+  }
+  html += '</div>';
+  return html;
+}
+
+// Fetch and display the folder's summary text (markdown/json) as plain text.
+function loadSummaryText(bucket, folder) {
+  if (!folder || !folder.summary_key) return;
+  const u = '/api/download?' + new URLSearchParams({ bucket, key: folder.summary_key });
+  fetch(u)
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+    .then(text => {
+      const el = document.getElementById('fdSummary');
+      if (el) el.textContent = text;
+    })
+    .catch(() => {
+      const el = document.getElementById('fdSummary');
+      if (el) el.textContent = '(summary unavailable)';
+    });
+}
+
 async function loadList(bucket, prefix) {
   state.bucket = bucket; state.prefix = prefix;
   renderCrumb(bucket, prefix);
@@ -550,20 +591,25 @@ async function loadList(bucket, prefix) {
     const folders = data.prefixes || [];
     const files = data.files || [];
 
-    if (!folders.length && !files.length) {
+    // Per-folder preview page (cover → GIF → summary) shown at the top when
+    // the current folder has recorded metadata.
+    const detail = renderFolderDetail(bucket, data.folder);
+
+    if (!folders.length && !files.length && !detail) {
       main.innerHTML = '<div class="empty">This folder is empty.</div>';
       return;
     }
 
-    let html = state.mode === 'preview'
+    let html = detail + (state.mode === 'preview'
       ? renderPreviewMode(bucket, folders, files)
       : state.mode === 'names'
         ? renderNamesMode(bucket, folders, files)
-        : renderListMode(bucket, folders, files);
+        : renderListMode(bucket, folders, files));
 
     if (data.truncated) html += '<div class="note">⚠ Listing truncated (very large folder).</div>';
     html += '<div class="note">Read-only — downloads only. Range requests supported for streaming.</div>';
     main.innerHTML = html;
+    loadSummaryText(bucket, data.folder);
     main.querySelectorAll('tr.row-link').forEach(tr => {
       tr.onclick = () => navigate(bucket, tr.dataset.prefix);
     });

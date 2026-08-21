@@ -341,20 +341,48 @@ impl MetadataDb {
         }
 
         // Migration 5: introduce `folder_meta` so a folder (a key prefix) can
-        // carry metadata — currently just an optional `preview_key` pointing at
-        // a cover image object inside that folder. Folders are not first-class
-        // objects, so this is the first place per-folder metadata can live.
+        // carry metadata. Folders are not first-class objects, so this is the
+        // first place per-folder metadata can live. (The original v5 shipped a
+        // single `preview_key` column; migration 6 generalizes it.)
         if current < 5 {
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS folder_meta (
-                    bucket_name  TEXT NOT NULL,
-                    prefix       TEXT NOT NULL,
-                    preview_key  TEXT,
-                    updated_at   INTEGER NOT NULL DEFAULT 0,
+                    bucket_name     TEXT NOT NULL,
+                    prefix          TEXT NOT NULL,
+                    cover_key       TEXT,
+                    summary_key     TEXT,
+                    preview_gif_key TEXT,
+                    updated_at      INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (bucket_name, prefix)
                 );",
             )?;
             conn.execute("UPDATE schema_version SET version = 5", [])?;
+        }
+
+        // Migration 6: generalize `folder_meta` for the folder preview page
+        // (Feature 5) — one cover image, one preview GIF, and one summary per
+        // folder. The original v5 column was `preview_key` (the cover image);
+        // rename it to `cover_key` and add `summary_key` + `preview_gif_key`.
+        // All three steps are guarded by column existence so this is idempotent
+        // and safe on both the live v5 DB and fresh installs.
+        if current < 6 {
+            let cols: Vec<String> = conn
+                .prepare("PRAGMA table_info(folder_meta)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            if cols.iter().any(|c| c == "preview_key") && !cols.iter().any(|c| c == "cover_key") {
+                conn.execute_batch("ALTER TABLE folder_meta RENAME COLUMN preview_key TO cover_key;")?;
+            }
+            if !cols.iter().any(|c| c == "summary_key") {
+                conn.execute_batch("ALTER TABLE folder_meta ADD COLUMN summary_key TEXT;")?;
+            }
+            if !cols.iter().any(|c| c == "preview_gif_key") {
+                conn.execute_batch("ALTER TABLE folder_meta ADD COLUMN preview_gif_key TEXT;")?;
+            }
+
+            conn.execute("UPDATE schema_version SET version = 6", [])?;
         }
 
         Ok(())
@@ -426,10 +454,12 @@ impl MetadataDb {
             );
 
             CREATE TABLE IF NOT EXISTS folder_meta (
-                bucket_name  TEXT NOT NULL,
-                prefix       TEXT NOT NULL,
-                preview_key  TEXT,
-                updated_at   INTEGER NOT NULL DEFAULT 0,
+                bucket_name     TEXT NOT NULL,
+                prefix          TEXT NOT NULL,
+                cover_key       TEXT,
+                summary_key     TEXT,
+                preview_gif_key TEXT,
+                updated_at      INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (bucket_name, prefix)
             );
             ",
@@ -1371,49 +1401,70 @@ impl MetadataDb {
         })
     }
 
-    // ---- Folder metadata (preview image) ----
+    // ---- Folder metadata (cover image, summary, preview GIF) ----
 
-    /// Record (or replace) the preview image key for a folder prefix.
-    pub fn set_folder_preview(
+    /// Record (or replace) the cover image key for a folder prefix.
+    pub fn set_folder_cover(&self, bucket: &str, prefix: &str, cover_key: &str) -> anyhow::Result<()> {
+        self.set_folder_field(bucket, prefix, FolderField::Cover, cover_key)
+    }
+
+    /// Record (or replace) the summary key for a folder prefix.
+    pub fn set_folder_summary(&self, bucket: &str, prefix: &str, summary_key: &str) -> anyhow::Result<()> {
+        self.set_folder_field(bucket, prefix, FolderField::Summary, summary_key)
+    }
+
+    /// Record (or replace) the preview GIF key for a folder prefix.
+    pub fn set_folder_gif(&self, bucket: &str, prefix: &str, gif_key: &str) -> anyhow::Result<()> {
+        self.set_folder_field(bucket, prefix, FolderField::Gif, gif_key)
+    }
+
+    /// Shared upsert for a single folder_meta column. `field` is a fixed enum
+    /// (never user input), so the column name is a compile-time constant.
+    fn set_folder_field(
         &self,
         bucket: &str,
         prefix: &str,
-        preview_key: &str,
+        field: FolderField,
+        value: &str,
     ) -> anyhow::Result<()> {
+        let column = field.column();
+        let sql = format!(
+            "INSERT INTO folder_meta (bucket_name, prefix, {column}, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(bucket_name, prefix) DO UPDATE SET
+               {column} = excluded.{column},
+               updated_at = excluded.updated_at"
+        );
         self.with_conn(|conn| {
             let now = chrono::Utc::now().timestamp_millis();
-            conn.execute(
-                "INSERT INTO folder_meta (bucket_name, prefix, preview_key, updated_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(bucket_name, prefix) DO UPDATE SET
-                   preview_key = excluded.preview_key,
-                   updated_at = excluded.updated_at",
-                params![bucket, prefix, preview_key, now],
-            )?;
+            conn.execute(&sql, params![bucket, prefix, value, now])?;
             Ok(())
         })
     }
 
-    /// Return the recorded preview image key for a folder prefix, if any.
-    pub fn get_folder_preview(
-        &self,
-        bucket: &str,
-        prefix: &str,
-    ) -> anyhow::Result<Option<String>> {
+    /// Return the recorded folder metadata (cover/summary/gif) for a prefix.
+    pub fn get_folder_meta(&self, bucket: &str, prefix: &str) -> anyhow::Result<Option<FolderMeta>> {
         self.with_conn(|conn| {
-            let v: Option<Option<String>> = conn
+            let v: Option<FolderMeta> = conn
                 .query_row(
-                    "SELECT preview_key FROM folder_meta WHERE bucket_name = ?1 AND prefix = ?2",
+                    "SELECT cover_key, summary_key, preview_gif_key FROM folder_meta \
+                     WHERE bucket_name = ?1 AND prefix = ?2",
                     params![bucket, prefix],
-                    |row| row.get::<_, Option<String>>(0),
+                    |row| {
+                        Ok(FolderMeta {
+                            cover_key: row.get(0)?,
+                            summary_key: row.get(1)?,
+                            preview_gif_key: row.get(2)?,
+                        })
+                    },
                 )
                 .optional()?;
-            Ok(v.flatten())
+            Ok(v)
         })
     }
 
-    /// Remove the preview image recording for a folder prefix.
-    pub fn clear_folder_preview(&self, bucket: &str, prefix: &str) -> anyhow::Result<()> {
+    /// Remove all folder metadata for a folder prefix.
+    pub fn clear_folder_meta(&self, bucket: &str, prefix: &str) -> anyhow::Result<()> {
         self.with_conn(|conn| {
             conn.execute(
                 "DELETE FROM folder_meta WHERE bucket_name = ?1 AND prefix = ?2",
@@ -1423,30 +1474,40 @@ impl MetadataDb {
         })
     }
 
-    /// List recorded folder metadata as (bucket, prefix, preview_key).
+    /// List recorded folder metadata as (bucket, prefix, FolderMeta).
     /// When `bucket` is `Some`, restrict to that bucket.
     pub fn list_folder_meta(
         &self,
         bucket: Option<&str>,
-    ) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
+    ) -> anyhow::Result<Vec<(String, String, FolderMeta)>> {
         self.with_conn(|conn| {
             let mut out = Vec::new();
+            let mapper = |r: &rusqlite::Row| -> rusqlite::Result<(String, String, FolderMeta)> {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    FolderMeta {
+                        cover_key: r.get(2)?,
+                        summary_key: r.get(3)?,
+                        preview_gif_key: r.get(4)?,
+                    },
+                ))
+            };
             if let Some(b) = bucket {
                 let mut stmt = conn.prepare(
-                    "SELECT bucket_name, prefix, preview_key FROM folder_meta \
-                     WHERE bucket_name = ?1 ORDER BY prefix",
+                    "SELECT bucket_name, prefix, cover_key, summary_key, preview_gif_key \
+                     FROM folder_meta WHERE bucket_name = ?1 ORDER BY prefix",
                 )?;
-                let rows =
-                    stmt.query_map(params![b], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                let rows = stmt.query_map(params![b], mapper)?;
                 for r in rows {
                     out.push(r?);
                 }
             } else {
                 let mut stmt = conn.prepare(
-                    "SELECT bucket_name, prefix, preview_key FROM folder_meta \
-                     ORDER BY bucket_name, prefix",
+                    "SELECT bucket_name, prefix, cover_key, summary_key, preview_gif_key \
+                     FROM folder_meta ORDER BY bucket_name, prefix",
                 )?;
-                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                let rows = stmt.query_map([], mapper)?;
                 for r in rows {
                     out.push(r?);
                 }
@@ -1519,6 +1580,59 @@ fn is_cover_image_name(name: &str) -> bool {
         || n.ends_with(".cover.png")
         || n.ends_with(".cover.webp")
         || n.ends_with(".cover.gif")
+}
+
+/// Whether a key's basename looks like a per-folder summary document.
+///
+/// Convention: `summary.<ext>` or `<name>.summary.<ext>` (the video-subtitle
+/// pipeline emits `<slug>.summary.md` / `.json`).
+pub fn is_summary_key(key: &str) -> bool {
+    let name = key.rsplit('/').next().unwrap_or(key);
+    let n = name.to_ascii_lowercase();
+    n == "summary.md"
+        || n == "summary.json"
+        || n == "summary.txt"
+        || n.ends_with(".summary.md")
+        || n.ends_with(".summary.json")
+        || n.ends_with(".summary.txt")
+}
+
+/// Whether a key's basename looks like a per-folder preview animation GIF.
+///
+/// Convention: `preview.gif` or `<name>.preview.gif`.
+pub fn is_preview_gif_key(key: &str) -> bool {
+    let name = key.rsplit('/').next().unwrap_or(key);
+    let n = name.to_ascii_lowercase();
+    n == "preview.gif" || n.ends_with(".preview.gif")
+}
+
+/// Per-folder metadata for the preview page (Feature 5): one cover image,
+/// one preview GIF, and one summary, each stored as an object key inside the
+/// folder. Any field may be `None` (the page degrades gracefully).
+#[derive(Debug, Clone, Default)]
+pub struct FolderMeta {
+    pub cover_key: Option<String>,
+    pub summary_key: Option<String>,
+    pub preview_gif_key: Option<String>,
+}
+
+/// A single folder_meta column. Column names are fixed compile-time constants
+/// (never user input), so they are safe to interpolate into SQL.
+#[derive(Debug, Clone, Copy)]
+pub enum FolderField {
+    Cover,
+    Summary,
+    Gif,
+}
+
+impl FolderField {
+    pub fn column(self) -> &'static str {
+        match self {
+            FolderField::Cover => "cover_key",
+            FolderField::Summary => "summary_key",
+            FolderField::Gif => "preview_gif_key",
+        }
+    }
 }
 
 /// Parent prefix of a key (with trailing slash), or `None` if the key sits at
@@ -1629,7 +1743,7 @@ mod tests {
                 )?)
             })
             .unwrap();
-        assert_eq!(version, 5, "migration should set version to 5");
+        assert_eq!(version, 6, "migration should set version to 6");
 
         // The legacy object became version 1 of a file, with its blob preserved.
         let obj = db.get_object("b", "k.txt").unwrap().expect("object migrated");

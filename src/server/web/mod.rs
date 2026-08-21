@@ -100,20 +100,23 @@ async fn list_objects(
 
     let (prefixes, files) = crate::server::group_objects_by_prefix(&objects, prefix.as_deref());
 
-    // Resolve a preview image for each folder prefix (only where recorded AND
-    // the object still exists). Omitted previews → UI falls back to the icon.
-    let previews = state
+    // Resolve per-folder metadata (cover/summary/gif) for each folder prefix
+    // (only where recorded AND the object still exists). Omitted → UI degrades.
+    let metas = state
         .engine
-        .folder_previews(&bucket, &prefixes)
+        .folder_meta_map(&bucket, &prefixes)
         .unwrap_or_default();
 
     let prefixes_json: Vec<serde_json::Value> = prefixes
         .into_iter()
         .map(|p| {
             let child_count = state.engine.count_direct_children(&bucket, &p).unwrap_or(0);
+            let m = metas.get(&p);
             json!({
                 "prefix": p,
-                "preview_key": previews.get(&p),
+                "cover_key": m.and_then(|m| m.cover_key.as_ref()),
+                "summary_key": m.and_then(|m| m.summary_key.as_ref()),
+                "preview_gif_key": m.and_then(|m| m.preview_gif_key.as_ref()),
                 "child_count": child_count,
             })
         })
@@ -130,11 +133,33 @@ async fn list_objects(
         })
         .collect();
 
+    // The current folder's OWN metadata (cover/summary/gif), if any — the
+    // UI renders a per-folder preview page from this.
+    let folder_json = match prefix.as_deref() {
+        Some(p) if !p.is_empty() => {
+            let norm = if p.ends_with('/') { p.to_string() } else { format!("{}/", p) };
+            state
+                .engine
+                .folder_meta_map(&bucket, &[norm.clone()])
+                .ok()
+                .and_then(|m| m.get(&norm).cloned())
+                .map(|m| {
+                    json!({
+                        "cover_key": m.cover_key,
+                        "summary_key": m.summary_key,
+                        "preview_gif_key": m.preview_gif_key,
+                    })
+                })
+        }
+        _ => None,
+    };
+
     json_response(json!({
         "bucket": bucket,
         "prefix": prefix.unwrap_or_default(),
         "prefixes": prefixes_json,
         "files": files_json,
+        "folder": folder_json,
         "truncated": truncated,
     }))
 }
