@@ -224,6 +224,97 @@ mount_prefix = "/multifs/018"
 quota_gb = 3
 
 [[storage.accounts]]
+email = "nova-video-019@atomicmail.ai"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_ATOMIC_019"
+mount_prefix = "/multifs/019"
+quota_gb = 3
+
+[[storage.accounts]]
+email = "nova-video-020@atomicmail.ai"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_ATOMIC_020"
+mount_prefix = "/multifs/020"
+quota_gb = 3
+
+[[storage.accounts]]
+email = "nova-video-021@atomicmail.ai"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_ATOMIC_021"
+mount_prefix = "/multifs/021"
+quota_gb = 3
+
+[[storage.accounts]]
+email = "nova-video-022@atomicmail.ai"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_ATOMIC_022"
+mount_prefix = "/multifs/022"
+quota_gb = 3
+
+[[storage.accounts]]
+email = "nova-video-023@atomicmail.ai"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_ATOMIC_023"
+mount_prefix = "/multifs/023"
+quota_gb = 3
+
+[[storage.accounts]]
+email = "nova-video-024@atomicmail.ai"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_ATOMIC_024"
+mount_prefix = "/multifs/024"
+quota_gb = 3
+
+[[storage.accounts]]
+email = "nova-video-025@atomicmail.ai"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_ATOMIC_025"
+mount_prefix = "/multifs/025"
+quota_gb = 3
+
+[[storage.accounts]]
+email = "nova-video-026@atomicmail.ai"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_ATOMIC_026"
+mount_prefix = "/multifs/026"
+quota_gb = 3
+
+[[storage.accounts]]
+email = "nova-video-027@atomicmail.ai"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_ATOMIC_027"
+mount_prefix = "/multifs/027"
+quota_gb = 3
+
+[[storage.accounts]]
+email = "nova-video-028@atomicmail.ai"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_ATOMIC_028"
+mount_prefix = "/multifs/028"
+quota_gb = 3
+
+[[storage.accounts]]
+email = "nova-video-029@atomicmail.ai"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_ATOMIC_029"
+mount_prefix = "/multifs/029"
+quota_gb = 3
+
+[[storage.accounts]]
+email = "nova-video-030@atomicmail.ai"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_ATOMIC_030"
+mount_prefix = "/multifs/030"
+quota_gb = 3
+
+[[storage.accounts]]
+email = "nova-video-031@atomicmail.ai"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_ATOMIC_031"
+mount_prefix = "/multifs/031"
+quota_gb = 3
+
+[[storage.accounts]]
 email = "local-disk"
 backend_type = "local"
 mount_prefix = "/multifs/local"
