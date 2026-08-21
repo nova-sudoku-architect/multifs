@@ -1454,6 +1454,48 @@ impl MetadataDb {
             Ok(out)
         })
     }
+
+    /// Count the direct children of a folder prefix: the number of immediate
+    /// files plus immediate subfolders under `prefix`. Folders are not stored;
+    /// they are derived from key prefixes, so this scans the `files` table.
+    ///
+    /// `prefix` is normalized to end with `/`; an empty (or `/`) prefix means
+    /// the bucket root, counting top-level children.
+    pub fn count_direct_children(&self, bucket: &str, prefix: &str) -> anyhow::Result<i64> {
+        let p = if prefix.is_empty() || prefix == "/" {
+            String::new()
+        } else if prefix.ends_with('/') {
+            prefix.to_string()
+        } else {
+            format!("{}/", prefix)
+        };
+        let pattern = format!("{}%", p);
+        // `substr()` is 1-indexed; this skips the prefix characters so the
+        // remainder can be inspected for a `/` (which would mark a subfolder).
+        let skip = (p.len() + 1) as i64;
+        self.with_conn(|conn| {
+            // Immediate files: remainder has no `/`, and the key is not a
+            // zero-byte folder marker (i.e. does not itself end in `/`).
+            let files: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM files \
+                 WHERE bucket_name = ?1 AND key LIKE ?2 \
+                   AND substr(key, ?3) NOT LIKE '%/%' \
+                   AND key NOT LIKE '%/'",
+                params![bucket, pattern, skip],
+                |r| r.get(0),
+            )?;
+            // Immediate subfolders: distinct first path segment after the prefix.
+            let folders: i64 = conn.query_row(
+                "SELECT COUNT(DISTINCT substr(key, ?3, instr(substr(key, ?3), '/') - 1)) \
+                 FROM files \
+                 WHERE bucket_name = ?1 AND key LIKE ?2 \
+                   AND instr(substr(key, ?3), '/') > 0",
+                params![bucket, pattern, skip],
+                |r| r.get(0),
+            )?;
+            Ok(files + folders)
+        })
+    }
 }
 
 /// Whether a key's basename looks like a folder cover image.

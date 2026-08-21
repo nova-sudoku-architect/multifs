@@ -157,6 +157,35 @@ mod tests {
         assert_eq!(db.account_total_size("a1").unwrap(), 300);
     }
 
+    #[test]
+    fn test_count_direct_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
+        db.create_bucket("test").unwrap();
+
+        // Bucket root: 2 immediate files + 2 immediate subfolders.
+        put_committed(&db, "test", "a.txt", 1, "e1", "2026-01-01", "a1", "/r/a.txt");
+        put_committed(&db, "test", "b.txt", 2, "e2", "2026-01-01", "a1", "/r/b.txt");
+        put_committed(&db, "test", "dir1/c.txt", 3, "e3", "2026-01-01", "a1", "/r/dir1/c.txt");
+        put_committed(&db, "test", "dir1/d.txt", 4, "e4", "2026-01-01", "a1", "/r/dir1/d.txt");
+        put_committed(&db, "test", "dir2/e.txt", 5, "e5", "2026-01-01", "a1", "/r/dir2/e.txt");
+
+        // Root prefix (empty or "/"): 2 files (a.txt, b.txt) + 2 subfolders (dir1, dir2).
+        assert_eq!(db.count_direct_children("test", "").unwrap(), 4);
+        assert_eq!(db.count_direct_children("test", "/").unwrap(), 4);
+
+        // dir1: 2 files; normalized prefix (with/without trailing slash) agrees.
+        assert_eq!(db.count_direct_children("test", "dir1").unwrap(), 2);
+        assert_eq!(db.count_direct_children("test", "dir1/").unwrap(), 2);
+
+        // dir2: 1 file.
+        assert_eq!(db.count_direct_children("test", "dir2/").unwrap(), 1);
+
+        // Unknown prefix: 0 children.
+        assert_eq!(db.count_direct_children("test", "nope/").unwrap(), 0);
+    }
+
     // ---- S3 XML format tests ----
 
     #[test]

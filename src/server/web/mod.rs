@@ -110,9 +110,11 @@ async fn list_objects(
     let prefixes_json: Vec<serde_json::Value> = prefixes
         .into_iter()
         .map(|p| {
+            let child_count = state.engine.count_direct_children(&bucket, &p).unwrap_or(0);
             json!({
                 "prefix": p,
                 "preview_key": previews.get(&p),
+                "child_count": child_count,
             })
         })
         .collect();

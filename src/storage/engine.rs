@@ -898,6 +898,12 @@ impl StorageEngine {
         Ok(out)
     }
 
+    /// Count the direct children (immediate files + subfolders) of a folder
+    /// prefix. Delegates to the metadata layer's prefix scan.
+    pub fn count_direct_children(&self, bucket: &str, prefix: &str) -> anyhow::Result<i64> {
+        self.meta.count_direct_children(bucket, prefix)
+    }
+
     // -----------------------------------------------------------------
     //  Shard status
     // -----------------------------------------------------------------

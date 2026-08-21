@@ -440,9 +440,17 @@ function folderRowHtml(bucket, f, showThumb) {
     ico = '<span class="ico icon-folder">📁</span>';
   }
   return `<tr class="row-link" data-prefix="${esc(prefix)}">
-    <td><div class="name">${ico}<a>${esc(name)}/</a></div></td>
+    <td><div class="name">${ico}<a>${esc(name)}/</a>${childBadge(f)}</div></td>
     <td class="size"></td><td class="mtime"></td><td class="ctype"></td>
   </tr>`;
+}
+
+// Small "N items" badge for a folder, showing its direct child count.
+function childBadge(f) {
+  const cc = (f && typeof f.child_count === 'number') ? f.child_count : null;
+  if (cc == null) return '';
+  const label = cc === 1 ? '1 item' : cc + ' items';
+  return `<span class="badge">${label}</span>`;
 }
 
 function fileRowHtml(bucket, f, showPreviewCol) {
@@ -477,7 +485,7 @@ function renderNamesMode(bucket, folders, files) {
   for (const f of folders) {
     const prefix = typeof f === 'string' ? f : f.prefix;
     const name = prefix.replace(/\/$/, '').split('/').pop();
-    html += `<div class="name-item folder" data-prefix="${esc(prefix)}"><a>${esc(name)}/</a></div>`;
+    html += `<div class="name-item folder" data-prefix="${esc(prefix)}"><a>${esc(name)}/</a>${childBadge(f)}</div>`;
   }
   for (const f of files) {
     const name = f.key.split('/').pop();
@@ -516,7 +524,7 @@ function renderPreviewMode(bucket, folders, files) {
       const purl = '/api/download?' + new URLSearchParams({ bucket, key: f.preview_key });
       html += `<div class="folder-card" data-prefix="${esc(prefix)}">
         <div class="fthumb"><img src="${esc(purl)}" loading="lazy" alt="${esc(name)}"></div>
-        <div class="fname">${esc(name)}</div>
+        <div class="fname">${esc(name)}${childBadge(f)}</div>
       </div>`;
     }
     html += '</div>';
