@@ -1807,11 +1807,15 @@ pub fn is_summary_key(key: &str) -> bool {
 
 /// Whether a key's basename looks like a per-folder preview animation GIF.
 ///
-/// Convention: `preview.gif` or `<name>.preview.gif`.
+/// Convention: `preview.gif`, `<name>.preview.gif`, or `<name>.keyframes.gif`
+/// (the video-subtitle pipeline emits `<slug>.keyframes.gif`).
 pub fn is_preview_gif_key(key: &str) -> bool {
     let name = key.rsplit('/').next().unwrap_or(key);
     let n = name.to_ascii_lowercase();
-    n == "preview.gif" || n.ends_with(".preview.gif")
+    n == "preview.gif"
+        || n.ends_with(".preview.gif")
+        || n.ends_with(".keyframes.gif")
+        || n == "keyframes.gif"
 }
 
 /// Per-folder metadata for the preview page (Feature 5): one cover image,

@@ -114,8 +114,12 @@ fn summary_rank(name: &str) -> u8 {
 fn gif_rank(name: &str) -> u8 {
     let n = name.to_ascii_lowercase();
     if n == "preview.gif" {
+        3
+    } else if n == "keyframes.gif" {
         2
     } else if n.ends_with(".preview.gif") {
+        2
+    } else if n.ends_with(".keyframes.gif") {
         1
     } else {
         0
