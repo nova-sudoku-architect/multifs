@@ -443,14 +443,19 @@ impl StorageEngine {
     // -----------------------------------------------------------------
 
     pub async fn get_object(&self, bucket: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+        // Read-through symlink: a get on a link key (or under it) reads the target.
+        let (bucket, key) = match self.resolve_read_key(bucket, key)? {
+            Some((b, k)) => (b, k),
+            None => (bucket.to_string(), key.to_string()),
+        };
         let obj = self
             .meta
-            .get_object(bucket, key)?
+            .get_object(&bucket, &key)?
             .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
 
         // Detect multipart composite and assemble from persisted parts.
         if let Some(upload_id) = Self::multipart_upload_id(&obj.remote_path) {
-            return self.get_multipart_object(bucket, key, &upload_id).await;
+            return self.get_multipart_object(&bucket, &key, &upload_id).await;
         }
 
         let backend = self.find_backend(&obj.account_email)?;
@@ -529,14 +534,19 @@ impl StorageEngine {
         range: Option<(usize, usize)>,
         tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
     ) -> anyhow::Result<()> {
+        // Read-through symlink: resolve the link key to its target before streaming.
+        let (bucket, key) = match self.resolve_read_key(bucket, key)? {
+            Some((b, k)) => (b, k),
+            None => (bucket.to_string(), key.to_string()),
+        };
         let obj = self
             .meta
-            .get_object(bucket, key)?
+            .get_object(&bucket, &key)?
             .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
 
         // Detect multipart composite and assemble from parts.
         if let Some(upload_id) = Self::multipart_upload_id(&obj.remote_path) {
-            return self.get_multipart_object_stream(bucket, key, &upload_id, range, tx).await;
+            return self.get_multipart_object_stream(&bucket, &key, &upload_id, range, tx).await;
         }
 
         let backend = self.find_backend(&obj.account_email)?;
@@ -693,9 +703,14 @@ impl StorageEngine {
     }
 
     pub async fn head_object(&self, bucket: &str, key: &str) -> anyhow::Result<ObjectInfo> {
+        // Read-through symlink: a head on a link key (or under it) resolves to the target.
+        let (bucket, key) = match self.resolve_read_key(bucket, key)? {
+            Some((b, k)) => (b, k),
+            None => (bucket.to_string(), key.to_string()),
+        };
         let obj = self
             .meta
-            .get_object(bucket, key)?
+            .get_object(&bucket, &key)?
             .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
         Ok(ObjectInfo {
             key: obj.key,
@@ -1022,6 +1037,48 @@ impl StorageEngine {
                     )));
                 }
             }
+        }
+    }
+
+    /// Resolve a full object key through symlinks for read-through (get/head).
+    /// Returns the resolved `(bucket, key)` to actually read, or `None` when no
+    /// symlink applies. Depth-capped at 8 hops to prevent loops. Same-bucket
+    /// only (matches v1 constraint).
+    pub fn resolve_read_key(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let trimmed = key.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let mut current = trimmed.to_string();
+        let mut hops = 0;
+        loop {
+            match self.meta.resolve_symlink(bucket, &current)? {
+                Some((tb, tk, rem)) => {
+                    if tb != bucket {
+                        return Ok(None); // same-bucket only
+                    }
+                    let mut target = tk.trim_end_matches('/').to_string();
+                    if !rem.is_empty() {
+                        target.push('/');
+                        target.push_str(&rem);
+                    }
+                    current = target;
+                    hops += 1;
+                    if hops >= 8 {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        if hops == 0 {
+            Ok(None)
+        } else {
+            Ok(Some((bucket.to_string(), current)))
         }
     }
 

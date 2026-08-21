@@ -508,6 +508,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_engine_symlink_read_through_get_head() {
+        let t = make_test_engine();
+        let engine = &t.engine;
+        engine.create_bucket("link-bucket").await.unwrap();
+        engine
+            .put_object("link-bucket", "video-subtitle/blor-116/a.mkv", b"aaa")
+            .await
+            .unwrap();
+        engine
+            .create_symlink("link-bucket", "tags/kiss/blor-116", "link-bucket", "video-subtitle/blor-116")
+            .unwrap();
+
+        // get through the link resolves to the target object.
+        let data = engine
+            .get_object("link-bucket", "tags/kiss/blor-116/a.mkv")
+            .await
+            .unwrap();
+        assert_eq!(data, b"aaa");
+
+        // head through the link resolves to the target object.
+        let info = engine
+            .head_object("link-bucket", "tags/kiss/blor-116/a.mkv")
+            .await
+            .unwrap();
+        assert_eq!(info.size, 3);
+        assert_eq!(info.key, "video-subtitle/blor-116/a.mkv");
+
+        // A non-existent key under the link still 404s.
+        assert!(engine
+            .get_object("link-bucket", "tags/kiss/blor-116/missing.mkv")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn test_engine_symlink_cross_bucket_rejected() {
         let t = make_test_engine();
         let engine = &t.engine;
