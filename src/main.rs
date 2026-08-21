@@ -48,6 +48,8 @@ enum Cli {
     Vacuum(cli::vacuum_cmd::VacuumArgs),
     /// Manage per-folder metadata (preview image)
     Folder(cli::folder_cmd::FolderArgs),
+    /// Manage symlinks (tag folders)
+    Link(cli::link_cmd::LinkArgs),
 }
 
 #[tokio::main]
@@ -77,6 +79,7 @@ async fn main() -> Result<()> {
         Cli::Fsck(args) => cli::fsck_cmd::run(args).await?,
         Cli::Vacuum(args) => cli::vacuum_cmd::run(args).await?,
         Cli::Folder(args) => cli::folder_cmd::run(args).await?,
+        Cli::Link(args) => cli::link_cmd::run(args).await?,
     }
 
     Ok(())

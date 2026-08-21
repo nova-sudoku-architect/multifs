@@ -186,6 +186,51 @@ mod tests {
         assert_eq!(db.count_direct_children("test", "nope/").unwrap(), 0);
     }
 
+    #[test]
+    fn test_symlink_crud_resolve_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(dir.path().join("test.db").to_str().unwrap()).unwrap();
+        db.create_bucket("test").unwrap();
+
+        put_committed(&db, "test", "video-subtitle/blor-116/a.mkv", 1, "e", "2026-01-01", "a1", "/r/a.mkv");
+
+        // Create a tag-folder link.
+        db.create_symlink("test", "tags/kiss/blor-116", "test", "video-subtitle/blor-116").unwrap();
+
+        // is_symlink is slash-normalized.
+        assert!(db.is_symlink("test", "tags/kiss/blor-116").unwrap());
+        assert!(db.is_symlink("test", "tags/kiss/blor-116/").unwrap());
+        assert!(!db.is_symlink("test", "video-subtitle/blor-116").unwrap());
+
+        // Exact resolve.
+        let r = db.resolve_symlink("test", "tags/kiss/blor-116").unwrap().unwrap();
+        assert_eq!(r.0, "test");
+        assert_eq!(r.1, "video-subtitle/blor-116");
+        assert_eq!(r.2, "");
+
+        // Ancestor resolve (path under a link).
+        let r2 = db.resolve_symlink("test", "tags/kiss/blor-116/sub/x.mkv").unwrap().unwrap();
+        assert_eq!(r2.1, "video-subtitle/blor-116");
+        assert_eq!(r2.2, "sub/x.mkv");
+
+        // No link applies.
+        assert!(db.resolve_symlink("test", "video-subtitle/blor-116").unwrap().is_none());
+
+        // list_symlinks_under finds direct children only.
+        let under = db.list_symlinks_under("test", "tags/kiss").unwrap();
+        assert_eq!(under.len(), 1);
+        assert_eq!(under[0].key, "tags/kiss/blor-116");
+        assert!(db.list_symlinks_under("test", "tags").unwrap().is_empty());
+
+        // list_all_symlinks sees it across buckets.
+        assert_eq!(db.list_all_symlinks().unwrap().len(), 1);
+
+        // Delete removes only the link row; the target object survives.
+        db.delete_symlink("test", "tags/kiss/blor-116").unwrap();
+        assert!(!db.is_symlink("test", "tags/kiss/blor-116").unwrap());
+        assert!(db.get_object("test", "video-subtitle/blor-116/a.mkv").unwrap().is_some());
+    }
+
     // ---- S3 XML format tests ----
 
     #[test]
@@ -411,6 +456,85 @@ mod tests {
             .unwrap();
         assert_eq!(prefixed.len(), 1);
         assert_eq!(prefixed[0].key, "a.txt");
+    }
+
+    #[tokio::test]
+    async fn test_engine_symlink_listing_and_safe_delete() {
+        let t = make_test_engine();
+        let engine = &t.engine;
+        engine.create_bucket("link-bucket").await.unwrap();
+
+        // Real folder with two files.
+        engine
+            .put_object("link-bucket", "video-subtitle/blor-116/a.mkv", b"aaa")
+            .await
+            .unwrap();
+        engine
+            .put_object("link-bucket", "video-subtitle/blor-116/b.mkv", b"bbb")
+            .await
+            .unwrap();
+
+        // Tag-folder link → the real folder.
+        engine
+            .create_symlink("link-bucket", "tags/kiss/blor-116", "link-bucket", "video-subtitle/blor-116")
+            .unwrap();
+
+        // Listing into the link re-presents the target's children under the link.
+        let (objs, _) = engine
+            .list_objects_symlink_aware("link-bucket", Some("tags/kiss/blor-116/"), None, 100)
+            .await
+            .unwrap();
+        assert_eq!(objs.len(), 2);
+        assert!(objs.iter().any(|o| o.key == "tags/kiss/blor-116/a.mkv"));
+        assert!(objs.iter().any(|o| o.key == "tags/kiss/blor-116/b.mkv"));
+
+        // The link shows up as a folder when listing its parent.
+        let prefixes = engine
+            .symlink_prefixes_under("link-bucket", Some("tags/kiss/"))
+            .unwrap();
+        assert_eq!(prefixes, vec!["tags/kiss/blor-116/".to_string()]);
+
+        // Deleting the link removes only the link; the target survives.
+        engine.delete_object("link-bucket", "tags/kiss/blor-116").await.unwrap();
+        assert!(engine
+            .head_object("link-bucket", "video-subtitle/blor-116/a.mkv")
+            .await
+            .is_ok());
+        // And the link no longer resolves.
+        assert!(engine
+            .resolve_list_prefix("link-bucket", "tags/kiss/blor-116/")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_engine_symlink_cross_bucket_rejected() {
+        let t = make_test_engine();
+        let engine = &t.engine;
+        engine.create_bucket("link-bucket").await.unwrap();
+        engine.create_bucket("other").await.unwrap();
+
+        let err = engine
+            .create_symlink("link-bucket", "tags/kiss/blor-116", "other", "video-subtitle/blor-116")
+            .unwrap_err();
+        assert!(err.to_string().contains("cross-bucket"));
+    }
+
+    #[tokio::test]
+    async fn test_engine_delete_bucket_clears_symlinks() {
+        let t = make_test_engine();
+        let engine = &t.engine;
+        engine.create_bucket("link-bucket").await.unwrap();
+        engine
+            .put_object("link-bucket", "video-subtitle/blor-116/a.mkv", b"aaa")
+            .await
+            .unwrap();
+        engine
+            .create_symlink("link-bucket", "tags/kiss/blor-116", "link-bucket", "video-subtitle/blor-116")
+            .unwrap();
+
+        engine.delete_bucket("link-bucket").await.unwrap();
+        assert!(engine.list_all_symlinks().unwrap().is_empty());
     }
 
     #[tokio::test]

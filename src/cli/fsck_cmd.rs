@@ -305,6 +305,64 @@ pub async fn run(args: FsckArgs) -> Result<()> {
     }
 
     // ------------------------------------------------------------------
+    // [6/6] Broken symlinks
+    // ------------------------------------------------------------------
+    println!("\n[6/6] Broken symlinks");
+    let symlinks = meta.list_all_symlinks()?;
+    if symlinks.is_empty() {
+        println!("  ✅ no symlinks recorded");
+    } else {
+        let mut broken: Vec<(String, String, String, String)> = Vec::new();
+        for l in &symlinks {
+            let target_exists = {
+                // Single-object target (exact object), or at least one object
+                // under a folder target prefix.
+                let exact = meta.get_object(&l.target_bucket, &l.target_key)?;
+                let under = meta.list_objects(&l.target_bucket, Some(&l.target_key), None, 1)?;
+                exact.is_some() || !under.is_empty()
+            };
+            if !target_exists {
+                broken.push((
+                    l.bucket_name.clone(),
+                    l.key.clone(),
+                    l.target_bucket.clone(),
+                    l.target_key.clone(),
+                ));
+            }
+        }
+        if broken.is_empty() {
+            println!(
+                "  ✅ all {} symlink(s) point at existing targets",
+                symlinks.len()
+            );
+        } else {
+            problems += broken.len();
+            println!("  ❌ {} broken symlink(s):", broken.len());
+            for (b, k, tb, tk) in &broken {
+                println!("    - {}/{} -> {}/{}", b, k, tb, tk);
+            }
+            if args.fix {
+                let mut removed = 0usize;
+                for (b, k, _tb, _tk) in &broken {
+                    match meta.delete_symlink(b, k) {
+                        Ok(()) => {
+                            removed += 1;
+                            println!("  🗑️  removed broken symlink {}/{}", b, k);
+                        }
+                        Err(e) => eprintln!("  ❌ failed to remove {}/{}: {}", b, k, e),
+                    }
+                }
+                println!("  done: {} broken symlink(s) removed", removed);
+            } else {
+                println!(
+                    "  (dry-run — pass --fix to remove {} broken symlink(s))",
+                    broken.len()
+                );
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Summary
     // ------------------------------------------------------------------
     println!("\n--- Summary ---");

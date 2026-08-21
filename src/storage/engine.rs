@@ -8,7 +8,7 @@ use chrono::Utc;
 use crate::config::{Config, PlacementStrategy};
 
 use super::backends::StorageBackend;
-use super::metadata::{MetadataDb, BucketRecord};
+use super::metadata::{MetadataDb, BucketRecord, SymlinkRecord};
 use rusqlite::params;
 
 #[derive(Debug, Clone)]
@@ -589,7 +589,7 @@ impl StorageEngine {
             let end_in_part = if global_end >= hi {
                 hi - lo // full part
             } else {
-                (global_end - lo) // exclusive end within part
+                global_end - lo // exclusive end within part
             };
             if end_in_part <= start_in_part {
                 continue;
@@ -715,6 +715,11 @@ impl StorageEngine {
     // -----------------------------------------------------------------
 
     pub async fn delete_object(&self, bucket: &str, key: &str) -> anyhow::Result<()> {
+        // Symlink (tag folder): delete the link row only — never the target.
+        if self.meta.is_symlink(bucket, key)? {
+            self.meta.delete_symlink(bucket, key)?;
+            return Ok(());
+        }
         // MVCC: remove the file pointer and mark the current version superseded.
         // The orphan blob is reclaimed later by `vacuum` (after the grace period).
         self.meta.delete_object(bucket, key)?;
@@ -855,6 +860,9 @@ impl StorageEngine {
         for obj in &objects {
             let _ = self.delete_object(name, &obj.key).await;
         }
+        // Clear symlinks for this bucket too (targets are same-bucket, so the
+        // real objects above already handle them; the link rows must go).
+        self.meta.delete_symlinks_for_bucket(name)?;
         self.meta.delete_bucket(name)?;
         Ok(())
     }
@@ -917,6 +925,146 @@ impl StorageEngine {
     /// prefix. Delegates to the metadata layer's prefix scan.
     pub fn count_direct_children(&self, bucket: &str, prefix: &str) -> anyhow::Result<i64> {
         self.meta.count_direct_children(bucket, prefix)
+    }
+
+    // -----------------------------------------------------------------
+    //  Symlinks (tag folders)
+    // -----------------------------------------------------------------
+
+    /// Create (or replace) a symlink. v1: same-bucket only.
+    pub fn create_symlink(
+        &self,
+        bucket: &str,
+        key: &str,
+        target_bucket: &str,
+        target_key: &str,
+    ) -> anyhow::Result<()> {
+        if target_bucket != bucket {
+            anyhow::bail!(
+                "cross-bucket symlinks not supported yet (link {} in {} -> {}/{})",
+                key,
+                bucket,
+                target_bucket,
+                target_key
+            );
+        }
+        self.meta.create_symlink(bucket, key, target_bucket, target_key)
+    }
+
+    /// Remove a symlink row (never the target).
+    pub fn delete_symlink(&self, bucket: &str, key: &str) -> anyhow::Result<()> {
+        self.meta.delete_symlink(bucket, key)
+    }
+
+    /// All symlinks across all buckets (for fsck).
+    pub fn list_all_symlinks(&self) -> anyhow::Result<Vec<SymlinkRecord>> {
+        self.meta.list_all_symlinks()
+    }
+
+    /// Symlinks directly under `prefix`, re-presented as folder prefixes
+    /// (trailing slash) for merging into a listing's CommonPrefixes.
+    pub fn symlink_prefixes_under(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        let p = prefix.unwrap_or("").trim_end_matches('/');
+        let links = self.meta.list_symlinks_under(bucket, p)?;
+        Ok(links
+            .into_iter()
+            .map(|l| format!("{}/", l.key.trim_end_matches('/')))
+            .collect())
+    }
+
+    /// Resolve a listing prefix through symlinks, depth-capped to avoid loops.
+    /// Returns `Some((link_prefix, target_prefix))` when `prefix` is (or lies
+    /// under) a symlink: list `target_prefix` and re-present keys under
+    /// `link_prefix`. Returns `None` when no symlink applies.
+    pub fn resolve_list_prefix(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let trimmed = prefix.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let link_root = trimmed.to_string();
+        let mut current = trimmed.to_string();
+        let mut hops = 0;
+        loop {
+            match self.meta.resolve_symlink(bucket, &current)? {
+                Some((tb, tk, rem)) => {
+                    if tb != bucket {
+                        return Ok(None); // same-bucket only
+                    }
+                    let mut target = tk.trim_end_matches('/').to_string();
+                    if !rem.is_empty() {
+                        target.push('/');
+                        target.push_str(&rem);
+                    }
+                    current = target;
+                    hops += 1;
+                    if hops >= 8 {
+                        return Ok(Some((
+                            format!("{}/", link_root),
+                            format!("{}/", current),
+                        )));
+                    }
+                }
+                None => {
+                    if hops == 0 {
+                        return Ok(None);
+                    }
+                    return Ok(Some((
+                        format!("{}/", link_root),
+                        format!("{}/", current),
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Symlink-aware object listing. When `prefix` resolves through a symlink,
+    /// list the target's children and re-present their keys under the link path.
+    pub async fn list_objects_symlink_aware(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        start_after: Option<&str>,
+        max_keys: i64,
+    ) -> anyhow::Result<(Vec<ObjectInfo>, bool)> {
+        let Some(p) = prefix else {
+            return self.list_objects(bucket, None, start_after, max_keys).await;
+        };
+        let Some((link_prefix, target_prefix)) = self.resolve_list_prefix(bucket, p)? else {
+            return self.list_objects(bucket, Some(p), start_after, max_keys).await;
+        };
+        let (objects, truncated) = self
+            .list_objects(bucket, Some(&target_prefix), start_after, max_keys)
+            .await?;
+        let re = objects
+            .into_iter()
+            .map(|mut o| {
+                if let Some(rest) = o.key.strip_prefix(&target_prefix) {
+                    o.key = format!("{}{}", link_prefix, rest);
+                }
+                o
+            })
+            .collect();
+        Ok((re, truncated))
+    }
+
+    /// If `prefix` is a symlink (exact), return its target prefix (trailing
+    /// slash); otherwise return the prefix unchanged. Used so tag folders reuse
+    /// their target's folder metadata / child counts in the UI.
+    pub fn effective_prefix(&self, bucket: &str, prefix: &str) -> anyhow::Result<String> {
+        match self.meta.resolve_symlink(bucket, prefix)? {
+            Some((tb, tk, rem)) if tb == bucket && rem.is_empty() => {
+                Ok(format!("{}/", tk.trim_end_matches('/')))
+            }
+            _ => Ok(prefix.to_string()),
+        }
     }
 
     // -----------------------------------------------------------------

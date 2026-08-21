@@ -7,6 +7,7 @@ pub mod folder_cmd;
 pub mod fsck_cmd;
 pub mod import_cmd;
 pub mod init;
+pub mod link_cmd;
 pub mod object_cmd;
 pub mod serve;
 pub mod shard_cmd;

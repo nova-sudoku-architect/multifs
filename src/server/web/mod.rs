@@ -91,14 +91,53 @@ async fn list_objects(
     const MAX_KEYS: i64 = 100_000;
     let (objects, truncated) = match state
         .engine
-        .list_objects(&bucket, prefix.as_deref(), None, MAX_KEYS)
+        .list_objects_symlink_aware(&bucket, prefix.as_deref(), None, MAX_KEYS)
         .await
     {
         Ok(v) => v,
         Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
 
-    let (prefixes, files) = crate::server::group_objects_by_prefix(&objects, prefix.as_deref());
+    let (mut prefixes, files) = crate::server::group_objects_by_prefix(&objects, prefix.as_deref());
+
+    // Merge symlinked folders (tag folders) into the folder list, re-presented
+    // under the link path when the requested prefix resolves through a symlink.
+    let effective = match prefix.as_deref() {
+        Some(p) => state
+            .engine
+            .resolve_list_prefix(&bucket, p)
+            .ok()
+            .flatten()
+            .map(|(_link, target)| target)
+            .unwrap_or_else(|| p.to_string()),
+        None => String::new(),
+    };
+    let link_root = prefix
+        .as_deref()
+        .map(|p| {
+            let t = p.trim_end_matches('/');
+            if t.is_empty() {
+                String::new()
+            } else {
+                format!("{}/", t)
+            }
+        })
+        .unwrap_or_default();
+    if let Ok(links) = state.engine.symlink_prefixes_under(&bucket, prefix.as_deref()) {
+        for sp in links {
+            let presented = if effective != link_root {
+                match sp.strip_prefix(&effective) {
+                    Some(rest) => format!("{}{}", link_root, rest),
+                    None => sp.clone(),
+                }
+            } else {
+                sp.clone()
+            };
+            if !prefixes.contains(&presented) {
+                prefixes.push(presented);
+            }
+        }
+    }
 
     // Resolve per-folder metadata (cover/summary/gif) for each folder prefix
     // (only where recorded AND the object still exists). Omitted → UI degrades.

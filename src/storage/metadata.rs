@@ -24,6 +24,18 @@ pub struct ObjectRecord {
     pub version: i64,
 }
 
+/// A symlink (tag folder) — a link path that points at a real folder prefix in
+/// the same bucket. Links are exposed as normal folders over S3/Web; deleting a
+/// link removes only the row, never the target.
+#[derive(Debug, Clone)]
+pub struct SymlinkRecord {
+    pub bucket_name: String,
+    pub key: String,
+    pub target_bucket: String,
+    pub target_key: String,
+    pub created_at: i64,
+}
+
 /// A row in the `versions` table (one version = one blob in the single-blob model).
 #[derive(Debug, Clone)]
 pub struct VersionRecord {
@@ -385,6 +397,25 @@ impl MetadataDb {
             conn.execute("UPDATE schema_version SET version = 6", [])?;
         }
 
+        // Migration 7: introduce `symlinks` (tag folders). A symlink is a link
+        // path (`key`) that points at a real folder prefix (`target_key`) in the
+        // same bucket. Deleting a symlink removes only the row — never the
+        // target. Links are exposed as normal folders over S3/Web.
+        if current < 7 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS symlinks (
+                    bucket_name   TEXT NOT NULL,
+                    key           TEXT NOT NULL,
+                    target_bucket TEXT NOT NULL,
+                    target_key    TEXT NOT NULL,
+                    created_at    INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (bucket_name, key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_symlinks_bucket ON symlinks(bucket_name);",
+            )?;
+            conn.execute("UPDATE schema_version SET version = 7", [])?;
+        }
+
         Ok(())
     }
 
@@ -462,6 +493,17 @@ impl MetadataDb {
                 updated_at      INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (bucket_name, prefix)
             );
+
+            CREATE TABLE IF NOT EXISTS symlinks (
+                bucket_name   TEXT NOT NULL,
+                key           TEXT NOT NULL,
+                target_bucket TEXT NOT NULL,
+                target_key    TEXT NOT NULL,
+                created_at    INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (bucket_name, key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_symlinks_bucket ON symlinks(bucket_name);
             ",
         )?;
 
@@ -1557,6 +1599,172 @@ impl MetadataDb {
             Ok(files + folders)
         })
     }
+
+    // ---- Symlinks (tag folders) ----
+
+    /// Create (or replace) a symlink: link path `key` → target folder prefix
+    /// `target_key`. Keys are stored without a trailing slash; callers should
+    /// pass normalized (slash-trimmed) paths.
+    pub fn create_symlink(
+        &self,
+        bucket: &str,
+        key: &str,
+        target_bucket: &str,
+        target_key: &str,
+    ) -> anyhow::Result<()> {
+        let key = key.trim_end_matches('/');
+        let target_key = target_key.trim_end_matches('/');
+        self.with_conn(|conn| {
+            let now = chrono::Utc::now().timestamp_millis();
+            conn.execute(
+                "INSERT INTO symlinks (bucket_name, key, target_bucket, target_key, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(bucket_name, key) DO UPDATE SET
+                   target_bucket = excluded.target_bucket,
+                   target_key    = excluded.target_key,
+                   created_at    = excluded.created_at",
+                params![bucket, key, target_bucket, target_key, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Delete a symlink row (never touches the target).
+    pub fn delete_symlink(&self, bucket: &str, key: &str) -> anyhow::Result<()> {
+        let key = key.trim_end_matches('/');
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM symlinks WHERE bucket_name = ?1 AND key = ?2",
+                params![bucket, key],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Whether `key` is itself a symlink entry (exact match, slash-normalized).
+    pub fn is_symlink(&self, bucket: &str, key: &str) -> anyhow::Result<bool> {
+        let key = key.trim_end_matches('/');
+        self.with_conn(|conn| {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM symlinks WHERE bucket_name = ?1 AND key = ?2",
+                params![bucket, key],
+                |r| r.get(0),
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    /// Delete every symlink in a bucket (used by bucket deletion).
+    pub fn delete_symlinks_for_bucket(&self, bucket: &str) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute("DELETE FROM symlinks WHERE bucket_name = ?1", params![bucket])?;
+            Ok(())
+        })
+    }
+
+    /// All symlinks for a bucket, ordered by key.
+    pub fn list_symlinks_for_bucket(&self, bucket: &str) -> anyhow::Result<Vec<SymlinkRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT bucket_name, key, target_bucket, target_key, created_at \
+                 FROM symlinks WHERE bucket_name = ?1 ORDER BY key",
+            )?;
+            let rows = stmt.query_map(params![bucket], symlink_from_row)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// All symlinks across all buckets (for fsck).
+    pub fn list_all_symlinks(&self) -> anyhow::Result<Vec<SymlinkRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT bucket_name, key, target_bucket, target_key, created_at \
+                 FROM symlinks ORDER BY bucket_name, key",
+            )?;
+            let rows = stmt.query_map([], symlink_from_row)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Symlinks whose link key is a *direct* child of `prefix` (slash-trimmed),
+    /// i.e. whose parent path equals the prefix. `prefix` empty → bucket root.
+    pub fn list_symlinks_under(&self, bucket: &str, prefix: &str) -> anyhow::Result<Vec<SymlinkRecord>> {
+        let prefix = prefix.trim_end_matches('/');
+        let links = self.list_symlinks_for_bucket(bucket)?;
+        let mut out = Vec::new();
+        for l in links {
+            let lk = l.key.trim_end_matches('/');
+            let direct = match lk.rsplit_once('/') {
+                Some((parent, _)) => parent == prefix,
+                None => prefix.is_empty(),
+            };
+            if direct {
+                out.push(l);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Resolve a link path or a path under a link. Returns
+    /// `Some((target_bucket, target_key, remainder))` where `remainder` is the
+    /// portion of `key_or_prefix` beyond the matched symlink key (empty for an
+    /// exact match). Resolves the longest ancestor symlink. `None` if no link
+    /// applies.
+    pub fn resolve_symlink(
+        &self,
+        bucket: &str,
+        key_or_prefix: &str,
+    ) -> anyhow::Result<Option<(String, String, String)>> {
+        let q = key_or_prefix.trim_end_matches('/');
+        let links = self.list_symlinks_for_bucket(bucket)?;
+
+        // Exact match wins.
+        if let Some(l) = links.iter().find(|l| l.key.trim_end_matches('/') == q) {
+            return Ok(Some((l.target_bucket.clone(), l.target_key.clone(), String::new())));
+        }
+
+        // Longest ancestor: q starts with `link.key + "/"`.
+        let mut best: Option<&SymlinkRecord> = None;
+        for l in &links {
+            let lk = l.key.trim_end_matches('/');
+            if q.len() > lk.len() + 1
+                && q.starts_with(lk)
+                && q.as_bytes().get(lk.len()) == Some(&b'/')
+            {
+                if best.map_or(true, |b| lk.len() > b.key.trim_end_matches('/').len()) {
+                    best = Some(l);
+                }
+            }
+        }
+        if let Some(l) = best {
+            let lk = l.key.trim_end_matches('/');
+            let remainder = &q[lk.len() + 1..];
+            return Ok(Some((
+                l.target_bucket.clone(),
+                l.target_key.clone(),
+                remainder.to_string(),
+            )));
+        }
+        Ok(None)
+    }
+}
+
+fn symlink_from_row(row: &rusqlite::Row) -> rusqlite::Result<SymlinkRecord> {
+    Ok(SymlinkRecord {
+        bucket_name: row.get(0)?,
+        key: row.get(1)?,
+        target_bucket: row.get(2)?,
+        target_key: row.get(3)?,
+        created_at: row.get(4)?,
+    })
 }
 
 /// Whether a key's basename looks like a folder cover image.
@@ -1743,7 +1951,7 @@ mod tests {
                 )?)
             })
             .unwrap();
-        assert_eq!(version, 6, "migration should set version to 6");
+        assert_eq!(version, 7, "migration should set version to 7");
 
         // The legacy object became version 1 of a file, with its blob preserved.
         let obj = db.get_object("b", "k.txt").unwrap().expect("object migrated");

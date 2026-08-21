@@ -332,7 +332,7 @@ async fn list_objects(
     // ListObjectsV2 continuation token: resume strictly after this key.
     let start_after = params.continuation_token.as_deref().or(params.marker.as_deref());
 
-    match state.engine.list_objects(&bucket, prefix, start_after, max_keys).await {
+    match state.engine.list_objects_symlink_aware(&bucket, prefix, start_after, max_keys).await {
         Ok((objects, is_truncated)) => {
             // If delimiter=/ is requested, group objects into CommonPrefixes
             let has_delimiter = delimiter == Some("/");
@@ -345,7 +345,39 @@ async fn list_objects(
             };
 
             if has_delimiter {
-                let (common_prefixes, file_objs) = crate::server::group_objects_by_prefix(&objects, prefix);
+                let (mut common_prefixes, file_objs) = crate::server::group_objects_by_prefix(&objects, prefix);
+
+                // Merge symlinked folders (tag folders) into CommonPrefixes so
+                // a symlink shows up as a normal folder. Re-presented under the
+                // link path when the requested prefix itself resolves through a
+                // symlink.
+                let effective = match prefix {
+                    Some(p) => state.engine.resolve_list_prefix(&bucket, p).unwrap_or(None)
+                        .map(|(_link, target)| target)
+                        .unwrap_or_else(|| p.to_string()),
+                    None => String::new(),
+                };
+                let link_root = prefix.map(|p| {
+                    let t = p.trim_end_matches('/');
+                    if t.is_empty() { String::new() } else { format!("{}/", t) }
+                }).unwrap_or_default();
+                if let Ok(links) = state.engine.symlink_prefixes_under(&bucket, prefix) {
+                    for sp in links {
+                        // Re-present under the link path when inside a symlink.
+                        let presented = if effective != link_root {
+                            match sp.strip_prefix(&effective) {
+                                Some(rest) => format!("{}{}", link_root, rest),
+                                None => sp.clone(),
+                            }
+                        } else {
+                            sp.clone()
+                        };
+                        if !common_prefixes.contains(&presented) {
+                            common_prefixes.push(presented);
+                        }
+                    }
+                }
+
                 let contents: Vec<(String, i64, String, String)> = file_objs
                     .iter()
                     .map(|o| (o.key.clone(), o.size, o.etag.clone(), o.last_modified.clone()))
