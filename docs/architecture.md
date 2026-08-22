@@ -213,6 +213,43 @@ so cover art and frame captures are visible without clicking. Text files are ser
 directly in the browser. Charset is detected at upload (BOM / UTF-8 validation) and stored in the
 `charset` column; unset values fall back to UTF-8 for text content.
 
+### Folder preview page
+
+In **Preview mode**, a folder that has recorded metadata (`folder_meta`) renders a per-folder
+detail page: cover image → preview GIF → summary document. Metadata is recorded via
+`multifs folder set-cover / set-summary / set-gif / backfill` (one cover, one GIF, and one
+summary key per folder); a missing field or a field whose object no longer exists is skipped
+(graceful degrade).
+
+### Summary document schema (JSON)
+
+The summary key may point to a `.json` file describing the video. The UI's `jsonToHtml()`
+renders this schema into a structured card (unknown fields are ignored; invalid JSON degrades
+to a raw `<pre>`). **Every value is tagged with its source(s)**: a field carries provenance as
+`{value, sources: [{url, note}]}` (or `{canonical, sources: [...]}` for actors). If multiple
+sources report the *same* value, they are merged into one entry tagged with all of them. A
+source is rendered as a small link labelled with its hostname (tooltip = note).
+
+- `title` — object with `zh_hk` (preferred) and/or `ja`; a differing `ja` is shown as 日文片名.
+- `code` — 品番 (catalog code).
+- `studio` — `{value, sources}` or a plain string (片商).
+- `release_date` — `{value, sources}` or a plain string (發售日).
+- `duration` — `{value, sources}` or a plain string (片長).
+- `rating` — an array of rating objects, each `{value, scale, votes, source: {url, note}}`
+  (a bare object is treated as a one-element array). Equal `value/scale` ratings from different
+  sources are merged; each distinct rating is one 評分 row with stars + score + vote count and
+  its source tag(s).
+- `story` (故事) and `description` (簡介).
+- `actors` — array of strings or `{canonical|name, sources: [...]}` objects (出演者), each
+  tagged with its source(s).
+- `comments` — `{summary, count, sources}` → 用家評論 (with count when present), source-tagged.
+- `tags` — object mapping category → array of tag strings (標籤).
+- `categories` — array of strings (分類).
+- `sources` — array of `{url, note}` objects (來源), linked.
+
+For a non-JSON summary (`.md`/`.txt`), the UI renders Markdown via a minimal safe renderer
+(headings, tables, lists, code, blockquotes, links).
+
 ---
 
 ## Delete Path

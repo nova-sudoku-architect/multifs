@@ -132,6 +132,17 @@
   .folder-detail .fd-summary th { background: var(--panel); font-weight: 600; }
   .folder-detail .fd-summary hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
   .folder-detail .fd-summary a { color: var(--accent2); }
+  .fd-summary .fs-title { font-size: 15px; font-weight: 600; margin-bottom: 8px; color: var(--text); }
+  .fd-summary .fs-row { display: flex; gap: 8px; padding: 3px 0; align-items: baseline; }
+  .fd-summary .fs-row .fs-k { flex: none; min-width: 78px; color: var(--muted); font-size: 12px; }
+  .fd-summary .fs-row .fs-v { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .fd-summary .src-tag {
+    display: inline-block; margin-left: 6px; padding: 0 7px;
+    border-radius: 9px; background: rgba(76,141,255,.14);
+    border: 1px solid rgba(76,141,255,.30); color: var(--accent2);
+    font-size: 11px; line-height: 1.7; text-decoration: none; vertical-align: 1px; white-space: nowrap;
+  }
+  .fd-summary a.src-tag:hover { text-decoration: underline; }
   .slide-row { display: flex; justify-content: flex-start; margin-top: 8px; min-height: 0; }
   .slide-row:empty, .slide-row:has(.slide-nav[style*="none"]) { display: none; }
   .slide-nav { display: none; align-items: center; gap: 6px; }
@@ -612,15 +623,96 @@ function loadSummaryText(bucket, folder) {
 // Render a structured content-summary JSON (the video-subtitle pipeline schema:
 // code/title/studio/release_date/duration/rating/story/description/actors/tags/sources)
 // into a clean HTML card. Degrades gracefully to the raw JSON if parsing fails.
+// --- Source provenance helpers (summary card) ---
+
+// Short hostname for a source URL (e.g. "javdb575.com"); used as the tag label.
+function srcHostname(url) {
+  try { return new URL(url).hostname; } catch (_) { return url || ''; }
+}
+
+// Render a list of sources ({url, note} or plain strings) as small linked tags,
+// deduped by URL. Returns '' when empty.
+function srcTags(sources) {
+  const arr = sources == null ? [] : (Array.isArray(sources) ? sources : [sources]);
+  const seen = new Set();
+  const tags = [];
+  for (const s of arr) {
+    const url = (s && typeof s === 'object' && s.url) ? s.url : (typeof s === 'string' ? s : '');
+    const note = (s && typeof s === 'object' && s.note) ? String(s.note) : '';
+    if (url && seen.has(url)) continue;
+    if (url) seen.add(url);
+    const label = url ? srcHostname(url) : (note || 'source');
+    const title = note || url || '';
+    tags.push(url
+      ? '<a class="src-tag" href="' + esc(url) + '" target="_blank" rel="noopener" title="' + esc(title) + '">' + esc(label) + '</a>'
+      : '<span class="src-tag" title="' + esc(title) + '">' + esc(label) + '</span>');
+  }
+  return tags.join('');
+}
+
+// Normalize a field into a list of {value, sources[]}, merging duplicate values:
+// the same value reported by multiple sources collapses to one entry that is
+// tagged with all of them. Handles:
+//   - {value, sources} / {value, source}   (studio, release_date, duration, rating)
+//   - {canonical, sources}                 (actors)
+//   - an array of the above, or a bare scalar
+function sourcedValues(field) {
+  if (field == null) return [];
+  const raw = Array.isArray(field) ? field : [field];
+  const map = new Map();
+  for (const item of raw) {
+    let value = null, sources = [];
+    if (item != null && typeof item === 'object') {
+      if ('value' in item) {
+        value = item.value;
+        sources = Array.isArray(item.sources) ? item.sources : (item.source != null ? [item.source] : []);
+      } else if ('canonical' in item) {
+        value = item.canonical;
+        sources = item.sources || [];
+      } else {
+        value = item;
+      }
+    } else {
+      value = item;
+    }
+    if (value == null || value === '') continue;
+    const key = JSON.stringify(value);
+    if (!map.has(key)) map.set(key, { value, sources: [] });
+    const cur = map.get(key);
+    for (const s of sources) {
+      if (!s) continue;
+      const sk = (s && typeof s === 'object' && s.url) ? s.url
+        : (typeof s === 'string' ? s : (s && s.note ? s.note : JSON.stringify(s)));
+      const dup = cur.sources.some(x => {
+        const xk = (x && typeof x === 'object' && x.url) ? x.url
+          : (typeof x === 'string' ? x : (x && x.note ? x.note : ''));
+        return xk === sk;
+      });
+      if (!dup) cur.sources.push(s);
+    }
+  }
+  return [...map.values()];
+}
+
+// Render a structured content-summary JSON into a clean HTML card. Every value
+// that carries provenance is tagged with its source(s); equal values from
+// multiple sources are merged and tagged with all of them. Degrades gracefully
+// to the raw JSON if parsing fails.
 function jsonToHtml(text) {
   let d;
   try { d = JSON.parse(text); } catch (_) { return '<pre>' + esc(text) + '</pre>'; }
   if (!d || typeof d !== 'object') return '<pre>' + esc(text) + '</pre>';
 
   const val = (v) => (v == null || v === '' ? null : v);
-  const txt = (v) => { const s = val(v); return s == null ? null : esc(String(s)); };
   const rows = [];
   const kv = (k, v) => rows.push('<div class="fs-row"><span class="fs-k">' + esc(k) + '</span><span class="fs-v">' + v + '</span></div>');
+
+  // Emit one row per distinct value, each tagged with its source(s).
+  const emitSourced = (label, field, fmt) => {
+    for (const v of sourcedValues(field)) {
+      kv(label, (fmt ? fmt(v.value) : esc(String(v.value))) + srcTags(v.sources));
+    }
+  };
 
   // Title (prefer zh_hk, fall back to ja)
   if (d.title && typeof d.title === 'object') {
@@ -632,29 +724,51 @@ function jsonToHtml(text) {
   }
   if (d.code) kv('品番', esc(String(d.code)));
 
-  const studio = d.studio && d.studio.value ? d.studio.value : d.studio;
-  if (val(studio)) kv('片商', esc(String(studio)));
-  const rd = d.release_date && d.release_date.value ? d.release_date.value : d.release_date;
-  if (val(rd)) kv('發售日', esc(String(rd)));
-  const dur = d.duration && d.duration.value ? d.duration.value : d.duration;
-  if (val(dur)) kv('片長', esc(String(dur)));
+  emitSourced('片商', d.studio);
+  emitSourced('發售日', d.release_date);
+  emitSourced('片長', d.duration);
 
-  if (Array.isArray(d.rating) && d.rating.length) {
-    const r = d.rating[0];
-    if (r && (r.value != null)) {
-      const scale = r.scale || 5;
-      const stars = '★'.repeat(Math.max(0, Math.round(r.value))) + '☆'.repeat(Math.max(0, scale - Math.round(r.value)));
-      const votes = r.votes ? ' (' + r.votes + ' 票)' : '';
-      kv('評分', esc(stars + ' ' + r.value + '/' + scale + votes));
+  // Ratings: merge equal value/scale across sources, then render each distinct
+  // rating with stars + votes + source tag(s).
+  const ratingRaw = d.rating == null ? [] : (Array.isArray(d.rating) ? d.rating : [d.rating]);
+  const ratingMap = new Map();
+  for (const r of ratingRaw) {
+    if (!r || r.value == null) continue;
+    const scale = r.scale || 5;
+    const key = r.value + '/' + scale;
+    if (!ratingMap.has(key)) ratingMap.set(key, { value: r.value, scale, votes: r.votes, sources: [] });
+    const cur = ratingMap.get(key);
+    if (r.source) {
+      const sk = (r.source && r.source.url) || (r.source && r.source.note) || JSON.stringify(r.source);
+      if (!cur.sources.some(x => ((x && x.url) || (x && x.note)) === sk)) cur.sources.push(r.source);
     }
+  }
+  for (const r of ratingMap.values()) {
+    const scale = r.scale || 5;
+    const stars = '★'.repeat(Math.max(0, Math.round(r.value))) + '☆'.repeat(Math.max(0, scale - Math.round(r.value)));
+    const votes = r.votes ? ' (' + r.votes + ' 票)' : '';
+    kv('評分', esc(stars + ' ' + r.value + '/' + scale + votes) + srcTags(r.sources));
   }
 
   if (val(d.story)) kv('故事', esc(String(d.story)));
   if (val(d.description)) kv('簡介', esc(String(d.description)));
 
+  // Actors: each canonical name tagged with its source(s).
   if (Array.isArray(d.actors) && d.actors.length) {
-    const names = d.actors.map(a => (typeof a === 'string' ? a : (a.canonical || (a.name || '')))).filter(Boolean);
-    if (names.length) kv('出演者', esc(names.join('、')));
+    const names = d.actors.map(a => {
+      if (typeof a === 'string') return esc(a);
+      const n = a.canonical || a.name;
+      if (!n) return '';
+      return esc(String(n)) + srcTags(a.sources);
+    }).filter(Boolean);
+    if (names.length) kv('出演者', names.join('、'));
+  }
+
+  // Comments (user reviews) — tagged with their source.
+  if (d.comments && typeof d.comments === 'object' && d.comments.summary) {
+    const c = d.comments;
+    const label = c.count ? '用家評論 (' + c.count + ' 條)' : '用家評論';
+    kv(label, esc(String(c.summary)) + srcTags(c.sources));
   }
 
   if (d.tags && typeof d.tags === 'object') {
@@ -665,8 +779,19 @@ function jsonToHtml(text) {
     if (parts.length) kv('標籤', esc(parts.join('　')));
   }
 
+  if (Array.isArray(d.categories) && d.categories.length) {
+    kv('分類', esc(d.categories.join('、')));
+  }
+
+  // Top-level source list ({url, note} objects, linked).
   if (Array.isArray(d.sources) && d.sources.length) {
-    const links = d.sources.map(u => '<a href="' + esc(String(u)) + '" target="_blank" rel="noopener">' + esc(String(u)) + '</a>');
+    const links = d.sources.map(s => {
+      const url = (s && s.url) || (typeof s === 'string' ? s : '');
+      const label = (s && s.note) || srcHostname(url) || url;
+      return url
+        ? '<a href="' + esc(url) + '" target="_blank" rel="noopener">' + esc(label) + '</a>'
+        : esc(label);
+    });
     rows.push('<div class="fs-row"><span class="fs-k">來源</span><span class="fs-v">' + links.join('<br>') + '</span></div>');
   }
 
