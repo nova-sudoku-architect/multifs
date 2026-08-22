@@ -48,6 +48,9 @@ pub enum AuditSubcommand {
         /// Actually delete (default is a dry-run report)
         #[arg(long)]
         apply: bool,
+        /// List every orphan path (dir + file) instead of just per-account counts
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -56,7 +59,7 @@ pub async fn run(args: AuditArgs) -> Result<()> {
         AuditSubcommand::Scan { email, summary } => scan_account(&email, summary).await,
         AuditSubcommand::ListFiles { email } => list_account_files(&email).await,
         AuditSubcommand::Reconcile { account } => reconcile(account.as_deref()).await,
-        AuditSubcommand::Cleanup { account, apply } => cleanup(account.as_deref(), apply).await,
+        AuditSubcommand::Cleanup { account, apply, verbose } => cleanup(account.as_deref(), apply, verbose).await,
     }
 }
 
@@ -370,7 +373,7 @@ async fn pcloud_delete_file(client: &reqwest::Client, token: &str, path: &str) -
 /// Dry-run by default. In `--apply` mode it deletes, but only after re-verifying
 /// each multipart upload_id has zero DB references (no committed version, no
 /// `multipart_parts` rows) — so a live object can never be corrupted.
-async fn cleanup(account_filter: Option<&str>, apply: bool) -> Result<()> {
+async fn cleanup(account_filter: Option<&str>, apply: bool, verbose: bool) -> Result<()> {
     let cfg_path = crate::config::find_config()?;
     let cfg = crate::config::load(&cfg_path)?;
     let meta = crate::storage::metadata::MetadataDb::open(&cfg.storage.meta_db_path)
@@ -461,6 +464,15 @@ async fn cleanup(account_filter: Option<&str>, apply: bool) -> Result<()> {
 
         println!("  {} : {} upload dirs + {} files = {} ({} skipped)",
             account.email, acct_dirs, acct_files, fmt_bytes(acct_bytes), skipped);
+
+        if verbose && !apply {
+            for (dir, bytes) in &safe_dirs {
+                println!("    [dir]  {}  ({})", dir, fmt_bytes(*bytes));
+            }
+            for (path, bytes) in &single_files {
+                println!("    [file] {}  ({})", path, fmt_bytes(*bytes));
+            }
+        }
 
         if apply {
             for (dir, bytes) in &safe_dirs {

@@ -160,8 +160,9 @@ multifs audit scan <email>        Find pCloud files NOT managed by MultiFS
 multifs audit list-files <email>  List all files (managed + orphaned)
 multifs audit reconcile [--account <email>]
                                   Diff each account's files vs the DB (orphan counts + bytes)
-multifs audit cleanup [--account <email>] [--apply]
-                                  Delete orphaned pCloud files (dry-run by default)
+multifs audit cleanup [--account <email>] [--apply] [--verbose]
+                                  Delete orphaned pCloud files (dry-run by default;
+                                  --verbose lists every orphan path)
 
 multifs import <email> <path> --bucket <b> [--key <k>]
                                   Register an existing pCloud file (metadata only)
