@@ -1238,6 +1238,7 @@ dependencies = [
  "md-5",
  "mime_guess",
  "mockall",
+ "percent-encoding",
  "predicates",
  "quick-xml",
  "rand",

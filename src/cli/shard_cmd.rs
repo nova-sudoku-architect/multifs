@@ -34,8 +34,8 @@ pub async fn run(args: ShardArgs) -> Result<()> {
     match args.command {
         ShardSubcommand::Status => {
             let statuses = engine.shard_status().await?;
-            println!("{:<30} {:<12} {:<12} {:<12}", "Email", "Objects", "Used", "Total");
-            println!("{:-<30} {:-<12} {:-<12} {:-<12}", "", "", "", "");
+            println!("{:<30} {:<12} {:<10} {:<12} {:<12}", "Email", "Objects", "Parts", "Used", "Total");
+            println!("{:-<30} {:-<12} {:-<10} {:-<12} {:-<12}", "", "", "", "", "");
             for s in &statuses {
                 let used_str = if s.used_bytes > 1_073_741_824 {
                     format!("{:.1} GiB", s.used_bytes as f64 / 1_073_741_824.0)
@@ -47,7 +47,7 @@ pub async fn run(args: ShardArgs) -> Result<()> {
                 } else {
                     format!("{:.1} MiB", s.total_bytes as f64 / 1_048_576.0)
                 };
-                println!("{:<30} {:<12} {:<12} {:<12}", s.email, s.object_count, used_str, total_str);
+                println!("{:<30} {:<12} {:<10} {:<12} {:<12}", s.email, s.object_count, s.part_count, used_str, total_str);
             }
         }
         ShardSubcommand::Rebalance { dry_run } => {

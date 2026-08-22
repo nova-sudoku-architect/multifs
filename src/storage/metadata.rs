@@ -53,6 +53,19 @@ pub struct VersionRecord {
     pub superseded_at: Option<i64>,
 }
 
+/// A single object version for the S3 ListObjectVersions view (one committed
+/// version row, with an `is_latest` flag derived from the `files` pointer).
+#[derive(Debug, Clone)]
+pub struct ObjectVersionRecord {
+    pub key: String,
+    pub version: i64,
+    pub size: i64,
+    pub etag: String,
+    pub last_modified: String,
+    pub content_type: Option<String>,
+    pub is_latest: bool,
+}
+
 /// Thread-safe metadata database wrapper.
 /// All operations use blocking calls on a fresh connection per op.
 #[derive(Clone)]
@@ -416,6 +429,22 @@ impl MetadataDb {
             conn.execute("UPDATE schema_version SET version = 7", [])?;
         }
 
+        // Migration 8: add a `versioning` column to `buckets` (S3
+        // PutBucketVersioning). Defaults to 'Suspended' (versioning off).
+        if current < 8 {
+            let cols: Vec<String> = conn
+                .prepare("PRAGMA table_info(buckets)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            if !cols.iter().any(|c| c == "versioning") {
+                conn.execute_batch(
+                    "ALTER TABLE buckets ADD COLUMN versioning TEXT NOT NULL DEFAULT 'Suspended';",
+                )?;
+            }
+            conn.execute("UPDATE schema_version SET version = 8", [])?;
+        }
+
         Ok(())
     }
 
@@ -581,6 +610,31 @@ impl MetadataDb {
                 buckets.push(row?);
             }
             Ok(buckets)
+        })
+    }
+
+    /// Get a bucket's versioning status ('Enabled' or 'Suspended'). Returns
+    /// `None` if the bucket does not exist.
+    pub fn get_bucket_versioning(&self, name: &str) -> anyhow::Result<Option<String>> {
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT versioning FROM buckets WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+    }
+
+    /// Set a bucket's versioning status ('Enabled' or 'Suspended').
+    pub fn set_bucket_versioning(&self, name: &str, status: &str) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE buckets SET versioning = ?2 WHERE name = ?1",
+                params![name, status],
+            )?;
+            Ok(())
         })
     }
 
@@ -759,6 +813,131 @@ impl MetadataDb {
         })
     }
 
+    /// Server-side copy: point a new destination key at the source object's
+    /// existing blob without moving any bytes (content-addressed metadata copy).
+    /// Creates a committed version + file pointer for `dst_bucket`/`dst_key` that
+    /// references the same `(account_email, remote_path)` blob as `src`, copying
+    /// size/etag/content_type/charset/checksum and superseding any previous
+    /// destination version. Returns the new destination version number.
+    ///
+    /// Callers must ensure the source is a real object (not a symlink) — the
+    /// engine resolves symlinks before calling this.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_object(
+        &self,
+        src: &ObjectRecord,
+        dst_bucket: &str,
+        dst_key: &str,
+        last_modified: &str,
+    ) -> anyhow::Result<i64> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let result = (|| -> anyhow::Result<i64> {
+                let now = chrono::Utc::now().timestamp_millis();
+
+                // Copy the source's checksum (ObjectRecord does not carry it).
+                let checksum: String = conn
+                    .query_row(
+                        "SELECT checksum FROM versions WHERE bucket_name = ?1 AND key = ?2 AND version = ?3",
+                        params![src.bucket_name, src.key, src.version],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or_default();
+
+                // Fresh version for the destination key.
+                let version: i64 = conn.query_row(
+                    "SELECT COALESCE(MAX(version), 0) + 1 FROM versions WHERE bucket_name = ?1 AND key = ?2",
+                    params![dst_bucket, dst_key],
+                    |row| row.get(0),
+                )?;
+
+                // Supersede the destination's previous current version (if any).
+                let prev: Option<i64> = conn
+                    .query_row(
+                        "SELECT current_version FROM files WHERE bucket_name = ?1 AND key = ?2",
+                        params![dst_bucket, dst_key],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(p) = prev {
+                    if p != version {
+                        conn.execute(
+                            "UPDATE versions SET superseded_at = ?1
+                             WHERE bucket_name = ?2 AND key = ?3 AND version = ?4 AND superseded_at IS NULL",
+                            params![now, dst_bucket, dst_key, p],
+                        )?;
+                    }
+                }
+
+                // Insert a committed version pointing at the source's blob.
+                conn.execute(
+                    "INSERT INTO versions (bucket_name, key, version, size, etag, last_modified, content_type, charset, account_email, remote_path, status, created_at, superseded_at, checksum)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'committed', ?11, NULL, ?12)",
+                    params![
+                        dst_bucket, dst_key, version,
+                        src.size, src.etag, last_modified, src.content_type, src.charset,
+                        src.account_email, src.remote_path, now, checksum
+                    ],
+                )?;
+
+                // Upsert the destination file pointer.
+                conn.execute(
+                    "INSERT INTO files (bucket_name, key, current_version, size, etag, last_modified, content_type, charset, checksum)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(bucket_name, key) DO UPDATE SET
+                       current_version = excluded.current_version,
+                       size = excluded.size,
+                       etag = excluded.etag,
+                       last_modified = excluded.last_modified,
+                       content_type = excluded.content_type,
+                       charset = excluded.charset,
+                       checksum = excluded.checksum",
+                    params![
+                        dst_bucket, dst_key, version,
+                        src.size, src.etag, last_modified, src.content_type, src.charset, checksum
+                    ],
+                )?;
+
+                Ok(version)
+            })();
+            match result {
+                Ok(v) => {
+                    conn.execute_batch("COMMIT;")?;
+                    Ok(v)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    /// Count OTHER committed, live (non-superseded) version rows referencing the
+    /// same `(account_email, remote_path)` blob. Used by `vacuum` to decide
+    /// whether a blob is still referenced by another live object (e.g. after a
+    /// `CopyObject`) and therefore must NOT be deleted.
+    pub fn blob_live_references_excluding(
+        &self,
+        account_email: &str,
+        remote_path: &str,
+        bucket: &str,
+        key: &str,
+        version: i64,
+    ) -> anyhow::Result<i64> {
+        self.with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM versions
+                 WHERE account_email = ?1 AND remote_path = ?2
+                   AND status = 'committed' AND superseded_at IS NULL
+                   AND NOT (bucket_name = ?3 AND key = ?4 AND version = ?5)",
+                params![account_email, remote_path, bucket, key, version],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
     /// Return the (bucket, key) under which `remote_path` is already tracked for
     /// `account_email`, if any (committed versions only).
     /// Store the SHA-256 checksum for a version's blob. Mirrors the value onto
@@ -909,6 +1088,96 @@ impl MetadataDb {
         })
     }
 
+    /// Fetch a specific committed version of an object by (bucket, key, version).
+    pub fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version: i64,
+    ) -> anyhow::Result<Option<ObjectRecord>> {
+        self.with_conn(|conn| {
+            let sql = "SELECT key, size, etag, last_modified, content_type, account_email, \
+                        remote_path, bucket_name, version, charset \
+                        FROM versions \
+                        WHERE bucket_name = ?1 AND key = ?2 AND version = ?3 AND status = 'committed'";
+            let mut stmt = conn.prepare(sql)?;
+            let mut rows = stmt.query(params![bucket, key, version])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(object_from_row(row)?))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    /// List all committed versions of objects in a bucket (S3 ListObjectVersions),
+    /// optionally filtered by prefix and resumed via key-marker / version-id-marker.
+    /// Sorted by key ascending, then version descending (newest first). Returns
+    /// `max_keys + 1` rows so the caller can detect truncation.
+    pub fn list_object_versions(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        key_marker: Option<&str>,
+        version_id_marker: Option<i64>,
+        max_keys: i64,
+    ) -> anyhow::Result<Vec<ObjectVersionRecord>> {
+        self.with_conn(|conn| {
+            let mut sql = String::from(
+                "SELECT v.key, v.version, v.size, v.etag, v.last_modified, v.content_type, \
+                        COALESCE((f.current_version = v.version), 0) AS is_latest \
+                 FROM versions v \
+                 LEFT JOIN files f ON f.bucket_name = v.bucket_name AND f.key = v.key \
+                 WHERE v.bucket_name = ?1 AND v.status = 'committed'",
+            );
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+                vec![Box::new(bucket.to_string())];
+
+            if let Some(p) = prefix {
+                sql.push_str(&format!(" AND v.key LIKE ?{}", params.len() + 1));
+                params.push(Box::new(format!("{}%", p)));
+            }
+            if let Some(km) = key_marker {
+                if let Some(vim) = version_id_marker {
+                    sql.push_str(&format!(
+                        " AND (v.key > ?{} OR (v.key = ?{} AND v.version < ?{}))",
+                        params.len() + 1,
+                        params.len() + 1,
+                        params.len() + 2
+                    ));
+                    params.push(Box::new(km.to_string()));
+                    params.push(Box::new(vim));
+                } else {
+                    sql.push_str(&format!(" AND v.key > ?{}", params.len() + 1));
+                    params.push(Box::new(km.to_string()));
+                }
+            }
+            sql.push_str(" ORDER BY v.key ASC, v.version DESC");
+            sql.push_str(&format!(" LIMIT ?{}", params.len() + 1));
+            params.push(Box::new(max_keys + 1));
+
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok(ObjectVersionRecord {
+                    key: row.get(0)?,
+                    version: row.get(1)?,
+                    size: row.get(2)?,
+                    etag: row.get(3)?,
+                    last_modified: row.get(4)?,
+                    content_type: row.get(5)?,
+                    is_latest: row.get::<_, i64>(6)? != 0,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
     pub fn delete_object(&self, bucket: &str, key: &str) -> anyhow::Result<()> {
         self.with_conn(|conn| {
             conn.execute_batch("BEGIN IMMEDIATE;")?;
@@ -1034,6 +1303,72 @@ impl MetadataDb {
                 objects.push(row?);
             }
             Ok(objects)
+        })
+    }
+
+    /// Every pCloud path that MultiFS considers "managed" for a given account:
+    /// the union of (a) every committed version's `remote_path` and (b) every
+    /// multipart part's `pcloud_path`. Used by `audit` to detect true orphans.
+    ///
+    /// Note a multipart object's `versions.remote_path` is the staging *directory*
+    /// marker (`.../__mp__/multipart-<id>`), not a real file — the real blobs are
+    /// the individual part files in `multipart_parts.pcloud_path`.
+    pub fn list_managed_remote_paths(&self, email: &str) -> anyhow::Result<Vec<String>> {
+        self.with_conn(|conn| {
+            let mut out = Vec::new();
+            {
+                let mut stmt = conn.prepare(
+                    "SELECT remote_path FROM versions WHERE account_email = ?1 AND status = 'committed'",
+                )?;
+                let rows = stmt.query_map(params![email], |r| r.get::<_, String>(0))?;
+                for r in rows {
+                    out.push(r?);
+                }
+            }
+            {
+                let mut stmt = conn.prepare(
+                    "SELECT pcloud_path FROM multipart_parts WHERE pcloud_account = ?1",
+                )?;
+                let rows = stmt.query_map(params![email], |r| r.get::<_, String>(0))?;
+                for r in rows {
+                    out.push(r?);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Count multipart parts physically stored on a given account (for `shard
+    /// status` — a multipart object's parts are spread across accounts, so the
+    /// logical object count alone under-reports an account's real footprint).
+    pub fn count_parts_for_account(&self, email: &str) -> anyhow::Result<i64> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM multipart_parts WHERE pcloud_account = ?1",
+                params![email],
+                |row| row.get(0),
+            )
+            .map_err(anyhow::Error::from)
+        })
+    }
+
+    /// Safety gate for orphan cleanup: is a multipart `upload_id` still referenced
+    /// by ANY committed version (its `remote_path` carries the `__mp__/multipart-<id>`
+    /// marker) or ANY `multipart_parts` row? If so, its part files must NOT be
+    /// deleted — some live object still depends on them.
+    pub fn upload_id_referenced(&self, upload_id: &str) -> anyhow::Result<bool> {
+        self.with_conn(|conn| {
+            let v: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM versions WHERE status = 'committed' AND remote_path LIKE ?1",
+                params![format!("%{}%", upload_id)],
+                |r| r.get(0),
+            )?;
+            let p: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM multipart_parts WHERE upload_id = ?1",
+                params![upload_id],
+                |r| r.get(0),
+            )?;
+            Ok(v > 0 || p > 0)
         })
     }
 
@@ -1343,6 +1678,62 @@ impl MetadataDb {
             } else {
                 Ok(None)
             }
+        })
+    }
+
+    /// List in-progress multipart uploads for a bucket (S3 ListMultipartUploads),
+    /// optionally filtered by prefix and resumed via key-marker / upload-id-marker.
+    /// Returns (upload_id, key, created_epoch_secs), sorted by key then upload_id,
+    /// with `max_uploads + 1` rows so the caller can detect truncation.
+    pub fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+        max_uploads: i64,
+    ) -> anyhow::Result<Vec<(String, String, i64)>> {
+        self.with_conn(|conn| {
+            let mut sql = String::from(
+                "SELECT upload_id, key, created FROM multipart_uploads WHERE bucket = ?1",
+            );
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+                vec![Box::new(bucket.to_string())];
+
+            if let Some(p) = prefix {
+                sql.push_str(&format!(" AND key LIKE ?{}", params.len() + 1));
+                params.push(Box::new(format!("{}%", p)));
+            }
+            if let Some(km) = key_marker {
+                if let Some(uim) = upload_id_marker {
+                    sql.push_str(&format!(
+                        " AND (key > ?{} OR (key = ?{} AND upload_id > ?{}))",
+                        params.len() + 1,
+                        params.len() + 1,
+                        params.len() + 2
+                    ));
+                    params.push(Box::new(km.to_string()));
+                    params.push(Box::new(uim.to_string()));
+                } else {
+                    sql.push_str(&format!(" AND key > ?{}", params.len() + 1));
+                    params.push(Box::new(km.to_string()));
+                }
+            }
+            sql.push_str(" ORDER BY key ASC, upload_id ASC");
+            sql.push_str(&format!(" LIMIT ?{}", params.len() + 1));
+            params.push(Box::new(max_uploads + 1)); // +1 to detect truncation
+
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
         })
     }
 
@@ -1943,7 +2334,7 @@ mod tests {
             .unwrap();
         }
 
-        // Open triggers migration to v3 (current latest).
+        // Open triggers migration to v8 (current latest).
         let db = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
 
         let version: i64 = db
@@ -1955,7 +2346,7 @@ mod tests {
                 )?)
             })
             .unwrap();
-        assert_eq!(version, 7, "migration should set version to 7");
+        assert_eq!(version, 8, "migration should set version to 8");
 
         // The legacy object became version 1 of a file, with its blob preserved.
         let obj = db.get_object("b", "k.txt").unwrap().expect("object migrated");
@@ -2127,5 +2518,68 @@ mod tests {
         // Deleting the file supersedes its version.
         db.delete_object("b", "k.txt").unwrap();
         assert_eq!(db.count_superseded_versions().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_copy_object_shares_blob_and_reference_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("copy.db");
+        let db = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
+
+        // Create a source object via the normal reserve/commit path.
+        let (v1, path1) = db
+            .reserve_version("b", "src.txt", "acct@x", "/mnt/x")
+            .unwrap();
+        db.commit_version(
+            "b",
+            "src.txt",
+            v1,
+            5,
+            "etag-src",
+            "2026-08-22T00:00:00.000Z",
+            Some("text/plain"),
+            &path1,
+        )
+        .unwrap();
+        db.set_checksum("b", "src.txt", v1, "checksum-src").unwrap();
+        db.set_charset("b", "src.txt", v1, Some("utf-8")).unwrap();
+
+        let src = db.get_object("b", "src.txt").unwrap().unwrap();
+
+        // Copy to a new key — must reference the SAME blob, no data movement.
+        let v2 = db
+            .copy_object(&src, "b", "dst.txt", "2026-08-22T01:00:00.000Z")
+            .unwrap();
+        assert_eq!(v2, 1, "destination starts at version 1");
+
+        let dst = db.get_object("b", "dst.txt").unwrap().unwrap();
+        assert_eq!(dst.account_email, "acct@x");
+        assert_eq!(dst.remote_path, path1, "copy must share the source blob path");
+        assert_eq!(dst.size, 5);
+        assert_eq!(dst.etag, "etag-src");
+        assert_eq!(dst.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(dst.charset.as_deref(), Some("utf-8"));
+        assert_eq!(
+            db.get_checksum("b", "dst.txt").unwrap().as_deref(),
+            Some("checksum-src"),
+            "checksum must be copied"
+        );
+
+        // The source is still live, so the blob has 1 other live reference.
+        let refs = db
+            .blob_live_references_excluding("acct@x", &path1, "b", "dst.txt", v2)
+            .unwrap();
+        assert_eq!(refs, 1, "source is still a live reference");
+
+        // Deleting the source supersedes its version → no other live reference.
+        db.delete_object("b", "src.txt").unwrap();
+        let refs = db
+            .blob_live_references_excluding("acct@x", &path1, "b", "dst.txt", v2)
+            .unwrap();
+        assert_eq!(refs, 0, "source deletion leaves the copy as the sole owner");
+
+        // The copy remains intact after the source is gone.
+        let dst = db.get_object("b", "dst.txt").unwrap().unwrap();
+        assert_eq!(dst.remote_path, path1);
     }
 }

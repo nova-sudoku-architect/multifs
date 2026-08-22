@@ -231,12 +231,40 @@ async fn head_bucket(
 async fn create_bucket(
     State(state): State<S3State>,
     Path(bucket): Path<String>,
-) -> StatusCode {
+    Query(params): Query<ListObjectsParams>,
+    body: Body,
+) -> Response {
+    // PUT /{bucket}?versioning — PutBucketVersioning
+    if params.versioning.is_some() {
+        let body_bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap_or_default();
+        let body_str = String::from_utf8_lossy(&body_bytes).to_string();
+        let status = if body_str.contains("Enabled") { "Enabled" } else { "Suspended" };
+        return match state.engine.set_bucket_versioning(&bucket, status).await {
+            Ok(_) => Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::empty())
+                .unwrap(),
+            Err(e) => {
+                let xml = s3_error_xml("InternalError", &e.to_string(), &bucket);
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("Content-Type", "application/xml")
+                    .body(Body::from(xml))
+                    .unwrap()
+            }
+        };
+    }
     match state.engine.create_bucket(&bucket).await {
-        Ok(_) => StatusCode::OK,
+        Ok(_) => Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .unwrap(),
         Err(e) => {
             tracing::error!("Failed to create bucket '{}': {}", bucket, e);
-            StatusCode::CONFLICT
+            Response::builder()
+                .status(StatusCode::CONFLICT)
+                .body(Body::empty())
+                .unwrap()
         }
     }
 }
@@ -266,6 +294,17 @@ struct ListObjectsParams {
     marker: Option<String>,
     location: Option<String>,
     versioning: Option<String>,
+    versions: Option<String>,
+    #[serde(rename = "versionId")]
+    version_id: Option<String>,
+    #[serde(rename = "version-id-marker")]
+    version_id_marker: Option<String>,
+    #[serde(rename = "key-marker")]
+    key_marker: Option<String>,
+    #[serde(rename = "upload-id-marker")]
+    upload_id_marker: Option<String>,
+    #[serde(rename = "max-uploads")]
+    max_uploads: Option<i64>,
     uploads: Option<String>,
     upload_id: Option<String>,
     #[serde(rename = "partNumber")]
@@ -282,18 +321,69 @@ async fn list_objects(
     Path(bucket): Path<String>,
     Query(params): Query<ListObjectsParams>,
 ) -> Response {
-    // POST /{bucket}/{key}?uploads — Initiate multipart upload
+    // GET /{bucket}?uploads — ListMultipartUploads (list in-progress uploads).
     if params.uploads.is_some() {
-        let upload_id = format!("multipart-{}", chrono::Utc::now().format("%Y%m%d%H%M%S%f"));
-        let xml = format!(
+        let max_uploads = params.max_uploads.unwrap_or(1000).clamp(1, 1000);
+        let uploads = match state
+            .engine
+            .list_multipart_uploads(
+                &bucket,
+                params.prefix.as_deref(),
+                params.key_marker.as_deref(),
+                params.upload_id_marker.as_deref(),
+                max_uploads,
+            )
+            .await
+        {
+            Ok(u) => u,
+            Err(e) => {
+                let xml = s3_error_xml("InternalError", &e.to_string(), &bucket);
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("Content-Type", "application/xml")
+                    .body(Body::from(xml))
+                    .unwrap();
+            }
+        };
+
+        let truncated = uploads.len() as i64 > max_uploads;
+        let mut shown = uploads;
+        if truncated {
+            shown.truncate(max_uploads as usize);
+        }
+        let next_key_marker = shown.last().map(|(_, k, _)| k.clone()).unwrap_or_default();
+        let next_upload_id_marker = shown.last().map(|(id, _, _)| id.clone()).unwrap_or_default();
+
+        let mut xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
-<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Bucket>{}</Bucket>
-  <Key>unknown</Key>
-  <UploadId>{}</UploadId>
-</InitiateMultipartUploadResult>"#,
-            bucket, upload_id
+  <KeyMarker>{}</KeyMarker>
+  <UploadIdMarker>{}</UploadIdMarker>
+  <NextKeyMarker>{}</NextKeyMarker>
+  <NextUploadIdMarker>{}</NextUploadIdMarker>
+  <MaxUploads>{}</MaxUploads>
+  <IsTruncated>{}</IsTruncated>"#,
+            xml_escape(&bucket),
+            xml_escape(params.key_marker.as_deref().unwrap_or("")),
+            xml_escape(params.upload_id_marker.as_deref().unwrap_or("")),
+            xml_escape(&next_key_marker),
+            xml_escape(&next_upload_id_marker),
+            max_uploads,
+            truncated
         );
+        for (id, k, created) in &shown {
+            let initiated = chrono::DateTime::from_timestamp(*created, 0)
+                .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                .unwrap_or_default();
+            xml.push_str(&format!(
+                "<Upload><Key>{}</Key><UploadId>{}</UploadId><Initiator><ID>multifs</ID><DisplayName>multifs</DisplayName></Initiator><Owner><ID>multifs</ID><DisplayName>multifs</DisplayName></Owner><StorageClass>STANDARD</StorageClass><Initiated>{}</Initiated></Upload>",
+                xml_escape(k),
+                xml_escape(id),
+                initiated
+            ));
+        }
+        xml.push_str("</ListMultipartUploadsResult>");
         return Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/xml")
@@ -316,11 +406,100 @@ async fn list_objects(
 
     // GET /{bucket}?versioning — return versioning status (rclone compat)
     if params.versioning.is_some() {
-        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        let status = state
+            .engine
+            .get_bucket_versioning(&bucket)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "Suspended".to_string());
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-  <Status>Suspended</Status>
-</VersioningConfiguration>"#;
+  <Status>{}</Status>
+</VersioningConfiguration>"#,
+            xml_escape(&status)
+        );
         return Response::builder()
+            .header("Content-Type", "application/xml")
+            .body(Body::from(xml))
+            .unwrap();
+    }
+
+    // GET /{bucket}?versions — ListObjectVersions (list committed versions).
+    if params.versions.is_some() {
+        let max_keys = params.max_keys.unwrap_or(1000).clamp(1, 1000);
+        let version_id_marker = params
+            .version_id_marker
+            .as_deref()
+            .and_then(|s| s.parse::<i64>().ok());
+        let versions = match state
+            .engine
+            .list_object_versions(
+                &bucket,
+                params.prefix.as_deref(),
+                params.key_marker.as_deref(),
+                version_id_marker,
+                max_keys,
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let xml = s3_error_xml("InternalError", &e.to_string(), &bucket);
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("Content-Type", "application/xml")
+                    .body(Body::from(xml))
+                    .unwrap();
+            }
+        };
+
+        let truncated = versions.len() as i64 > max_keys;
+        let mut shown = versions;
+        if truncated {
+            shown.truncate(max_keys as usize);
+        }
+        let next_key_marker = shown.last().map(|v| v.key.clone()).unwrap_or_default();
+        let next_version_id_marker = shown
+            .last()
+            .map(|v| v.version.to_string())
+            .unwrap_or_default();
+
+        let mut xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>{}</Name>
+  <Prefix>{}</Prefix>
+  <KeyMarker>{}</KeyMarker>
+  <VersionIdMarker>{}</VersionIdMarker>
+  <NextKeyMarker>{}</NextKeyMarker>
+  <NextVersionIdMarker>{}</NextVersionIdMarker>
+  <MaxKeys>{}</MaxKeys>
+  <IsTruncated>{}</IsTruncated>"#,
+            xml_escape(&bucket),
+            xml_escape(params.prefix.as_deref().unwrap_or("")),
+            xml_escape(params.key_marker.as_deref().unwrap_or("")),
+            xml_escape(params.version_id_marker.as_deref().unwrap_or("")),
+            xml_escape(&next_key_marker),
+            xml_escape(&next_version_id_marker),
+            max_keys,
+            truncated
+        );
+        for v in &shown {
+            xml.push_str(&format!(
+                "<Version><Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest><LastModified>{}</LastModified><ETag>&quot;{}&quot;</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Version>",
+                xml_escape(&v.key),
+                v.version,
+                v.is_latest,
+                xml_escape(&v.last_modified),
+                xml_escape(&v.etag),
+                v.size
+            ));
+        }
+        xml.push_str("</ListVersionsResult>");
+        return Response::builder()
+            .status(StatusCode::OK)
             .header("Content-Type", "application/xml")
             .body(Body::from(xml))
             .unwrap();
@@ -547,6 +726,16 @@ async fn put_object(
 
     // PUT /{bucket}/{key}?partNumber=N&uploadId=... — Upload a part
     if has_part_number {
+        // UploadPartCopy: part upload with `x-amz-copy-source` (no body).
+        if let Some(copy_src) = headers
+            .get("x-amz-copy-source")
+            .and_then(|v| v.to_str().ok())
+        {
+            let copy_range = headers
+                .get("x-amz-copy-source-range")
+                .and_then(|v| v.to_str().ok());
+            return upload_part_copy(&state, &bucket, &key, copy_src, copy_range, query_str).await;
+        }
         let q = parse_query(query_str);
         let upload_id = q
             .get("uploadId")
@@ -595,6 +784,14 @@ async fn put_object(
             .body(Body::empty())
             .unwrap();
     }
+    // CopyObject: PUT with `x-amz-copy-source` — server-side copy (no body).
+    if let Some(copy_src) = headers
+        .get("x-amz-copy-source")
+        .and_then(|v| v.to_str().ok())
+    {
+        return copy_object(&state, &bucket, &key, copy_src).await;
+    }
+
     // Resolve content type from file extension + client header
     let client_ct = headers
         .get(http::header::CONTENT_TYPE)
@@ -660,6 +857,227 @@ async fn put_object(
     }
 }
 
+/// Handle S3 CopyObject: a PUT with `x-amz-copy-source: /bucket/key` and no
+/// body. Performs a server-side (metadata-level) copy — the destination key
+/// references the source's blob without moving bytes.
+async fn copy_object(
+    state: &S3State,
+    dst_bucket: &str,
+    dst_key: &str,
+    copy_source: &str,
+) -> Response {
+    tracing::info!(
+        "S3 CopyObject {}/{} <- {}",
+        dst_bucket,
+        dst_key,
+        copy_source
+    );
+
+    // `x-amz-copy-source` is `/{bucket}/{key}` with the key percent-encoded and
+    // may carry a `?versionId=...` query we ignore for now.
+    let raw = copy_source.trim_start_matches('/');
+    let raw = raw.split('?').next().unwrap_or(raw);
+    let (src_bucket, src_key_enc) = match raw.split_once('/') {
+        Some((b, k)) => (b.to_string(), k.to_string()),
+        None => {
+            let xml = s3_error_xml(
+                "InvalidArgument",
+                &format!("invalid x-amz-copy-source: {}", copy_source),
+                &format!("{}/{}", dst_bucket, dst_key),
+            );
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap();
+        }
+    };
+    let src_key = percent_encoding::percent_decode_str(&src_key_enc)
+        .decode_utf8_lossy()
+        .to_string();
+
+    match state
+        .engine
+        .copy_object(&src_bucket, &src_key, dst_bucket, dst_key)
+        .await
+    {
+        Ok(info) => {
+            let etag = format!("\"{}\"", info.etag);
+            let xml = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <LastModified>{}</LastModified>
+  <ETag>{}</ETag>
+</CopyObjectResult>"#,
+                info.last_modified,
+                etag,
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/xml")
+                .header("ETag", etag)
+                .body(Body::from(xml))
+                .unwrap()
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let (code, status) = if msg.contains("same object") {
+                ("InvalidRequest", StatusCode::BAD_REQUEST)
+            } else if msg.contains("Object not found") {
+                ("NoSuchKey", StatusCode::NOT_FOUND)
+            } else {
+                ("InternalError", StatusCode::INTERNAL_SERVER_ERROR)
+            };
+            let xml = s3_error_xml(code, &msg, &format!("{}/{}", dst_bucket, dst_key));
+            Response::builder()
+                .status(status)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap()
+        }
+    }
+}
+
+/// Parse `x-amz-copy-source-range: bytes=first-last` (inclusive, both required).
+fn parse_copy_range(r: &str) -> Option<(u64, u64)> {
+    let r = r.strip_prefix("bytes=")?;
+    let (a, b) = r.split_once('-')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+/// Handle S3 UploadPartCopy: a part upload (`?partNumber=N&uploadId=...`) that
+/// carries `x-amz-copy-source` and an optional `x-amz-copy-source-range`.
+async fn upload_part_copy(
+    state: &S3State,
+    dst_bucket: &str,
+    dst_key: &str,
+    copy_source: &str,
+    copy_range: Option<&str>,
+    query_str: &str,
+) -> Response {
+    let q = parse_query(query_str);
+    let upload_id = q
+        .get("uploadId")
+        .or_else(|| q.get("upload_id"))
+        .cloned()
+        .unwrap_or_default();
+    let part_no = q
+        .get("partNumber")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    // Verify the upload exists before copying anything.
+    match state.engine.get_multipart_upload(&upload_id).await {
+        Ok(None) => {
+            let xml = s3_error_xml(
+                "NoSuchUpload",
+                "no such multipart upload",
+                &format!("{}/{}", dst_bucket, dst_key),
+            );
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap();
+        }
+        Err(e) => {
+            let xml = s3_error_xml(
+                "InternalError",
+                &e.to_string(),
+                &format!("{}/{}", dst_bucket, dst_key),
+            );
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap();
+        }
+        Ok(Some(_)) => {}
+    }
+
+    // Parse `x-amz-copy-source: /bucket/key` (key percent-encoded).
+    let raw = copy_source.trim_start_matches('/');
+    let raw = raw.split('?').next().unwrap_or(raw);
+    let (src_bucket, src_key_enc) = match raw.split_once('/') {
+        Some((b, k)) => (b.to_string(), k.to_string()),
+        None => {
+            let xml = s3_error_xml(
+                "InvalidArgument",
+                &format!("invalid x-amz-copy-source: {}", copy_source),
+                &format!("{}/{}", dst_bucket, dst_key),
+            );
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap();
+        }
+    };
+    let src_key = percent_encoding::percent_decode_str(&src_key_enc)
+        .decode_utf8_lossy()
+        .to_string();
+
+    let range = match copy_range {
+        Some(r) => match parse_copy_range(r) {
+            Some(range) => Some(range),
+            None => {
+                let xml = s3_error_xml(
+                    "InvalidArgument",
+                    &format!("invalid x-amz-copy-source-range: {}", r),
+                    &format!("{}/{}", dst_bucket, dst_key),
+                );
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/xml")
+                    .body(Body::from(xml))
+                    .unwrap();
+            }
+        },
+        None => None,
+    };
+
+    match state
+        .engine
+        .upload_part_copy(&src_bucket, &src_key, range, dst_bucket, &upload_id, part_no)
+        .await
+    {
+        Ok((_staging, _size, md5)) => {
+            let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+            let etag = format!("\"{}\"", md5);
+            let xml = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<CopyPartResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <LastModified>{}</LastModified>
+  <ETag>{}</ETag>
+</CopyPartResult>"#,
+                now, etag
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/xml")
+                .header("ETag", etag)
+                .body(Body::from(xml))
+                .unwrap()
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let (code, status) = if msg.contains("Object not found") {
+                ("NoSuchKey", StatusCode::NOT_FOUND)
+            } else if msg.contains("range") {
+                ("InvalidRange", StatusCode::RANGE_NOT_SATISFIABLE)
+            } else {
+                ("InternalError", StatusCode::INTERNAL_SERVER_ERROR)
+            };
+            let xml = s3_error_xml(code, &msg, &format!("{}/{}", dst_bucket, dst_key));
+            Response::builder()
+                .status(status)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap()
+        }
+    }
+}
+
 /// GET /{bucket}/{key} — Download object with streaming Range support.
 /// Uses channel-based streaming so video players (VLC) can seek without
 /// the server buffering the entire file into memory.
@@ -683,8 +1101,19 @@ async fn get_object(
     use futures::stream::StreamExt;
     use std::pin::Pin;
 
+    // Parse optional ?versionId=N (fetch a specific version, else current).
+    let version_id = uri.query().and_then(|q| {
+        let map = parse_query(q);
+        map.get("versionId").or_else(|| map.get("version_id")).cloned()
+    });
+    let resolved_version = version_id.as_deref().and_then(|s| s.parse::<i64>().ok());
+
     // Get object metadata first (size, content-type, etag)
-    let obj_info = match state.engine.head_object(&bucket, &key).await {
+    let obj_info = match resolved_version {
+        Some(v) => state.engine.head_object_version(&bucket, &key, v).await,
+        None => state.engine.head_object(&bucket, &key).await,
+    };
+    let obj_info = match obj_info {
         Ok(info) => info,
         Err(e) => {
             let xml = s3_error_xml("NoSuchKey", &e.to_string(), &format!("{}/{}", bucket, key));
@@ -724,7 +1153,13 @@ async fn get_object(
 
     tokio::task::spawn(async move {
         let range_for_stream = parsed_range;
-        if let Err(e) = engine.get_object_stream(&b, &k, range_for_stream, tx).await {
+        let result = match resolved_version {
+            Some(v) => engine
+                .get_object_version_stream(&b, &k, v, range_for_stream, tx)
+                .await,
+            None => engine.get_object_stream(&b, &k, range_for_stream, tx).await,
+        };
+        if let Err(e) = result {
             tracing::error!("S3 stream error for {}/{}: {}", b, k, e);
         }
     });
@@ -852,8 +1287,17 @@ async fn list_parts(
 async fn head_object(
     State(state): State<S3State>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<ListObjectsParams>,
 ) -> Response {
-    match state.engine.head_object(&bucket, &key).await {
+    let resolved_version = params
+        .version_id
+        .as_deref()
+        .and_then(|s| s.parse::<i64>().ok());
+    let result = match resolved_version {
+        Some(v) => state.engine.head_object_version(&bucket, &key, v).await,
+        None => state.engine.head_object(&bucket, &key).await,
+    };
+    match result {
         Ok(info) => {
             let ct = info.content_type.clone().unwrap_or_else(|| "application/octet-stream".to_string());
             let ct_header = match crate::server::serve_charset(info.charset.as_deref(), Some(&ct)) {

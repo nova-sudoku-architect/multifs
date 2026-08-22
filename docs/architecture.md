@@ -1,12 +1,12 @@
 # MultiFS — System Architecture
 
-> Version 0.3.0 | 2026-08-15 | Author: Nova Claw
+> Version 0.3.0 | 2026-08-22 | Author: Nova Claw
 
 ## Overview
 
 MultiFS is a multi-cloud storage pool written in Rust that aggregates multiple storage
 backends into a **single S3-compatible API endpoint** (port 9000). Objects are distributed
-across **8 pCloud OAuth accounts (~49 GB)** plus a **local disk backend (80 GB)** using
+across **47 pCloud OAuth accounts (~178 GB)** plus a **local disk backend (80 GB)** using
 **single-blob storage with copy-on-write MVCC versioning**. Every object is stored as one self-contained blob on one account; overwrites create
 a new version and atomically flip the file's "current version" pointer, never mutating the live
 blob in place.
@@ -20,6 +20,7 @@ blob in place.
 | MVCC versioned overwrite | ✅ Live | Copy-on-write: new version + atomic pointer flip, old blob kept for grace period |
 | Range streaming | ✅ Live | HTTP Range forwarded to pCloud CDN (start/end) |
 | S3 multipart upload | ✅ Live | Initiate / UploadPart / Complete / ListParts / Abort; parts persisted and assembled |
+| S3 copy & versioning | ✅ Live | CopyObject, UploadPartCopy, ListMultipartUploads, ListObjectVersions (`versionId`), PutBucketVersioning |
 | `vacuum` GC | ✅ Live | Reclaims abandoned `pending` and superseded (orphaned) version blobs |
 | `import` command | ✅ Live | Register an existing pCloud file into the DB (metadata only) |
 | Content checksums | ✅ Live | SHA-256 stored per blob; `checksum rebuild|verify` detects in-place drift |
@@ -64,7 +65,7 @@ blob in place.
 │             ▼               ▼              ▼         │  │
 │    ┌──────────────┐ ┌──────────────┐ ┌─────────────┐ │  │
 │    │ PCloudBackend│ │LocalDiskBack │ │ MockBackend │ │  │
-│    │ (8 accounts) │ │ (80 GB prio1)│ │ (unit tests)│ │  │
+│    │ (47 accounts) │ │ (80 GB prio1)│ │ (unit tests)│ │  │
 │    └──────┬───────┘ └──────────────┘ └─────────────┘ │  │
 │           ▼                                           │  │
 │    ┌──────────────────────────────┐                   │  │
@@ -80,13 +81,14 @@ blob in place.
 
 ## Data Model (SQLite)
 
-Path: `/var/lib/multifs/meta.db` (WAL mode). Schema version **4** (charset column added in migration 4).
+Path: `/var/lib/multifs/meta.db` (WAL mode). Schema version **8** (latest: `buckets.versioning` added in migration 8).
 
 ```sql
 -- Bucket registry
 CREATE TABLE buckets (
     name TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    versioning     TEXT NOT NULL DEFAULT 'Suspended'  -- S3 versioning status
 );
 
 -- Logical file pointer: one row per (bucket, key)
@@ -322,7 +324,7 @@ pub trait StorageBackend: Send + Sync {
 
 | Backend | Status | Notes |
 |---------|--------|-------|
-| `PCloudBackend` | ✅ Complete | 8 accounts, EU API |
+| `PCloudBackend` | ✅ Complete | 47 accounts, EU API |
 | `LocalDiskBackend` | ✅ Complete | Files under a root dir (`path`), used as overflow tier |
 | `MockBackend` | ✅ Complete | In-memory HashMap, honors byte ranges, used by unit tests |
 | `TrackedBackend` | ✅ Complete | Wraps any backend with call tracking + latency simulation |
@@ -363,6 +365,7 @@ multifs bucket create|list|info      Manage buckets
 multifs object cp|ls|rm|info         Manage objects
 multifs shard status                 Show account fill levels
 multifs audit scan|list-files        Find files not managed by MultiFS
+multifs audit reconcile|cleanup      Diff/delete orphaned pCloud files vs the DB
 multifs import <email> <path> \      Register an existing pCloud file (metadata only)
     --bucket <b> [--key <k>]
 multifs import <email> --scan \      Bulk-import every unmanaged file in the account
@@ -392,7 +395,7 @@ multifs fsck [--checksums] [--fix]   Verify DB integrity + backend presence/size
 
 ## Test Coverage
 
-All 116 lib tests pass (`cargo test --lib`). Highlights:
+All 123 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_multipart_part_body_is_consumed_and_stored` — multipart round-trip + assembly.
 - `test_s3_multipart_roundtrip_stores_object` — total size + ETag correctness.
 - `test_concurrent_streaming` — concurrent range streams (range-aware mock).
@@ -423,7 +426,7 @@ backend_type = "pcloud"
 token_env = "PCLOUD_TOKEN_VIDEO_01"
 mount_prefix = "/multifs/01"
 quota_gb = 10
-# ... 7 more pCloud accounts ...
+# ... 46 more pCloud accounts ...
 
 [[storage.accounts]]
 email = "local-disk"

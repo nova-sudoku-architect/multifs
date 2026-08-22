@@ -1,7 +1,7 @@
 # MultiFS — Multi-Cloud Storage Pool
 
 A MinIO/S3-compatible object storage service written in Rust that aggregates multiple
-storage backends — **8 pCloud OAuth accounts (~49 GB)** plus a **local disk (80 GB)** — into
+storage backends — **47 pCloud OAuth accounts (~178 GB)** plus a **local disk (80 GB)** — into
 a single S3 endpoint (port 9000). Objects are stored as **single self-contained blobs** with
 **copy-on-write MVCC versioning**: overwrites create a new version and atomically flip the
 live pointer, never mutating a blob in place.
@@ -31,6 +31,7 @@ multifs serve
 |---------|--------|
 | **S3-compatible API** — ListBuckets, Create/DeleteBucket, Put/Get/Head/Delete Object, ListObjectsV2 | ✅ |
 | **S3 multipart upload** — Initiate / UploadPart / Complete / ListParts / Abort (rclone >64 MB) | ✅ |
+| **S3 copy & versioning** — CopyObject, UploadPartCopy, ListMultipartUploads, ListObjectVersions (`versionId`), PutBucketVersioning | ✅ |
 | **Single-blob MVCC versioning** — copy-on-write overwrite, old version kept for a grace period | ✅ |
 | **HTTP Range streaming** — Range forwarded to the pCloud CDN (start/end) | ✅ |
 | **Tiered placement** — cloud-first, local disk as last resort (per-account `priority`) | ✅ |
@@ -48,7 +49,7 @@ multifs serve
 
 | Type | Count | Notes |
 |------|-------|-------|
-| pCloud (EU) | 8 accounts | OAuth tokens from env vars, ~49 GB combined |
+| pCloud (EU) | 47 accounts | OAuth tokens from env vars, ~178 GB combined |
 | Local disk | 1 | `/var/lib/multifs/disk`, 80 GB, `priority = 1` (last resort) |
 
 ## S3 Usage
@@ -152,11 +153,15 @@ multifs object cp <src> <dst>     Copy object (local ↔ remote)
 multifs object rm <bucket>/<key>  Delete object
 multifs object info <bucket>/<key>  Object metadata
 
-multifs shard status              Backend fill levels
+multifs shard status              Backend fill levels (objects + parts)
 multifs shard rebalance           Rebalance over-full → under-full backends
 
 multifs audit scan <email>        Find pCloud files NOT managed by MultiFS
 multifs audit list-files <email>  List all files (managed + orphaned)
+multifs audit reconcile [--account <email>]
+                                  Diff each account's files vs the DB (orphan counts + bytes)
+multifs audit cleanup [--account <email>] [--apply]
+                                  Delete orphaned pCloud files (dry-run by default)
 
 multifs import <email> <path> --bucket <b> [--key <k>]
                                   Register an existing pCloud file (metadata only)

@@ -8,7 +8,7 @@ use chrono::Utc;
 use crate::config::{Config, PlacementStrategy};
 
 use super::backends::StorageBackend;
-use super::metadata::{MetadataDb, BucketRecord, SymlinkRecord};
+use super::metadata::{MetadataDb, BucketRecord, SymlinkRecord, ObjectVersionRecord};
 use rusqlite::params;
 
 #[derive(Debug, Clone)]
@@ -28,6 +28,7 @@ pub struct ObjectInfo {
 pub struct ShardStatus {
     pub email: String,
     pub object_count: i64,
+    pub part_count: i64,
     pub used_bytes: i64,
     pub total_bytes: i64,
 }
@@ -725,6 +726,111 @@ impl StorageEngine {
         })
     }
 
+    /// Fetch metadata for a specific committed version (S3 `versionId`).
+    pub async fn head_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version: i64,
+    ) -> anyhow::Result<ObjectInfo> {
+        let obj = self
+            .meta
+            .get_object_version(bucket, key, version)?
+            .ok_or_else(|| anyhow::anyhow!("Object version not found: {}/{} v{}", bucket, key, version))?;
+        Ok(ObjectInfo {
+            key: obj.key,
+            size: obj.size,
+            etag: obj.etag,
+            last_modified: obj.last_modified,
+            content_type: obj.content_type,
+            charset: obj.charset,
+            account_email: obj.account_email,
+            remote_path: obj.remote_path,
+            version: obj.version,
+        })
+    }
+
+    /// Stream a specific committed version's bytes (S3 `versionId`), with the
+    /// same Range semantics as `get_object_stream`.
+    pub async fn get_object_version_stream(
+        &self,
+        bucket: &str,
+        key: &str,
+        version: i64,
+        range: Option<(usize, usize)>,
+        tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, anyhow::Error>>,
+    ) -> anyhow::Result<()> {
+        let obj = self
+            .meta
+            .get_object_version(bucket, key, version)?
+            .ok_or_else(|| anyhow::anyhow!("Object version not found: {}/{} v{}", bucket, key, version))?;
+        if let Some(upload_id) = Self::multipart_upload_id(&obj.remote_path) {
+            return self.get_multipart_object_stream(bucket, key, &upload_id, range, tx).await;
+        }
+        let backend = self.find_backend(&obj.account_email)?;
+        let (range_start, range_end) = match range {
+            Some((s, e)) => (Some(s as u64), Some(e as u64)),
+            None => (None, None),
+        };
+        backend
+            .backend
+            .download_stream(&obj.remote_path, range_start, range_end, tx)
+            .await
+    }
+
+    // -----------------------------------------------------------------
+    //  Server-side copy (CopyObject)
+    // -----------------------------------------------------------------
+
+    /// Copy an object to a new key without moving any bytes: the destination
+    /// version references the source's existing blob (content-addressed
+    /// metadata copy). Source symlinks are resolved before the copy. Returns the
+    /// destination `ObjectInfo`.
+    pub async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+    ) -> anyhow::Result<ObjectInfo> {
+        // S3 rejects copying an object onto itself.
+        if src_bucket == dst_bucket && src_key == dst_key {
+            anyhow::bail!(
+                "copy source and destination are the same object: {}/{}",
+                src_bucket,
+                src_key
+            );
+        }
+
+        // Resolve source symlink (read-through) to the real object.
+        let (sb, sk) = match self.resolve_read_key(src_bucket, src_key)? {
+            Some((b, k)) => (b, k),
+            None => (src_bucket.to_string(), src_key.to_string()),
+        };
+        let src = self
+            .meta
+            .get_object(&sb, &sk)?
+            .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", sb, sk))?;
+
+        self.ensure_bucket(dst_bucket)?;
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        let version = self
+            .meta
+            .copy_object(&src, dst_bucket, dst_key, &now)?;
+
+        Ok(ObjectInfo {
+            key: dst_key.to_string(),
+            size: src.size,
+            etag: src.etag,
+            last_modified: now,
+            content_type: src.content_type,
+            charset: src.charset,
+            account_email: src.account_email,
+            remote_path: src.remote_path,
+            version,
+        })
+    }
+
     // -----------------------------------------------------------------
     //  Delete
     // -----------------------------------------------------------------
@@ -770,6 +876,22 @@ impl StorageEngine {
         let mut orphans_removed = 0u64;
         for v in &orphans {
             if !dry_run {
+                // Reference-aware reclaim: if another live object still points
+                // at this blob (e.g. via CopyObject, which shares the same
+                // `remote_path`), keep the blob and only drop this superseded
+                // version row — otherwise we'd delete bytes a live key needs.
+                let live_refs = self.meta.blob_live_references_excluding(
+                    &v.account_email,
+                    &v.remote_path,
+                    &v.bucket_name,
+                    &v.key,
+                    v.version,
+                )?;
+                if live_refs > 0 {
+                    self.meta.delete_version(&v.bucket_name, &v.key, v.version)?;
+                    orphans_removed += 1;
+                    continue;
+                }
                 // Multipart (chunked) objects store their parts folder as the
                 // version's `remote_path` (`.../__mp__/multipart-<id>`). A plain
                 // `delete` is a `deletefile` on a folder, which silently no-ops,
@@ -1132,12 +1254,14 @@ impl StorageEngine {
         let mut statuses = Vec::new();
         for handle in self.backends.iter() {
             let obj_count = self.meta.count_objects_for_account(&handle.label)?;
+            let part_count = self.meta.count_parts_for_account(&handle.label)?;
             let total_size = self.meta.account_total_size(&handle.label)?;
             let quota = handle.quota_gb as i64 * 1_073_741_824;
             if let Ok((used, total)) = handle.backend.check_quota().await {
                 statuses.push(ShardStatus {
                     email: handle.label.clone(),
                     object_count: obj_count,
+                    part_count,
                     used_bytes: used,
                     total_bytes: total,
                 });
@@ -1145,6 +1269,7 @@ impl StorageEngine {
                 statuses.push(ShardStatus {
                     email: handle.label.clone(),
                     object_count: obj_count,
+                    part_count,
                     used_bytes: total_size,
                     total_bytes: quota,
                 });
@@ -1180,6 +1305,44 @@ impl StorageEngine {
         upload_id: &str,
     ) -> anyhow::Result<Option<(String, String, Option<String>)>> {
         self.meta.get_multipart(upload_id)
+    }
+
+    /// List in-progress multipart uploads for a bucket (S3 ListMultipartUploads).
+    /// Returns (upload_id, key, created_epoch_secs), with `max_uploads + 1` rows
+    /// so the caller can detect truncation.
+    pub async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+        max_uploads: i64,
+    ) -> anyhow::Result<Vec<(String, String, i64)>> {
+        self.meta
+            .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, max_uploads)
+    }
+
+    /// List all committed object versions in a bucket (S3 ListObjectVersions).
+    pub async fn list_object_versions(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        key_marker: Option<&str>,
+        version_id_marker: Option<i64>,
+        max_keys: i64,
+    ) -> anyhow::Result<Vec<ObjectVersionRecord>> {
+        self.meta
+            .list_object_versions(bucket, prefix, key_marker, version_id_marker, max_keys)
+    }
+
+    /// Get a bucket's versioning status ('Enabled' or 'Suspended').
+    pub async fn get_bucket_versioning(&self, name: &str) -> anyhow::Result<Option<String>> {
+        self.meta.get_bucket_versioning(name)
+    }
+
+    /// Set a bucket's versioning status ('Enabled' or 'Suspended').
+    pub async fn set_bucket_versioning(&self, name: &str, status: &str) -> anyhow::Result<()> {
+        self.meta.set_bucket_versioning(name, status)
     }
 
     /// Upload a single multipart part as one blob to pCloud.
@@ -1222,6 +1385,110 @@ impl StorageEngine {
         )?;
 
         Ok((staging_key, part_size, part_md5))
+    }
+
+    /// Copy a byte range of an existing object into a multipart part
+    /// (S3 UploadPartCopy). Streams the source range directly to a fresh part
+    /// blob, computing the part's MD5 ETag on the fly. Returns
+    /// (staging_key, part_size, part_md5).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_part_copy(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        range: Option<(u64, u64)>, // (first, last) inclusive — S3 copy-source-range
+        dst_bucket: &str,
+        upload_id: &str,
+        part_number: u64,
+    ) -> anyhow::Result<(String, i64, String)> {
+        use futures::StreamExt;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        // Resolve source symlink (read-through) to the real object.
+        let (sb, sk) = match self.resolve_read_key(src_bucket, src_key)? {
+            Some((b, k)) => (b, k),
+            None => (src_bucket.to_string(), src_key.to_string()),
+        };
+        let src = self
+            .meta
+            .get_object(&sb, &sk)?
+            .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", sb, sk))?;
+
+        let src_size = src.size as u64;
+        // Convert the inclusive [first, last] range to an exclusive end offset.
+        let (start, end_exclusive) = match range {
+            Some((first, last)) => {
+                if last < first {
+                    anyhow::bail!("invalid copy range: {}-{}", first, last);
+                }
+                if first >= src_size {
+                    anyhow::bail!(
+                        "copy range start {} beyond object size {}",
+                        first,
+                        src_size
+                    );
+                }
+                (first, (last + 1).min(src_size))
+            }
+            None => (0, src_size),
+        };
+        if start >= end_exclusive {
+            anyhow::bail!("empty copy range");
+        }
+
+        // Stream the source range, hashing MD5 while forwarding to the backend.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, anyhow::Error>>(16);
+        let engine = self.clone();
+        let b = sb.clone();
+        let k = sk.clone();
+        tokio::spawn(async move {
+            if let Err(e) = engine
+                .get_object_stream(&b, &k, Some((start as usize, end_exclusive as usize)), tx)
+                .await
+            {
+                tracing::error!("upload_part_copy: source stream error for {}/{}: {}", b, k, e);
+            }
+        });
+
+        let hasher = Arc::new(std::sync::Mutex::new(Md5::new()));
+        let hasher_tee = hasher.clone();
+        let hashed_stream = ReceiverStream::new(rx).map(move |item| {
+            let chunk = item?;
+            hasher_tee.lock().unwrap().update(&chunk);
+            Ok::<bytes::Bytes, anyhow::Error>(chunk)
+        });
+
+        let backends = &*self.backends;
+        if backends.is_empty() {
+            anyhow::bail!("No storage backends configured");
+        }
+        if self.placement == PlacementStrategy::Utilization {
+            let _ = self.refresh_quotas().await;
+        }
+        let idx = self.pick_backend().await?;
+        let part_path = format!(
+            "{}/{}/__mp__/{}/{}",
+            backends[idx].mount_prefix, dst_bucket, upload_id, part_number
+        );
+
+        let (actual_path, _file_id, _sha256_etag, file_size) = backends[idx]
+            .backend
+            .upload_stream(&part_path, Box::new(hashed_stream))
+            .await?;
+
+        let part_md5 = hex::encode(hasher.lock().unwrap().clone().finalize());
+        let staging_key = format!("__mp__/{}/{}", upload_id, part_number);
+
+        self.meta.store_multipart_part(
+            upload_id,
+            part_number,
+            file_size,
+            &part_md5,
+            &backends[idx].label,
+            &actual_path,
+        )?;
+
+        Ok((staging_key, file_size, part_md5))
     }
 
     /// Complete a multipart upload — stitch parts into the final object.

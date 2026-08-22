@@ -52,6 +52,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 url = "2"
+percent-encoding = "2"
 walkdir = "2"
 bytes = "1"
 mime_guess = "2"
