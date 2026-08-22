@@ -279,6 +279,12 @@ Background (the server runs a vacuum every 10 minutes) or on-demand
 it has been superseded for the grace window. Completed multipart objects (no
 `multipart_uploads` row) are never swept, so their retained parts survive for read assembly.
 
+Multipart part deletion is **per-account**: `upload_part` picks a backend independently for
+each part, so a single upload's parts can scatter across 2–4 backends. Reclaim groups parts
+by account and deletes each account's `__mp__/multipart-<id>` folder (with a per-file
+fallback). A failed delete keeps the DB rows so a later vacuum retries rather than silently
+leaking bytes.
+
 ---
 
 ## S3 Multipart Upload
@@ -395,11 +401,13 @@ multifs fsck [--checksums] [--fix]   Verify DB integrity + backend presence/size
 
 ## Test Coverage
 
-All 123 lib tests pass (`cargo test --lib`). Highlights:
+All 124 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_multipart_part_body_is_consumed_and_stored` — multipart round-trip + assembly.
 - `test_s3_multipart_roundtrip_stores_object` — total size + ETag correctness.
 - `test_concurrent_streaming` — concurrent range streams (range-aware mock).
 - `test_streaming_range_download` — range slicing (inclusive start / exclusive end).
+- `test_abort_multipart_deletes_parts_from_all_backends` — abort reclaims parts
+  scattered across backends (per-account delete, no cross-backend leak).
 - `stream_hasher` — incremental SHA-256 ETag hashing.
 
 ---

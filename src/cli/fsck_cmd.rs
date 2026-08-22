@@ -426,35 +426,11 @@ pub async fn run(args: FsckArgs) -> Result<()> {
 
         if !orphan_parts.is_empty() {
             for id in &orphan_parts {
-                let parts = meta.list_multipart_parts(id)?;
-                // All parts of one multipart upload share a single
-                // `__mp__/<id>/N` folder. Prefer one recursive folder delete;
-                // fall back to per-file deletes when the backend can't do it.
-                let folder = parts
-                    .first()
-                    .and_then(|(_, _, _, _, path)| path.rsplit_once('/').map(|(dir, _)| dir.to_string()));
-                let account = parts
-                    .first()
-                    .map(|(_, _, _, account, _)| account.clone());
-                let mut folder_deleted = false;
-                if let (Some(account), Some(folder)) = (account.as_deref(), folder.as_deref()) {
-                    match engine.delete_folder_recursive(account, folder).await {
-                        Ok(Some(n)) => {
-                            folder_deleted = true;
-                            println!("  🧹 deleted orphan multipart folder {} ({}) — {} file(s)", id, folder, n);
-                        }
-                        Ok(None) => {}
-                        Err(e) => eprintln!(
-                            "  ⚠️  recursive delete of {} failed ({}); falling back to per-file delete",
-                            folder, e
-                        ),
-                    }
-                }
-                if !folder_deleted {
-                    for (_pn, _size, _etag, account, path) in &parts {
-                        let _ = engine.delete_blob(account, path).await;
-                    }
-                    println!("  🧹 deleted orphan multipart parts: {}", id);
+                // Delete each part from its OWN account (parts scatter across
+                // backends), not just the first part's folder (Bug A).
+                match engine.delete_multipart_parts(id).await {
+                    Ok(()) => println!("  🧹 deleted orphan multipart parts: {}", id),
+                    Err(e) => eprintln!("  ⚠️  failed to delete orphan multipart parts {}: {}", id, e),
                 }
                 meta.delete_multipart(id)?;
             }

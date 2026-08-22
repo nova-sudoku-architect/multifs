@@ -1763,6 +1763,11 @@ impl MetadataDb {
         })
     }
 
+    /// Record (or overwrite) a single staged multipart part. Returns the prior
+    /// `(pcloud_account, pcloud_path)` if this `(upload_id, part_number)` was
+    /// already recorded on a *different* blob, so the caller can garbage-collect
+    /// the stale blob (a client retry after a timeout may land on a different
+    /// backend). Returns `Ok(None)` when this is a brand-new part slot.
     pub fn store_multipart_part(
         &self,
         upload_id: &str,
@@ -1771,8 +1776,16 @@ impl MetadataDb {
         part_etag: &str,
         pcloud_account: &str,
         pcloud_path: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<(String, String)>> {
         self.with_conn(|conn| {
+            let prev = conn
+                .query_row(
+                    "SELECT pcloud_account, pcloud_path FROM multipart_parts \
+                     WHERE upload_id = ?1 AND part_number = ?2",
+                    params![upload_id, part_number as i64],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
             conn.execute(
                 "INSERT OR REPLACE INTO multipart_parts \
                  (upload_id, part_number, size, part_etag, pcloud_account, pcloud_path) \
@@ -1786,7 +1799,7 @@ impl MetadataDb {
                     pcloud_path
                 ],
             )?;
-            Ok(())
+            Ok(prev.map(|(a, p)| (a, p)))
         })
     }
 

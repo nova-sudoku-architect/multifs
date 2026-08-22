@@ -195,6 +195,11 @@ Completed multipart objects keep their part rows for read assembly and are left 
 In-progress uploads can also be cancelled explicitly via S3 AbortMultipartUpload
 (`DELETE /bucket/key?uploadId=...`).
 
+Multipart parts are reclaimed **per-account**: since each `UploadPart` picks a backend
+independently, one upload's parts can live on 2–4 backends, and GC deletes each part from
+the backend that actually holds it. A failed delete keeps the metadata rows so a later
+vacuum retries instead of leaking bytes.
+
 ## Deploy
 
 ```bash

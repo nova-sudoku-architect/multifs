@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -698,6 +699,52 @@ impl StorageEngine {
         backend.backend.delete_folder_recursive(remote_path).await
     }
 
+    /// Delete every part blob of a multipart upload, each from the account that
+    /// actually holds it. Parts can be scattered across multiple backends (each
+    /// `upload_part` picks a backend independently), so we group parts by
+    /// account and delete each account's `__mp__/multipart-<id>` folder, with a
+    /// per-file fallback when a backend lacks recursive folder deletion.
+    ///
+    /// Returns `Err` if any blob could not be deleted, so callers keep the DB
+    /// rows and retry later rather than silently leaking bytes (Bug A/B).
+    pub async fn delete_multipart_parts(&self, upload_id: &str) -> anyhow::Result<()> {
+        let parts = self.meta.list_multipart_parts(upload_id)?;
+        // Group part paths by account. Each part records its own
+        // `pcloud_account` + `pcloud_path`, so this is authoritative regardless
+        // of where the canonical `remote_path` points.
+        let mut by_account: HashMap<String, Vec<String>> = HashMap::new();
+        for (_pn, _sz, _etag, acct, path) in &parts {
+            by_account.entry(acct.clone()).or_default().push(path.clone());
+        }
+        for (acct, paths) in &by_account {
+            let backend = self.find_backend(acct)?;
+            // All parts of one account share a single upload folder; derive it
+            // from any part path (strip the trailing part number).
+            let folder = paths[0]
+                .rsplit_once('/')
+                .map(|(dir, _)| dir.to_string())
+                .unwrap_or_else(|| paths[0].clone());
+            match backend.backend.delete_folder_recursive(&folder).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    for path in paths {
+                        backend.backend.delete(path).await?;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "delete_multipart_parts: recursive delete of {} failed ({}); falling back to per-file delete",
+                        folder, e
+                    );
+                    for path in paths {
+                        backend.backend.delete(path).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// List every managed object (current versions) across all buckets.
     pub fn list_all_objects(&self) -> anyhow::Result<Vec<crate::storage::metadata::ObjectRecord>> {
         self.meta.list_all_objects()
@@ -893,43 +940,46 @@ impl StorageEngine {
                     continue;
                 }
                 // Multipart (chunked) objects store their parts folder as the
-                // version's `remote_path` (`.../__mp__/multipart-<id>`). A plain
-                // `delete` is a `deletefile` on a folder, which silently no-ops,
-                // and the `multipart_parts` rows were never removed — so every
-                // chunked object deletion leaked its parts. Delete the folder
-                // recursively (falling back to per-part deletes) and drop the
-                // parts rows instead.
-                if let Some(upload_id) = Self::multipart_upload_id(&v.remote_path) {
-                    if let Ok(backend) = self.find_backend(&v.account_email) {
-                        let folder_deleted = match backend
-                            .backend
-                            .delete_folder_recursive(&v.remote_path)
-                            .await
-                        {
-                            Ok(Some(_)) => true,
-                            Ok(None) => false,
-                            Err(e) => {
-                                eprintln!(
-                                    "vacuum: recursive delete of {} failed ({}); falling back to per-part delete",
-                                    v.remote_path, e
-                                );
-                                false
-                            }
-                        };
-                        if !folder_deleted {
-                            let parts = self.meta.list_multipart_parts(&upload_id)?;
-                            for (_pn, _sz, _etag, acct, path) in &parts {
-                                if let Ok(b) = self.find_backend(acct) {
-                                    let _ = b.backend.delete(path).await;
-                                }
-                            }
+                // version's `remote_path` (`.../__mp__/multipart-<id>`). Parts
+                // scatter across whichever backend each `upload_part` picked, so
+                // we group parts by account and delete each account's folder
+                // (Bug A). Only if that delete succeeds do we drop the DB rows,
+                // so a failed delete doesn't silently leak bytes and never retry
+                // (Bug B).
+                let blob_ok = if let Some(upload_id) = Self::multipart_upload_id(&v.remote_path) {
+                    match self.delete_multipart_parts(&upload_id).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(
+                                "vacuum: failed to delete parts for multipart {}; keeping rows for retry: {}",
+                                upload_id, e
+                            );
+                            false
                         }
                     }
-                    self.meta.delete_multipart(&upload_id)?;
                 } else if let Ok(backend) = self.find_backend(&v.account_email) {
-                    let _ = backend.backend.delete(&v.remote_path).await;
+                    match backend.backend.delete(&v.remote_path).await {
+                        Ok(_) => true,
+                        Err(e) => {
+                            tracing::warn!(
+                                "vacuum: failed to delete blob {} on {}; keeping version row for retry: {}",
+                                v.remote_path, v.account_email, e
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                // Only drop the metadata rows when the blob is actually gone; on
+                // a delete error we keep them so a later vacuum retries instead
+                // of abandoning the bytes to leak forever.
+                if blob_ok {
+                    if let Some(upload_id) = Self::multipart_upload_id(&v.remote_path) {
+                        self.meta.delete_multipart(&upload_id)?;
+                    }
+                    self.meta.delete_version(&v.bucket_name, &v.key, v.version)?;
                 }
-                self.meta.delete_version(&v.bucket_name, &v.key, v.version)?;
             }
             orphans_removed += 1;
         }
@@ -1374,15 +1424,45 @@ impl StorageEngine {
         let part_md5 = hex::encode(Md5::digest(data));
         let part_size = data.len() as i64;
 
-        // Record the part so Complete can stitch it.
-        self.meta.store_multipart_part(
+        // Record the part so Complete can stitch it. If recording fails, the
+        // freshly-uploaded blob would be orphaned (no DB row points at it) —
+        // best-effort delete it, then propagate the error (Bug C). The returned
+        // prior `(account, path)` lets us reap a stale blob left over from a
+        // retry that landed on a different backend (Bug D).
+        match self.meta.store_multipart_part(
             upload_id,
             part_number,
             part_size,
             &part_md5,
             &backends[idx].label,
             &actual_path,
-        )?;
+        ) {
+            Ok(prev) => {
+                if let Some((old_label, old_path)) = prev {
+                    if old_label != backends[idx].label || old_path != actual_path {
+                        if let Ok(backend) = self.find_backend(&old_label) {
+                            if let Err(e) = backend.backend.delete(&old_path).await {
+                                tracing::warn!(
+                                    "upload_part: failed to reap stale part blob {} on {}: {}",
+                                    old_path, old_label, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if let Ok(backend) = self.find_backend(&backends[idx].label) {
+                    if let Err(de) = backend.backend.delete(&actual_path).await {
+                        tracing::warn!(
+                            "upload_part: best-effort cleanup of {} failed: {}",
+                            actual_path, de
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        }
 
         Ok((staging_key, part_size, part_md5))
     }
@@ -1479,14 +1559,43 @@ impl StorageEngine {
         let part_md5 = hex::encode(hasher.lock().unwrap().clone().finalize());
         let staging_key = format!("__mp__/{}/{}", upload_id, part_number);
 
-        self.meta.store_multipart_part(
+        // Record the part for Complete. On a store error, the just-uploaded blob
+        // would be orphaned — best-effort delete it, then propagate (Bug C).
+        // Also reap any stale blob left by a retry on a different backend (Bug D).
+        match self.meta.store_multipart_part(
             upload_id,
             part_number,
             file_size,
             &part_md5,
             &backends[idx].label,
             &actual_path,
-        )?;
+        ) {
+            Ok(prev) => {
+                if let Some((old_label, old_path)) = prev {
+                    if old_label != backends[idx].label || old_path != actual_path {
+                        if let Ok(backend) = self.find_backend(&old_label) {
+                            if let Err(e) = backend.backend.delete(&old_path).await {
+                                tracing::warn!(
+                                    "upload_part_copy: failed to reap stale part blob {} on {}: {}",
+                                    old_path, old_label, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if let Ok(backend) = self.find_backend(&backends[idx].label) {
+                    if let Err(de) = backend.backend.delete(&actual_path).await {
+                        tracing::warn!(
+                            "upload_part_copy: best-effort cleanup of {} failed: {}",
+                            actual_path, de
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        }
 
         Ok((staging_key, file_size, part_md5))
     }
@@ -1593,10 +1702,11 @@ impl StorageEngine {
             return Ok(());
         }
         let parts = self.meta.list_multipart_parts(upload_id)?;
-        for (_pn, _size, _etag, account, path) in &parts {
-            if let Ok(backend) = self.find_backend(account) {
-                let _ = backend.backend.delete(path).await;
-            }
+        // Delete every part from its own account (parts scatter across backends
+        // since each `upload_part` picks one independently). Grouping by account
+        // prevents leaking the non-canonical blobs (Bug A).
+        if !parts.is_empty() {
+            self.delete_multipart_parts(upload_id).await?;
         }
         self.meta.delete_multipart(upload_id)?;
         Ok(())

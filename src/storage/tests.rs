@@ -1133,4 +1133,74 @@ mod tests {
         assert!(engine.get_multipart_upload(upload_id).await.unwrap().is_some());
         assert_eq!(engine.list_multipart_parts(upload_id).await.unwrap().len(), 1);
     }
+
+    #[tokio::test]
+    async fn test_abort_multipart_deletes_parts_from_all_backends() {
+        use crate::config::PlacementStrategy;
+        use crate::storage::engine::{BackendHandle, StorageEngine};
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(dir.path().join("test.db").to_str().unwrap()).unwrap();
+
+        // Two mock backends with round-robin placement: 3 parts scatter a/b/a.
+        let handles = vec![
+            BackendHandle::new(
+                Box::new(MockBackend::new("mock-a")),
+                "/mnt/mock-a".to_string(),
+                "mock-a".to_string(),
+                10,
+            ),
+            BackendHandle::new(
+                Box::new(MockBackend::new("mock-b")),
+                "/mnt/mock-b".to_string(),
+                "mock-b".to_string(),
+                10,
+            ),
+        ];
+        let engine = StorageEngine::from_backends_with_strategy(handles, db, PlacementStrategy::RoundRobin);
+        engine.create_bucket("mp-bucket").await.unwrap();
+
+        let upload_id = "multipart-scatter-abort";
+        engine
+            .create_multipart_upload("mp-bucket", "big.bin", upload_id, None)
+            .await
+            .unwrap();
+        engine
+            .upload_part("mp-bucket", upload_id, 1, b"part-one")
+            .await
+            .unwrap();
+        engine
+            .upload_part("mp-bucket", upload_id, 2, b"part-two")
+            .await
+            .unwrap();
+        engine
+            .upload_part("mp-bucket", upload_id, 3, b"part-three")
+            .await
+            .unwrap();
+
+        // Parts must have scattered across both backends (round-robin).
+        let statuses = engine.shard_status().await.unwrap();
+        let used: Vec<(String, i64)> = statuses
+            .iter()
+            .map(|s| (s.email.clone(), s.used_bytes))
+            .collect();
+        assert!(
+            used.iter().all(|(_, b)| *b > 0),
+            "expected parts on both backends, got {:?}",
+            used
+        );
+
+        // Abort must delete every part from its OWN backend (Bug A), leaving
+        // zero leaked blobs on the non-canonical backend.
+        engine.abort_multipart_upload(upload_id).await.unwrap();
+
+        let statuses = engine.shard_status().await.unwrap();
+        for s in &statuses {
+            assert_eq!(
+                s.used_bytes, 0,
+                "backend {} leaked {} bytes after abort",
+                s.email, s.used_bytes
+            );
+        }
+        assert!(engine.list_multipart_parts(upload_id).await.unwrap().is_empty());
+    }
 }
