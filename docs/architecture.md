@@ -219,7 +219,9 @@ In **Preview mode**, a folder that has recorded metadata (`folder_meta`) renders
 detail page: cover image → preview GIF → summary document. Metadata is recorded via
 `multifs folder set-cover / set-summary / set-gif / backfill` (one cover, one GIF, and one
 summary key per folder); a missing field or a field whose object no longer exists is skipped
-(graceful degrade).
+(graceful degrade). Live object upload records folder artifacts automatically with the same
+preference ranking as `backfill` (e.g. `summary.json` outranks `summary.md`/`summary.txt`), so
+a higher-priority key is never overwritten by a lower-priority upload.
 
 ### Summary document schema (JSON)
 
@@ -438,7 +440,7 @@ multifs fsck [--checksums] [--fix]   Verify DB integrity + backend presence/size
 
 ## Test Coverage
 
-All 127 lib tests pass (`cargo test --lib`). Highlights:
+All 128 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_multipart_part_body_is_consumed_and_stored` — multipart round-trip + assembly.
 - `test_s3_multipart_roundtrip_stores_object` — total size + ETag correctness.
 - `test_concurrent_streaming` — concurrent range streams (range-aware mock).

@@ -3,7 +3,8 @@ use clap::Parser;
 use std::collections::HashMap;
 
 use crate::storage::metadata::{
-    is_cover_image_key, is_preview_gif_key, is_summary_key, parent_prefix, FolderMeta, MetadataDb,
+    cover_rank, gif_rank, is_cover_image_key, is_preview_gif_key, is_summary_key, parent_prefix,
+    summary_rank, FolderMeta, MetadataDb,
 };
 
 /// Manage per-folder metadata for the folder preview page (Feature 5): one
@@ -72,59 +73,6 @@ fn normalize_prefix(p: &str) -> String {
         "/".to_string()
     } else {
         format!("{}/", trimmed)
-    }
-}
-
-/// Preference rank for a cover-image basename. Higher wins.
-fn cover_rank(name: &str) -> u8 {
-    let n = name.to_ascii_lowercase();
-    if n == "cover.jpg" || n == "cover.png" || n == "cover.webp" {
-        3
-    } else if n == "cover.jpeg" || n == "cover.gif" {
-        2
-    } else if n.ends_with(".cover.jpg")
-        || n.ends_with(".cover.png")
-        || n.ends_with(".cover.webp")
-    {
-        1
-    } else {
-        0
-    }
-}
-
-/// Preference rank for a summary basename. Higher wins.
-fn summary_rank(name: &str) -> u8 {
-    let n = name.to_ascii_lowercase();
-    if n == "summary.json" {
-        6
-    } else if n == "summary.md" {
-        5
-    } else if n == "summary.txt" {
-        4
-    } else if n.ends_with(".summary.json") {
-        3
-    } else if n.ends_with(".summary.md") {
-        2
-    } else if n.ends_with(".summary.txt") {
-        1
-    } else {
-        0
-    }
-}
-
-/// Preference rank for a preview-GIF basename. Higher wins.
-fn gif_rank(name: &str) -> u8 {
-    let n = name.to_ascii_lowercase();
-    if n == "preview.gif" {
-        3
-    } else if n == "keyframes.gif" {
-        2
-    } else if n.ends_with(".preview.gif") {
-        2
-    } else if n.ends_with(".keyframes.gif") {
-        1
-    } else {
-        0
     }
 }
 
@@ -259,30 +207,4 @@ fn backfill(meta: &MetadataDb, bucket: Option<&str>, dry_run: bool) -> Result<()
         if dry_run { "would be " } else { "" }
     );
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn summary_rank_prefers_json_over_md_over_txt() {
-        assert_eq!(summary_rank("summary.json"), 6);
-        assert_eq!(summary_rank("summary.md"), 5);
-        assert_eq!(summary_rank("summary.txt"), 4);
-    }
-
-    #[test]
-    fn summary_rank_suffixed_variants_rank_below_bare() {
-        assert_eq!(summary_rank("foo.summary.json"), 3);
-        assert_eq!(summary_rank("foo.summary.md"), 2);
-        assert_eq!(summary_rank("foo.summary.txt"), 1);
-        assert_eq!(summary_rank("readme.md"), 0);
-    }
-
-    #[test]
-    fn summary_rank_is_case_insensitive() {
-        assert_eq!(summary_rank("SUMMARY.JSON"), 6);
-        assert_eq!(summary_rank("Foo.Summary.Md"), 2);
-    }
 }

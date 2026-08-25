@@ -1065,18 +1065,36 @@ impl StorageEngine {
     /// If `key` is a folder artifact (cover image, summary, or preview GIF),
     /// record it in the parent folder prefix's metadata. No-op for other keys
     /// or bucket-root keys. Best-effort: the caller decides whether to surface
-    /// errors.
+    /// errors. An artifact only replaces the recorded key when it outranks it
+    /// (same preference ranking as `multifs folder backfill`), so a
+    /// higher-priority key is never overwritten by a lower-priority upload.
     fn record_folder_metadata(&self, bucket: &str, key: &str) -> anyhow::Result<()> {
-        use crate::storage::metadata::{is_cover_image_key, is_preview_gif_key, is_summary_key};
+        use crate::storage::metadata::{
+            cover_rank, gif_rank, is_cover_image_key, is_preview_gif_key, is_summary_key, summary_rank,
+        };
         let Some(prefix) = crate::storage::metadata::parent_prefix(key) else {
             return Ok(());
         };
+        let existing = self.meta.get_folder_meta(bucket, &prefix)?;
+        let new_basename = key.rsplit('/').next().unwrap_or(key);
         if is_cover_image_key(key) {
-            self.meta.set_folder_cover(bucket, &prefix, key)?;
+            let old = existing.as_ref().and_then(|m| m.cover_key.as_deref());
+            let old_basename = old.map(|k| k.rsplit('/').next().unwrap_or(k)).unwrap_or("");
+            if old.is_none() || cover_rank(new_basename) > cover_rank(old_basename) {
+                self.meta.set_folder_cover(bucket, &prefix, key)?;
+            }
         } else if is_summary_key(key) {
-            self.meta.set_folder_summary(bucket, &prefix, key)?;
+            let old = existing.as_ref().and_then(|m| m.summary_key.as_deref());
+            let old_basename = old.map(|k| k.rsplit('/').next().unwrap_or(k)).unwrap_or("");
+            if old.is_none() || summary_rank(new_basename) > summary_rank(old_basename) {
+                self.meta.set_folder_summary(bucket, &prefix, key)?;
+            }
         } else if is_preview_gif_key(key) {
-            self.meta.set_folder_gif(bucket, &prefix, key)?;
+            let old = existing.as_ref().and_then(|m| m.preview_gif_key.as_deref());
+            let old_basename = old.map(|k| k.rsplit('/').next().unwrap_or(k)).unwrap_or("");
+            if old.is_none() || gif_rank(new_basename) > gif_rank(old_basename) {
+                self.meta.set_folder_gif(bucket, &prefix, key)?;
+            }
         }
         Ok(())
     }
@@ -1846,4 +1864,32 @@ impl StorageEngine {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::metadata::MetadataDb;
 
+    #[test]
+    fn record_folder_metadata_json_summary_wins_over_md_regardless_of_upload_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("meta.db");
+        let meta = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
+        let engine = StorageEngine::from_backends(vec![], meta.clone());
+        let bucket = "test-bucket";
+
+        // Lower-priority MD uploaded first is recorded.
+        engine.record_folder_metadata(bucket, "folder/summary.md").unwrap();
+        let m = meta.get_folder_meta(bucket, "folder/").unwrap().unwrap();
+        assert_eq!(m.summary_key.as_deref(), Some("folder/summary.md"));
+
+        // Higher-priority JSON uploaded later replaces it.
+        engine.record_folder_metadata(bucket, "folder/summary.json").unwrap();
+        let m = meta.get_folder_meta(bucket, "folder/").unwrap().unwrap();
+        assert_eq!(m.summary_key.as_deref(), Some("folder/summary.json"));
+
+        // Lower-priority TXT uploaded last must not overwrite the JSON.
+        engine.record_folder_metadata(bucket, "folder/summary.txt").unwrap();
+        let m = meta.get_folder_meta(bucket, "folder/").unwrap().unwrap();
+        assert_eq!(m.summary_key.as_deref(), Some("folder/summary.json"));
+    }
+}
