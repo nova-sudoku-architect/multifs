@@ -95,11 +95,13 @@ fn cover_rank(name: &str) -> u8 {
 /// Preference rank for a summary basename. Higher wins.
 fn summary_rank(name: &str) -> u8 {
     let n = name.to_ascii_lowercase();
-    if n == "summary.md" {
+    if n == "summary.json" {
+        6
+    } else if n == "summary.md" {
         5
     } else if n == "summary.txt" {
         4
-    } else if n == "summary.json" {
+    } else if n.ends_with(".summary.json") {
         3
     } else if n.ends_with(".summary.md") {
         2
@@ -257,4 +259,30 @@ fn backfill(meta: &MetadataDb, bucket: Option<&str>, dry_run: bool) -> Result<()
         if dry_run { "would be " } else { "" }
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_rank_prefers_json_over_md_over_txt() {
+        assert_eq!(summary_rank("summary.json"), 6);
+        assert_eq!(summary_rank("summary.md"), 5);
+        assert_eq!(summary_rank("summary.txt"), 4);
+    }
+
+    #[test]
+    fn summary_rank_suffixed_variants_rank_below_bare() {
+        assert_eq!(summary_rank("foo.summary.json"), 3);
+        assert_eq!(summary_rank("foo.summary.md"), 2);
+        assert_eq!(summary_rank("foo.summary.txt"), 1);
+        assert_eq!(summary_rank("readme.md"), 0);
+    }
+
+    #[test]
+    fn summary_rank_is_case_insensitive() {
+        assert_eq!(summary_rank("SUMMARY.JSON"), 6);
+        assert_eq!(summary_rank("Foo.Summary.Md"), 2);
+    }
 }

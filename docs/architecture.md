@@ -438,7 +438,7 @@ multifs fsck [--checksums] [--fix]   Verify DB integrity + backend presence/size
 
 ## Test Coverage
 
-All 124 lib tests pass (`cargo test --lib`). Highlights:
+All 127 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_multipart_part_body_is_consumed_and_stored` — multipart round-trip + assembly.
 - `test_s3_multipart_roundtrip_stores_object` — total size + ETag correctness.
 - `test_concurrent_streaming` — concurrent range streams (range-aware mock).
