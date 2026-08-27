@@ -40,6 +40,38 @@ commands, already-minimal output, and pipes/heredocs (rtk auto-skips). On
 failure read the tee log for full output. rtk is an *output display layer* only —
 never hide a mutating command's result (commit, push, deploy).
 
+## Coding tasks — use codex + rtk + headroom
+
+Feature builds, refactors, and non-trivial code changes in this repo are
+delegated to **Codex** as a background worker, routed through **Headroom** for
+token compression, with output trimmed via **rtk**.
+
+- Run the agent with `codex exec` (background, `pty`), not in the foreground
+  OpenClaw session.
+- **Headroom** must be up first: it proxies Codex → DeepSeek. Start it with
+  `HEADROOM_CODEX_UPSTREAM_BASE_URL=https://api.deepseek.com` and
+  `DEEPSEEK_CODING_API_KEY` exported (both in `~/.openclaw/.env`), then
+  `headroom proxy` on port 8787. Confirm with `headroom doctor`.
+- **rtk** compresses verbose command output inside the worker: prefix build /
+  test / clippy / git commands (`rtk cargo build`, `rtk cargo test --lib`, `rtk
+  git status`).
+- **Headroom** is also the code-quality gate: run `headroom` on the Rust sources
+touched and fix any failures it flags at the level the rest of the repo holds.
+- On this host, Codex's bubblewrap sandbox can't create network namespaces
+  (`bwrap: loopback: Failed RTM_NEWADDR`). The host is already externally
+  sandboxed, so launch with
+  `--dangerously-bypass-approvals-and-sandbox` (equivalent to
+  `sandbox: danger-full-access`); a sandboxed launch will fail every command.
+- Stop the Headroom proxy (and don't schedule heavy Codex work) during DeepSeek
+  **peak hours** — see below.
+
+### MultiFS-specific build/test
+
+- Build: `rtk cargo build --release`
+- Tests: `rtk cargo test --lib` — final passing count must be synced into
+  `docs/architecture.md` (non-negotiable).
+- Clippy: `rtk cargo clippy`
+
 ## Subagent model routing — use Flash for simple tasks
 
 When delegating via `sessions_spawn`, do NOT default the child to the current
