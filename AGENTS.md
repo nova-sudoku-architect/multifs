@@ -29,3 +29,39 @@ If a reviewer can't tell what the code does by reading the docs, the change isn'
 ## Secrets
 
 Passwords, API keys, and OAuth tokens live in env vars (`~/.openclaw/.env` / `/etc/multifs.env`), never in code, config, or docs. Config files reference them by env-var name only (`token_env = "PCLOUD_TOKEN_VIDEO_01"`).
+
+## Token savings — use rtk
+
+Prefix verbose shell commands with `rtk` to cut token usage 50–90%: `rtk git
+status/diff/log`, `rtk ls`, `rtk read <file>`, `rtk grep "pattern"`, `rtk find`,
+`rtk cargo test/build/clippy`, `rtk docker ps/logs`, `rtk kubectl`. Rule: any
+command likely to emit >100 lines gets the `rtk` prefix. Skip interactive
+commands, already-minimal output, and pipes/heredocs (rtk auto-skips). On
+failure read the tee log for full output. rtk is an *output display layer* only —
+never hide a mutating command's result (commit, push, deploy).
+
+## Subagent model routing — use Flash for simple tasks
+
+When delegating via `sessions_spawn`, do NOT default the child to the current
+model. Most delegated work is mechanical → run it on the cheaper, faster
+**deepseek/deepseek-v4-flash**.
+
+- **Simple / mechanical → flash:** summarize, translate, list/enumerate,
+  reformat, quick lookup, batch repetitive work, data extraction, file/grep/read.
+- **Complex / reasoning → main agent (deepseek-v4-pro):** architecture,
+  multi-step debugging, trade-offs, synthesis, judgment calls.
+
+How: `sessions_spawn(..., model="deepseek/deepseek-v4-flash")` with a
+self-contained brief, `mode="run"` for one-shot work, omit `context` unless the
+child needs the transcript. Question: "reasoning or execution?" Execution →
+flash. Reasoning → keep on Pro.
+
+## DeepSeek peak hours — remind the user
+
+Peak hours (rates ×2): **01:00–04:00 and 06:00–10:00 UTC, Mon–Fri** (that's
+09:00–12:00 and 14:00–18:00 in Asia/Hong_Kong, UTC+8). All other hours are
+off-peak (half price).
+
+If the user asks you to do anything during peak hours, **remind them** that
+DeepSeek peak rates are 2× off-peak and suggest deferring non-urgent work to
+off-peak hours.
