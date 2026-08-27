@@ -342,9 +342,11 @@ impl StorageEngine {
         self.meta.set_checksum(bucket, key, version, &etag)?;
         self.meta.set_charset(bucket, key, version, charset.as_deref())?;
         // Best-effort: if this key is a folder artifact (cover / summary /
-        // preview GIF), record it in the parent folder's metadata. Failures
+        // preview GIF), record it in the parent folder's metadata, and refresh
+        // the last-modified time of every folder containing the key. Failures
         // here must not fail the upload.
         let _ = self.record_folder_metadata(bucket, key);
+        let _ = self.touch_folder(bucket, key);
 
         Ok(ObjectInfo {
             key: key.to_string(),
@@ -423,9 +425,11 @@ impl StorageEngine {
         self.meta.set_checksum(bucket, key, version, &etag)?;
         self.meta.set_charset(bucket, key, version, charset)?;
         // Best-effort: if this key is a folder artifact (cover / summary /
-        // preview GIF), record it in the parent folder's metadata. Failures
+        // preview GIF), record it in the parent folder's metadata, and refresh
+        // the last-modified time of every folder containing the key. Failures
         // here must not fail the upload.
         let _ = self.record_folder_metadata(bucket, key);
+        let _ = self.touch_folder(bucket, key);
 
         Ok(ObjectInfo {
             key: key.to_string(),
@@ -864,6 +868,9 @@ impl StorageEngine {
         let version = self
             .meta
             .copy_object(&src, dst_bucket, dst_key, &now)?;
+        // The destination folder gains an object — refresh its last-modified
+        // chain. Best-effort: never fail the copy on a touch error.
+        let _ = self.touch_folder(dst_bucket, dst_key);
 
         Ok(ObjectInfo {
             key: dst_key.to_string(),
@@ -886,11 +893,15 @@ impl StorageEngine {
         // Symlink (tag folder): delete the link row only — never the target.
         if self.meta.is_symlink(bucket, key)? {
             self.meta.delete_symlink(bucket, key)?;
+            // Removal is a change: refresh the parent folder's last-modified.
+            let _ = self.touch_folder(bucket, key);
             return Ok(());
         }
         // MVCC: remove the file pointer and mark the current version superseded.
         // The orphan blob is reclaimed later by `vacuum` (after the grace period).
         self.meta.delete_object(bucket, key)?;
+        // Removal is a change: refresh every folder containing the key.
+        let _ = self.touch_folder(bucket, key);
         Ok(())
     }
 
@@ -1124,6 +1135,14 @@ impl StorageEngine {
             out.insert(p.clone(), m);
         }
         Ok(out)
+    }
+
+    /// Record the current time as the last-modified of every folder containing
+    /// `key` (the key's own folder + all ancestors up to the bucket root).
+    /// Best-effort: callers use `let _ = ...` — a failure here must never fail
+    /// a write/delete.
+    pub fn touch_folder(&self, bucket: &str, key: &str) -> anyhow::Result<()> {
+        self.meta.touch_folder(bucket, key)
     }
 
     /// Count the direct children (immediate files + subfolders) of a folder
@@ -1689,6 +1708,9 @@ impl StorageEngine {
             content_type.as_deref().or(ct.as_deref()),
             &canonical_path,
         )?;
+        // A completed multipart upload is an object add/update — refresh the
+        // folder last-modified chain. Best-effort.
+        let _ = self.touch_folder(bucket, &real_key);
 
         // IMPORTANT (S3 round-trip fix): keep the multipart_parts rows so GET can
         // assemble the object from its parts. Previously we called
@@ -1891,5 +1913,64 @@ mod tests {
         engine.record_folder_metadata(bucket, "folder/summary.txt").unwrap();
         let m = meta.get_folder_meta(bucket, "folder/").unwrap().unwrap();
         assert_eq!(m.summary_key.as_deref(), Some("folder/summary.json"));
+    }
+
+    #[test]
+    fn delete_object_touches_folder_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("meta.db");
+        let meta = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
+        let engine = StorageEngine::from_backends(vec![], meta.clone());
+        let bucket = "test-bucket";
+
+        // Seed an object directly at the metadata layer (no backends needed).
+        let (v, p) = meta
+            .reserve_version(bucket, "folder/sub/old.txt", "acct1", "/mnt/a")
+            .unwrap();
+        meta.commit_version(bucket, "folder/sub/old.txt", v, 5, "e", "2026-01-01", None, &p)
+            .unwrap();
+
+        // Delete via the engine — removal must stamp the whole folder chain.
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            engine.delete_object(bucket, "folder/sub/old.txt").await.unwrap();
+        });
+        for prefix in ["folder/sub/", "folder/", ""] {
+            let m = meta
+                .get_folder_meta(bucket, prefix)
+                .unwrap()
+                .unwrap_or_else(|| panic!("delete must stamp prefix {:?}", prefix));
+            assert!(m.last_modified > 0, "delete must stamp {:?}", prefix);
+        }
+    }
+
+    #[test]
+    fn copy_object_touches_destination_folder_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("meta.db");
+        let meta = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
+        let engine = StorageEngine::from_backends(vec![], meta.clone());
+        let bucket = "test-bucket";
+
+        // Seed a source object at the metadata layer.
+        let (v, p) = meta
+            .reserve_version(bucket, "src/film.mkv", "acct1", "/mnt/a")
+            .unwrap();
+        meta.commit_version(bucket, "src/film.mkv", v, 5, "e", "2026-01-01", None, &p)
+            .unwrap();
+
+        // Copy via the engine — the destination folder chain must be stamped.
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            engine
+                .copy_object(bucket, "src/film.mkv", bucket, "dst/copies/film.mkv")
+                .await
+                .unwrap();
+        });
+        for prefix in ["dst/copies/", "dst/", ""] {
+            let m = meta
+                .get_folder_meta(bucket, prefix)
+                .unwrap()
+                .unwrap_or_else(|| panic!("copy must stamp prefix {:?}", prefix));
+            assert!(m.last_modified > 0, "copy must stamp {:?}", prefix);
+        }
     }
 }

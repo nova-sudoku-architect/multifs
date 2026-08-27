@@ -27,6 +27,7 @@ blob in place.
 | `fsck` health check | ✅ Live | DB integrity + backend presence/size + optional checksum verify |
 | Placement | ✅ Live | Tiered: cloud-first, local disk as last resort (per-account `priority`) |
 | Read-only web UI | ✅ Live | GET-only browser navigator: list buckets/objects + download (port 9001) |
+| Folder last-modified | ✅ Live | Every folder shows the time of the last add/remove/update in its subtree (list + preview modes) |
 | Erasure coding | ❌ Stub | Not deployed (single-blob model; each blob lives on one account) |
 | NFS | ❌ Stub | Port 2049 not exposed |
 
@@ -81,7 +82,7 @@ blob in place.
 
 ## Data Model (SQLite)
 
-Path: `/var/lib/multifs/meta.db` (WAL mode). Schema version **8** (latest: `buckets.versioning` added in migration 8).
+Path: `/var/lib/multifs/meta.db` (WAL mode). Schema version **9** (latest: `folder_meta.last_modified` added in migration 9 for folder last-modified tracking; migration 8 added `buckets.versioning`).
 
 ```sql
 -- Bucket registry
@@ -142,6 +143,21 @@ CREATE TABLE multipart_parts (
     pcloud_account TEXT NOT NULL,
     pcloud_path TEXT NOT NULL,
     PRIMARY KEY (upload_id, part_number)
+);
+
+-- Per-folder metadata: cover/summary/preview-GIF keys plus the folder's
+-- last-modified time (epoch ms of the last file add/remove/update in the
+-- folder's subtree; 0 = never recorded). `updated_at` is the cover/summary
+-- write time — do not conflate it with `last_modified`.
+CREATE TABLE folder_meta (
+    bucket_name     TEXT NOT NULL,
+    prefix          TEXT NOT NULL,
+    cover_key       TEXT,
+    summary_key     TEXT,
+    preview_gif_key TEXT,
+    updated_at      INTEGER NOT NULL DEFAULT 0,
+    last_modified   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket_name, prefix)
 );
 ```
 
@@ -216,12 +232,26 @@ directly in the browser. Charset is detected at upload (BOM / UTF-8 validation) 
 ### Folder preview page
 
 In **Preview mode**, a folder that has recorded metadata (`folder_meta`) renders a per-folder
-detail page: cover image → preview GIF → summary document. Metadata is recorded via
+detail page: cover image → preview GIF → summary document, plus the folder's last-modified
+time. Metadata is recorded via
 `multifs folder set-cover / set-summary / set-gif / backfill` (one cover, one GIF, and one
 summary key per folder); a missing field or a field whose object no longer exists is skipped
 (graceful degrade). Live object upload records folder artifacts automatically with the same
 preference ranking as `backfill` (e.g. `summary.json` outranks `summary.md`/`summary.txt`), so
 a higher-priority key is never overwritten by a lower-priority upload.
+
+### Folder last-modified tracking
+
+Every object add/remove/update (PutObject, streaming uploads, CopyObject,
+CompleteMultipartUpload, object delete, batch delete, and `multifs import`)
+stamps the object's own folder **and every ancestor folder up to the bucket
+root** with the current epoch-ms time in `folder_meta.last_modified`, so a
+folder's last-modified time equals the most recent content mutation anywhere in
+its subtree. The stamp is best-effort (`let _ = …`) and never fails the
+mutation; it is kept separate from `updated_at` (the cover/summary write time).
+The web UI shows the value in list mode (folder rows), preview mode (folder
+cards + per-folder detail page), and names mode; folders with no recorded
+mutation render "—".
 
 ### Summary document schema (JSON)
 
@@ -440,7 +470,7 @@ multifs fsck [--checksums] [--fix]   Verify DB integrity + backend presence/size
 
 ## Test Coverage
 
-All 128 lib tests pass (`cargo test --lib`). Highlights:
+All 133 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_multipart_part_body_is_consumed_and_stored` — multipart round-trip + assembly.
 - `test_s3_multipart_roundtrip_stores_object` — total size + ETag correctness.
 - `test_concurrent_streaming` — concurrent range streams (range-aware mock).

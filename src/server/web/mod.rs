@@ -158,6 +158,7 @@ async fn list_objects(
                 "cover_key": m.and_then(|m| m.cover_key.as_ref()),
                 "summary_key": m.and_then(|m| m.summary_key.as_ref()),
                 "preview_gif_key": m.and_then(|m| m.preview_gif_key.as_ref()),
+                "last_modified": m.map(|m| m.last_modified).unwrap_or(0),
                 "child_count": child_count,
                 "is_symlink": symlink_set.contains(&p),
             })
@@ -190,6 +191,7 @@ async fn list_objects(
                         "cover_key": m.cover_key,
                         "summary_key": m.summary_key,
                         "preview_gif_key": m.preview_gif_key,
+                        "last_modified": m.last_modified,
                     })
                 })
         }

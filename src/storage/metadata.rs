@@ -445,6 +445,24 @@ impl MetadataDb {
             conn.execute("UPDATE schema_version SET version = 8", [])?;
         }
 
+        // Migration 9: add `last_modified` to `folder_meta` (folder
+        // last-modified tracking). Epoch millis of the last file add/remove/
+        // update anywhere in the folder's subtree; 0 = never recorded.
+        // `updated_at` keeps meaning "when the cover/summary was last written".
+        if current < 9 {
+            let cols: Vec<String> = conn
+                .prepare("PRAGMA table_info(folder_meta)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            if !cols.iter().any(|c| c == "last_modified") {
+                conn.execute_batch(
+                    "ALTER TABLE folder_meta ADD COLUMN last_modified INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            conn.execute("UPDATE schema_version SET version = 9", [])?;
+        }
+
         Ok(())
     }
 
@@ -520,6 +538,7 @@ impl MetadataDb {
                 summary_key     TEXT,
                 preview_gif_key TEXT,
                 updated_at      INTEGER NOT NULL DEFAULT 0,
+                last_modified   INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (bucket_name, prefix)
             );
 
@@ -1888,12 +1907,34 @@ impl MetadataDb {
         })
     }
 
+    /// Record the current time as the last-modified of every folder containing
+    /// `key`: the key's own parent prefix plus every ancestor prefix up to the
+    /// bucket root (the root is `""`). Creates `folder_meta` rows on demand and
+    /// never touches `updated_at` (which stays the cover/summary write time).
+    /// Best-effort by design — callers must not fail a write/delete on error.
+    pub fn touch_folder(&self, bucket: &str, key: &str) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let prefixes = ancestor_prefixes(key);
+        self.with_conn(|conn| {
+            for p in &prefixes {
+                conn.execute(
+                    "INSERT INTO folder_meta (bucket_name, prefix, last_modified)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(bucket_name, prefix) DO UPDATE SET
+                       last_modified = excluded.last_modified",
+                    params![bucket, p, now],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
     /// Return the recorded folder metadata (cover/summary/gif) for a prefix.
     pub fn get_folder_meta(&self, bucket: &str, prefix: &str) -> anyhow::Result<Option<FolderMeta>> {
         self.with_conn(|conn| {
             let v: Option<FolderMeta> = conn
                 .query_row(
-                    "SELECT cover_key, summary_key, preview_gif_key FROM folder_meta \
+                    "SELECT cover_key, summary_key, preview_gif_key, last_modified FROM folder_meta \
                      WHERE bucket_name = ?1 AND prefix = ?2",
                     params![bucket, prefix],
                     |row| {
@@ -1901,6 +1942,7 @@ impl MetadataDb {
                             cover_key: row.get(0)?,
                             summary_key: row.get(1)?,
                             preview_gif_key: row.get(2)?,
+                            last_modified: row.get(3)?,
                         })
                     },
                 )
@@ -1936,12 +1978,13 @@ impl MetadataDb {
                         cover_key: r.get(2)?,
                         summary_key: r.get(3)?,
                         preview_gif_key: r.get(4)?,
+                        last_modified: r.get(5)?,
                     },
                 ))
             };
             if let Some(b) = bucket {
                 let mut stmt = conn.prepare(
-                    "SELECT bucket_name, prefix, cover_key, summary_key, preview_gif_key \
+                    "SELECT bucket_name, prefix, cover_key, summary_key, preview_gif_key, last_modified \
                      FROM folder_meta WHERE bucket_name = ?1 ORDER BY prefix",
                 )?;
                 let rows = stmt.query_map(params![b], mapper)?;
@@ -1950,7 +1993,7 @@ impl MetadataDb {
                 }
             } else {
                 let mut stmt = conn.prepare(
-                    "SELECT bucket_name, prefix, cover_key, summary_key, preview_gif_key \
+                    "SELECT bucket_name, prefix, cover_key, summary_key, preview_gif_key, last_modified \
                      FROM folder_meta ORDER BY bucket_name, prefix",
                 )?;
                 let rows = stmt.query_map([], mapper)?;
@@ -2276,13 +2319,16 @@ pub fn gif_rank(name: &str) -> u8 {
 }
 
 /// Per-folder metadata for the preview page (Feature 5): one cover image,
-/// one preview GIF, and one summary, each stored as an object key inside the
-/// folder. Any field may be `None` (the page degrades gracefully).
+/// one preview GIF, one summary (each stored as an object key inside the
+/// folder), and the folder's last-modified time. Any field may be `None`
+/// (the page degrades gracefully); `last_modified` is epoch millis (0 = never
+/// recorded).
 #[derive(Debug, Clone, Default)]
 pub struct FolderMeta {
     pub cover_key: Option<String>,
     pub summary_key: Option<String>,
     pub preview_gif_key: Option<String>,
+    pub last_modified: i64,
 }
 
 /// A single folder_meta column. Column names are fixed compile-time constants
@@ -2308,6 +2354,23 @@ impl FolderField {
 /// the bucket root (no `/` in it).
 pub fn parent_prefix(key: &str) -> Option<String> {
     key.rsplit_once('/').map(|(p, _)| format!("{}/", p))
+}
+
+/// Every folder prefix containing `key`, deepest first, ending at the bucket
+/// root (`""`): the key's own parent folder, then each ancestor, then `""`.
+/// E.g. `a/b/c.txt` → `["a/b/", "a/", ""]`; a root-level `c.txt` → `[""]`.
+pub fn ancestor_prefixes(key: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = key;
+    while let Some((parent, _)) = rest.rsplit_once('/') {
+        if parent.is_empty() {
+            break;
+        }
+        out.push(format!("{}/", parent));
+        rest = parent;
+    }
+    out.push(String::new());
+    out
 }
 
 #[cfg(test)]
@@ -2421,7 +2484,7 @@ mod tests {
             .unwrap();
         }
 
-        // Open triggers migration to v8 (current latest).
+        // Open triggers migration to v9 (current latest).
         let db = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
 
         let version: i64 = db
@@ -2433,7 +2496,23 @@ mod tests {
                 )?)
             })
             .unwrap();
-        assert_eq!(version, 8, "migration should set version to 8");
+        assert_eq!(version, 9, "migration should set version to 9");
+
+        // Migration 9 added folder_meta.last_modified.
+        let cols: Vec<String> = db
+            .with_conn(|conn| {
+                Ok(conn
+                    .prepare("PRAGMA table_info(folder_meta)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(|r| r.ok())
+                    .collect())
+            })
+            .unwrap();
+        assert!(
+            cols.iter().any(|c| c == "last_modified"),
+            "folder_meta should have last_modified after migration 9: {:?}",
+            cols
+        );
 
         // The legacy object became version 1 of a file, with its blob preserved.
         let obj = db.get_object("b", "k.txt").unwrap().expect("object migrated");
@@ -2668,5 +2747,80 @@ mod tests {
         // The copy remains intact after the source is gone.
         let dst = db.get_object("b", "dst.txt").unwrap().unwrap();
         assert_eq!(dst.remote_path, path1);
+    }
+
+    #[test]
+    fn ancestor_prefixes_covers_own_folder_and_bucket_root() {
+        assert_eq!(
+            ancestor_prefixes("a/b/c.txt"),
+            vec!["a/b/".to_string(), "a/".to_string(), String::new()]
+        );
+        assert_eq!(ancestor_prefixes("a.txt"), vec![String::new()]);
+        assert_eq!(ancestor_prefixes("a/b/"), vec!["a/b/".to_string(), "a/".to_string(), String::new()]);
+    }
+
+    #[test]
+    fn touch_folder_stamps_ancestors_and_keeps_meta_write_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(dir.path().join("touch.db").to_str().unwrap()).unwrap();
+        db.create_bucket("b").unwrap();
+
+        // A nested key touches its own folder, each ancestor, and the root.
+        db.touch_folder("b", "series/2026/ep1.mkv").unwrap();
+
+        for p in ["series/2026/", "series/", ""] {
+            let m = db.get_folder_meta("b", p).unwrap().expect("row created by touch");
+            assert!(m.last_modified > 0, "prefix {:?} should be stamped", p);
+            assert_eq!(m.last_modified, db.get_folder_meta("b", p).unwrap().unwrap().last_modified);
+        }
+
+        // `updated_at` stays 0 — it is the cover/summary write time, not the
+        // folder content time.
+        db.with_conn(|conn| {
+            let ua: i64 = conn.query_row(
+                "SELECT updated_at FROM folder_meta WHERE bucket_name='b' AND prefix='series/'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(ua, 0, "touch must not move updated_at");
+            Ok(())
+        })
+        .unwrap();
+
+        // A root-level key only stamps the root.
+        let dir2 = tempfile::tempdir().unwrap();
+        let db2 = MetadataDb::open(dir2.path().join("touch.db").to_str().unwrap()).unwrap();
+        db2.create_bucket("b").unwrap();
+        db2.touch_folder("b", "root.txt").unwrap();
+        assert!(db2.get_folder_meta("b", "").unwrap().unwrap().last_modified > 0);
+        assert!(db2.get_folder_meta("b", "other/").unwrap().is_none());
+
+    }
+
+    #[test]
+    fn touch_folder_preserves_cover_summary_gif() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(dir.path().join("touch.db").to_str().unwrap()).unwrap();
+        db.create_bucket("b").unwrap();
+
+        db.set_folder_cover("b", "series/", "series/cover.jpg").unwrap();
+        db.set_folder_summary("b", "series/", "series/summary.json").unwrap();
+        let before = db.get_folder_meta("b", "series/").unwrap().unwrap();
+        assert_eq!(before.cover_key.as_deref(), Some("series/cover.jpg"));
+        assert_eq!(before.summary_key.as_deref(), Some("series/summary.json"));
+        assert_eq!(before.last_modified, 0);
+
+        // A later file add refreshes last_modified but keeps the recorded fields.
+        db.touch_folder("b", "series/ep2.mkv").unwrap();
+        let after = db.get_folder_meta("b", "series/").unwrap().unwrap();
+        assert_eq!(after.cover_key, before.cover_key);
+        assert_eq!(after.summary_key, before.summary_key);
+        assert!(after.last_modified > 0);
+
+        // Re-touch bumps last_modified forward (monotonic).
+        let t1 = after.last_modified;
+        db.touch_folder("b", "series/ep3.mkv").unwrap();
+        let t2 = db.get_folder_meta("b", "series/").unwrap().unwrap().last_modified;
+        assert!(t2 >= t1);
     }
 }

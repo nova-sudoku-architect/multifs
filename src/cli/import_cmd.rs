@@ -312,6 +312,9 @@ fn register(
         modified,
         content_type,
     )?;
+    // Importing a file is a folder add — refresh the folder last-modified
+    // chain (best-effort; never fail the import on a touch error).
+    let _ = meta.touch_folder(bucket, key);
     Ok(())
 }
 

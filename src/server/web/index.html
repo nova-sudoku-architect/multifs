@@ -88,6 +88,7 @@
   .folder-card .fthumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .folder-card .fthumb .folder-big { font-size: clamp(56px, 18vw, 96px); }
   .folder-card .fname { font-size: 13px; color: var(--text); max-width: 100%; text-align: center; overflow-wrap: anywhere; }
+  .folder-card .fmeta { font-size: 11px; color: var(--muted); text-align: center; }
   .folder-card:hover .fname { color: var(--accent2); }
   /* Responsive preview grid: 2-up on phones, 3-up on tablets, 4-up on desktop. */
   @media (min-width: 640px) {
@@ -112,6 +113,7 @@
   .name-item.file a { color: var(--accent2); }
   /* Per-folder preview page (cover → GIF → summary). */
   .folder-detail { display: flex; flex-direction: column; gap: 14px; margin: 4px 0 18px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); }
+  .folder-detail .fd-meta { font-size: 12px; color: var(--muted); }
   .folder-detail .fd-head { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 6px; }
   .folder-detail .fd-cover img { max-width: 100%; max-height: 360px; border-radius: 8px; border: 1px solid var(--border); background: #000; object-fit: contain; display: block; }
   .folder-detail .fd-gif img { max-width: 100%; max-height: 280px; border-radius: 8px; border: 1px solid var(--border); background: #000; display: block; }
@@ -228,10 +230,17 @@ function fmtSize(n) {
 }
 
 function fmtDate(s) {
-  if (!s) return '';
-  const d = new Date(s.includes('T') ? s : s.replace(' ', 'T') + 'Z');
-  if (isNaN(d)) return s;
+  if (s == null || s === '') return '';
+  const d = typeof s === 'number' ? new Date(s) : new Date(s.includes('T') ? s : s.replace(' ', 'T') + 'Z');
+  if (isNaN(d)) return String(s);
   return d.toLocaleString(undefined, { year:'numeric', month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' });
+}
+
+// Last-modified cell for folders: epoch millis (or ISO string); 0/absent
+// (never recorded) renders as an em dash.
+function fmtMtime(v) {
+  if (v == null || v === 0 || v === '') return '\u2014';
+  return fmtDate(v);
 }
 
 function isImage(key) {
@@ -479,7 +488,7 @@ function folderRowHtml(bucket, f, showThumb) {
   }
   return `<tr class="row-link" data-prefix="${esc(prefix)}">
     <td><div class="name">${ico}<a>${esc(name)}/</a>${childBadge(f)}${symlinkBadge(f)}</div></td>
-    <td class="size"></td><td class="mtime"></td><td class="ctype"></td>
+    <td class="size"></td><td class="mtime">${esc(fmtMtime(f && f.last_modified))}</td><td class="ctype"></td>
   </tr>`;
 }
 
@@ -569,6 +578,7 @@ function renderPreviewMode(bucket, folders, files) {
       html += `<div class="folder-card" data-prefix="${esc(prefix)}">
         <div class="fthumb"><img src="${esc(purl)}" loading="lazy" alt="${esc(name)}"></div>
         <div class="fname">${esc(name)}${childBadge(f)}${symlinkBadge(f)}</div>
+        <div class="fmeta">${esc(fmtMtime(f.last_modified))}</div>
       </div>`;
     }
     html += '</div>';
@@ -587,6 +597,9 @@ function renderPreviewMode(bucket, folders, files) {
 function renderFolderDetail(bucket, folder) {
   if (!folder) return '';
   let html = '<div class="folder-detail">';
+  if (folder.last_modified) {
+    html += `<div class="fd-meta">Last modified: ${esc(fmtMtime(folder.last_modified))}</div>`;
+  }
   if (folder.cover_key) {
     const u = '/api/download?' + new URLSearchParams({ bucket, key: folder.cover_key });
     html += `<div><div class="fd-head">Cover</div><div class="fd-cover"><img src="${esc(u)}" alt="cover"></div></div>`;
