@@ -480,7 +480,14 @@ email = "nova-video-055@atomicmail.ai"
 backend_type = "pcloud"
 token_env = "PCLOUD_TOKEN_ATOMIC_055"
 mount_prefix = "/multifs/055"
-quota_gb = 3
+quota_gb = 4
+
+[[storage.accounts]]
+email = "nova-video-056@atomicmail.ai"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_ATOMIC_056"
+mount_prefix = "/multifs/056"
+quota_gb = 4
 
 [[storage.accounts]]
 email = "local-disk"
