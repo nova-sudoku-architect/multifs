@@ -47,6 +47,9 @@
     font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
     padding: 8px 10px; border-bottom: 1px solid var(--border);
   }
+  .table th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+  .table th.sortable:hover { color: var(--text); }
+  .table th.sortable.active { color: var(--accent2); }
   .table td { padding: 9px 10px; border-bottom: 1px solid var(--border); }
   .table tr:hover td { background: var(--panel2); }
   .row-link { cursor: pointer; }
@@ -200,7 +203,7 @@ const btnNext = document.getElementById('btnNext');
 const slidePos = document.getElementById('slidePos');
 
 // View state — survives navigation so the chosen mode persists.
-const state = { bucket: '', prefix: '', mode: 'list', cols: loadCols() };
+const state = { bucket: '', prefix: '', mode: 'list', cols: loadCols(), sort: loadSort() };
 
 // Sibling-folder slide state (for prev/next folder navigation).
 const siblings = { list: [], index: -1 };
@@ -212,6 +215,79 @@ function loadCols() {
 function applyCols() {
   if (state.cols === 'auto') document.body.removeAttribute('data-cols');
   else document.body.setAttribute('data-cols', state.cols);
+}
+
+// ---- Column sorting (list / preview / buckets) ----
+// state.sort = { key: 'name'|'size'|'mtime'|'type', dir: 1|-1 }, persisted so
+// the choice survives navigation and reloads. Folders are always kept grouped
+// ahead of files; each group is sorted independently by the active column.
+function loadSort() {
+  try {
+    const s = JSON.parse(localStorage.getItem('multifs.sort') || 'null');
+    if (s && typeof s.key === 'string' && (s.dir === 1 || s.dir === -1)) return s;
+  } catch (_) {}
+  return { key: 'name', dir: 1 };
+}
+
+function saveSort() {
+  try { localStorage.setItem('multifs.sort', JSON.stringify(state.sort)); } catch (_) {}
+}
+
+// Basename of a key/prefix (last path segment, trailing slash stripped).
+function baseName(p) { return String(p == null ? '' : p).replace(/\/$/, '').split('/').pop(); }
+
+// Epoch-ms for a timestamp that may be epoch ms (folders) or ISO (files/buckets).
+function ts(v) {
+  if (v == null || v === '') return 0;
+  if (typeof v === 'number') return v;
+  const t = Date.parse(v);
+  return isNaN(t) ? 0 : t;
+}
+
+// Extract the value a given column sorts by, for one row of the given kind.
+function sortVal(row, kind, key) {
+  if (row == null) return (key === 'name' || key === 'type') ? '' : 0;
+  if (key === 'name') {
+    if (kind === 'file') return baseName(row.key);
+    if (kind === 'bucket') return String(row.name || '');
+    return baseName(typeof row === 'string' ? row : (row.prefix || ''));
+  }
+  if (key === 'size') return kind === 'file' ? (row.size || 0) : -1;
+  if (key === 'mtime') return kind === 'bucket' ? ts(row.created_at) : ts(row.last_modified);
+  if (key === 'type') return kind === 'file' ? String(row.content_type || '') : '';
+  return 0;
+}
+
+function cmpVal(a, b) {
+  if (typeof a === 'number' && typeof b === 'number') return a - b;
+  return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
+}
+
+// Return a sorted copy of `rows` for the active column; ties break on name.
+function sortRows(rows, kind) {
+  const { key, dir } = state.sort;
+  return rows.slice().sort((a, b) => {
+    let c = cmpVal(sortVal(a, kind, key), sortVal(b, kind, key));
+    if (c === 0) c = cmpVal(sortVal(a, kind, 'name'), sortVal(b, kind, 'name'));
+    return c * dir;
+  });
+}
+
+// Clickable table header with an active-direction arrow.
+function sortTh(label, key) {
+  const active = state.sort.key === key;
+  const arrow = active ? (state.sort.dir > 0 ? ' \u25B2' : ' \u25BC') : '';
+  return '<th class="sortable' + (active ? ' active' : '') + '" data-sort="' + key +
+    '" title="Sort by ' + label + '">' + label + arrow + '</th>';
+}
+
+// Toggle direction when the same column is clicked, else set it ascending.
+function setSort(key) {
+  if (state.sort.key === key) state.sort.dir = -state.sort.dir;
+  else { state.sort.key = key; state.sort.dir = 1; }
+  saveSort();
+  if (state.bucket) loadList(state.bucket, state.prefix);
+  else loadBuckets();
 }
 
 function esc(s) {
@@ -457,8 +533,9 @@ async function loadBuckets() {
       main.innerHTML = '<div class="empty">No buckets yet.</div>';
       return;
     }
-    let html = '<table class="table"><thead><tr><th>Name</th><th>Created</th></tr></thead><tbody>';
-    for (const b of buckets) {
+    const sorted = sortRows(buckets, 'bucket');
+    let html = '<table class="table"><thead><tr>' + sortTh('Name', 'name') + sortTh('Created', 'mtime') + '</tr></thead><tbody>';
+    for (const b of sorted) {
       html += `<tr class="row-link" data-bucket="${esc(b.name)}">
         <td><div class="name"><span class="ico icon-bucket">🗂</span><a>${esc(b.name)}</a></div></td>
         <td class="mtime">${esc(fmtDate(b.created_at))}</td>
@@ -466,6 +543,9 @@ async function loadBuckets() {
     }
     html += '</tbody></table>';
     main.innerHTML = html;
+    main.querySelectorAll('th[data-sort]').forEach(th => {
+      th.onclick = () => setSort(th.dataset.sort);
+    });
     main.querySelectorAll('tr.row-link').forEach(tr => {
       tr.onclick = () => navigate(tr.dataset.bucket, '');
     });
@@ -526,21 +606,21 @@ function fileRowHtml(bucket, f, showPreviewCol) {
 }
 
 function renderListMode(bucket, folders, files) {
-  let html = '<table class="table"><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Type</th></tr></thead><tbody>';
-  for (const f of folders) html += folderRowHtml(bucket, f, false);
-  for (const f of files) html += fileRowHtml(bucket, f);
+  let html = '<table class="table"><thead><tr>' + sortTh('Name', 'name') + sortTh('Size', 'size') + sortTh('Modified', 'mtime') + sortTh('Type', 'type') + '</tr></thead><tbody>';
+  for (const f of sortRows(folders, 'folder')) html += folderRowHtml(bucket, f, false);
+  for (const f of sortRows(files, 'file')) html += fileRowHtml(bucket, f);
   html += '</tbody></table>';
   return html;
 }
 
 function renderNamesMode(bucket, folders, files) {
   let html = '<div class="names-grid">';
-  for (const f of folders) {
+  for (const f of sortRows(folders, 'folder')) {
     const prefix = typeof f === 'string' ? f : f.prefix;
     const name = prefix.replace(/\/$/, '').split('/').pop();
     html += `<div class="name-item folder" data-prefix="${esc(prefix)}"><a>${esc(name)}/</a>${childBadge(f)}${symlinkBadge(f)}</div>`;
   }
-  for (const f of files) {
+  for (const f of sortRows(files, 'file')) {
     const name = f.key.split('/').pop();
     const durl = '/api/download?' + new URLSearchParams({ bucket, key: f.key });
     html += `<div class="name-item file"><a class="file-link" href="${esc(durl)}">${esc(name)}</a></div>`;
@@ -550,10 +630,12 @@ function renderNamesMode(bucket, folders, files) {
 }
 
 function renderPreviewMode(bucket, folders, files) {
-  const images = files.filter(f => isImage(f.key));
-  const others = files.filter(f => !isImage(f.key));
-  const withPreview = folders.filter(f => f && f.cover_key);
-  const noPreview = folders.filter(f => !(f && f.cover_key));
+  const foldersSorted = sortRows(folders, 'folder');
+  const filesSorted = sortRows(files, 'file');
+  const images = filesSorted.filter(f => isImage(f.key));
+  const others = filesSorted.filter(f => !isImage(f.key));
+  const withPreview = foldersSorted.filter(f => f && f.cover_key);
+  const noPreview = foldersSorted.filter(f => !(f && f.cover_key));
   let html = '';
   if (images.length) {
     html += '<div class="gallery">';
@@ -585,7 +667,7 @@ function renderPreviewMode(bucket, folders, files) {
   }
   // Folders without a preview image stay as rows with the folder icon.
   if (noPreview.length || others.length) {
-    html += '<table class="table"><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Type</th></tr></thead><tbody>';
+    html += '<table class="table"><thead><tr>' + sortTh('Name', 'name') + sortTh('Size', 'size') + sortTh('Modified', 'mtime') + sortTh('Type', 'type') + '</tr></thead><tbody>';
     for (const f of noPreview) html += folderRowHtml(bucket, f, false);
     for (const f of others) html += fileRowHtml(bucket, f);
     html += '</tbody></table>';
@@ -969,6 +1051,9 @@ async function loadList(bucket, prefix) {
     html += '<div class="note">Read-only — downloads only. Range requests supported for streaming.</div>';
     main.innerHTML = html;
     if (state.mode === 'preview') loadSummaryText(bucket, data.folder);
+    main.querySelectorAll('th[data-sort]').forEach(th => {
+      th.onclick = () => setSort(th.dataset.sort);
+    });
     main.querySelectorAll('tr.row-link').forEach(tr => {
       tr.onclick = () => navigate(bucket, tr.dataset.prefix);
     });

@@ -42,6 +42,7 @@ multifs serve
 | **`fsck` health check** — DB integrity + backend presence/size + optional checksum verify | ✅ |
 | **CLI management** — accounts, buckets, objects, shards, audit | ✅ |
 | **Read-only web UI** — browser file navigator (GET-only: list buckets/objects, download) | ✅ |
+| **Web UI column sorting** — click any column header to sort list/preview/names + buckets (persisted) | ✅ |
 | **Folder last-modified** — every folder shows the time of the last file add/remove/update in its subtree (list + preview modes) | ✅ |
 | WebDAV | ❌ Removed |
 | NFS | ❌ Stub (port not exposed) |

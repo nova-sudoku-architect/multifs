@@ -250,6 +250,15 @@ summary key per folder); a missing field or a field whose object no longer exist
 preference ranking as `backfill` (e.g. `summary.json` outranks `summary.md`/`summary.txt`), so
 a higher-priority key is never overwritten by a lower-priority upload.
 
+### Column sorting
+
+List, **Preview** (rows + folder cards), **Names**, and the bucket list are
+sortable by any displayed column (Name, Size, Modified, Type; Name/Created for
+buckets). Click a column header to sort ascending, click again to toggle
+descending; the active column shows an arrow. Folders are always kept grouped
+ahead of files — each group is sorted independently. The choice persists across
+navigation and reloads (`localStorage`).
+
 ### Folder last-modified tracking
 
 Every object add/remove/update (PutObject, streaming uploads, CopyObject,
