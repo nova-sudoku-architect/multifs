@@ -798,44 +798,68 @@ async fn put_object(
         .and_then(|v| v.to_str().ok());
     let content_type = crate::server::resolve_content_type(&key, client_ct);
 
-    // Check Content-Length to decide streaming vs buffered
+    // Declared body size (boto3 / aws-cli always set this for put_object).
     let content_length = headers
         .get(http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
 
-    const CHUNK_SIZE_LIMIT: u64 = 32 * 1024 * 1024; // 32 MB — same as engine's chunk size
+    // Large / binary bodies are streamed straight through to the backend with a
+    // declared Content-Length — no full-body RAM buffering (fixes the ≥1 GB
+    // single-object PUT stall / memory blow-up). Text bodies are still buffered
+    // because we need the raw bytes to detect the charset, and text files are
+    // small. Unknown-length (chunked) bodies fall back to buffering too.
+    let is_text = crate::server::is_text_content_type(content_type.as_deref());
 
-    // Buffer the full request body first, then pass as a stream.
-    // Direct `body.into_data_stream()` causes a deadlock: axum/hyper can't
-    // send the response until the request body is fully consumed, but the
-    // engine starts making pCloud API calls BEFORE consuming the stream.
-    // WebDAV doesn't hit this because `Bytes` is extracted eagerly.
-    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(b) => b,
-        Err(e) => {
-            let xml = s3_error_xml("RequestTimeout", &e.to_string(), &format!("{}/{}", bucket, key));
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .header("Content-Type", "application/xml")
-                .body(Body::from(xml))
-                .unwrap();
-        }
+    let result = if content_length.is_some() && !is_text {
+        use futures::StreamExt;
+        let len = content_length.unwrap_or(0);
+        let stream = body
+            .into_data_stream()
+            .map(|chunk| chunk.map_err(|e| anyhow::anyhow!("request body read error: {}", e)));
+        tracing::info!("S3 PUT: streaming body ({len} bytes), calling engine");
+        state
+            .engine
+            .put_object_stream(
+                &bucket,
+                &key,
+                content_type.as_deref(),
+                None,
+                Some(len),
+                stream,
+            )
+            .await
+    } else {
+        // Buffer the full request body first, then pass as a stream. (Text
+        // bodies need the bytes for charset detection.)
+        let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+            Ok(b) => b,
+            Err(e) => {
+                let xml = s3_error_xml("RequestTimeout", &e.to_string(), &format!("{}/{}", bucket, key));
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/xml")
+                    .body(Body::from(xml))
+                    .unwrap();
+            }
+        };
+        let len = bytes.len() as u64;
+        let charset = crate::server::resolve_charset(content_type.as_deref(), &bytes);
+        let stream =
+            futures::stream::once(futures::future::ready(Ok::<bytes::Bytes, anyhow::Error>(bytes)));
+        tracing::info!("S3 PUT: body buffered ({} bytes), calling engine", len);
+        state
+            .engine
+            .put_object_stream(
+                &bucket,
+                &key,
+                content_type.as_deref(),
+                charset.as_deref(),
+                Some(len),
+                stream,
+            )
+            .await
     };
-    let byte_vec: Vec<u8> = bytes.to_vec();
-    let charset = crate::server::resolve_charset(content_type.as_deref(), &byte_vec);
-    let stream = futures::stream::once(futures::future::ready(Ok(bytes::Bytes::from(byte_vec))));
-    tracing::info!("S3 PUT: body buffered ({} bytes), calling engine", bytes.len());
-    let result = state
-        .engine
-        .put_object_stream(
-            &bucket,
-            &key,
-            content_type.as_deref(),
-            charset.as_deref(),
-            stream,
-        )
-        .await;
 
     match result {
         Ok(info) => {

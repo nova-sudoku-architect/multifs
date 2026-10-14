@@ -21,6 +21,7 @@ blob in place.
 | Range streaming | ✅ Live | HTTP Range forwarded to pCloud CDN (start/end) |
 | S3 multipart upload | ✅ Live | Initiate / UploadPart / Complete / ListParts / Abort; parts persisted and assembled |
 | S3 copy & versioning | ✅ Live | CopyObject, UploadPartCopy, ListMultipartUploads, ListObjectVersions (`versionId`), PutBucketVersioning |
+| Streaming PUT + timeouts | ✅ Live | Large binary PUTs stream body → pCloud with `Content-Length` (no double buffering); pCloud client has a per-request timeout (`MULTIFS_HTTP_TIMEOUT_SECS`, default 1800s) |
 | `vacuum` GC | ✅ Live | Reclaims abandoned `pending` and superseded (orphaned) version blobs |
 | `import` command | ✅ Live | Register an existing pCloud file into the DB (metadata only) |
 | Content checksums | ✅ Live | SHA-256 stored per blob; `checksum rebuild|verify` detects in-place drift |
@@ -175,6 +176,15 @@ Maps to a three-step reserve → stream → commit:
    `(bucket, key)` and insert a `versions` row with `status='pending'`.
 2. **Stream** — upload the body to a fresh blob via `upload_stream`. Existing
    blobs are never touched.
+
+   The S3 `PutObject` handler forwards the request body straight through to the
+   backend when the client declares a `Content-Length` and the content is not
+   text: the body is streamed to pCloud with a real `Content-Length` (no
+   full-body RAM buffering). Text bodies are buffered first (to detect the
+   charset — they are small), and unknown-length / chunked bodies fall back to
+   buffering. This keeps peak server memory flat for multi-GB single-object
+   PUTs — previously a ≥1 GB PUT buffered the body twice and could stall for
+   >10 min on the backend socket.
 3. **Commit** — in a single SQLite transaction:
    - `UPDATE versions SET status='committed', size, etag, last_modified`
    - `UPDATE files SET current_version=?, size, etag, last_modified, content_type`
@@ -470,7 +480,11 @@ multifs fsck [--checksums] [--fix]   Verify DB integrity + backend presence/size
 
 ## Test Coverage
 
-All 133 lib tests pass (`cargo test --lib`). Highlights:
+All 136 lib tests pass (`cargo test --lib`). Highlights:
+- `test_s3_copy_object_roundtrip` / `test_s3_copy_object_overwrites_existing` —
+  CopyObject stores a byte-for-byte copy (size + ETag), incl. overwrite (GH #2).
+- `test_s3_binary_put_streams_with_content_length` — binary PUT with a declared
+  `Content-Length` takes the streaming path and round-trips intact.
 - `test_s3_multipart_part_body_is_consumed_and_stored` — multipart round-trip + assembly.
 - `test_s3_multipart_roundtrip_stores_object` — total size + ETag correctness.
 - `test_concurrent_streaming` — concurrent range streams (range-aware mock).

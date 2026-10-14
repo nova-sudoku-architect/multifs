@@ -27,10 +27,16 @@ pub trait StorageBackend: Send + Sync {
 
     /// Upload a file from a streaming source, computing the SHA-256 ETag
     /// on-the-fly. Returns (remote_path, file_id, sha256_etag, file_size).
+    ///
+    /// `content_length` is the caller's known body size (e.g. the S3 PUT
+    /// `Content-Length`). Backends that can upload with a declared length use it
+    /// to stream the body straight through without buffering it in RAM; pass
+    /// `None` when the size is unknown (the backend will then buffer).
     async fn upload_stream(
         &self,
         remote_path: &str,
         stream: Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send + Unpin>,
+        content_length: Option<u64>,
     ) -> anyhow::Result<(String, i64, String, i64)>;
 
     /// Download a file's complete content.

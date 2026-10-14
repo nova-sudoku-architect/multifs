@@ -137,6 +137,7 @@ impl StorageBackend for LocalDiskBackend {
         &self,
         remote_path: &str,
         stream: Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send + Unpin>,
+        _content_length: Option<u64>,
     ) -> anyhow::Result<(String, i64, String, i64)> {
         use futures::StreamExt;
         use sha2::{Digest, Sha256};
@@ -381,7 +382,7 @@ mod tests {
         ];
         let stream = Box::new(futures::stream::iter(chunks));
         let (_, _id, etag, size) = b
-            .upload_stream("/multifs/local-test/stream.bin", stream)
+            .upload_stream("/multifs/local-test/stream.bin", stream, None)
             .await
             .unwrap();
         assert_eq!(size, 6);

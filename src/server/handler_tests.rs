@@ -928,4 +928,141 @@ mod handler_tests {
         let body_str = String::from_utf8_lossy(&body);
         assert!(body_str.contains("<Status>Suspended</Status>"));
     }
+
+    // =====================================================================
+    // CopyObject round-trip — regression for GH issue #2
+    // =====================================================================
+    //
+    // The pre-CopyObject server handled a `PUT` with `x-amz-copy-source` as a
+    // *normal* PUT (empty body), silently storing a 0-byte target. CopyObject
+    // support must now store a byte-for-byte copy with a matching size + ETag.
+    #[tokio::test]
+    async fn test_s3_copy_object_roundtrip() {
+        use crate::server::s3;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
+        let backends: Vec<BackendHandle> = vec![BackendHandle::new(
+            Box::new(MockBackend::new("mock-a")),
+            "/mnt/mock-a".to_string(),
+            "mock-a".to_string(),
+            10,
+        )];
+        let engine = Arc::new(StorageEngine::from_backends(backends, db));
+        let app = s3::build_router(engine.clone());
+
+        let payload = b"copy me: the quick brown fox jumps over the lazy dog".repeat(4);
+        let put = Request::builder()
+            .method("PUT")
+            .uri("/test-bucket/dir/src.bin")
+            .header("content-type", "application/octet-stream")
+            .header("content-length", payload.len().to_string())
+            .body(Body::from(payload.clone()))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(put).await.unwrap().status(), 200);
+
+        // Server-side copy: PUT with `x-amz-copy-source` and an empty body.
+        let cp = Request::builder()
+            .method("PUT")
+            .uri("/test-bucket/dir/dst.bin")
+            .header("x-amz-copy-source", "/test-bucket/dir/src.bin")
+            .header("content-length", "0")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(cp).await.unwrap();
+        assert_eq!(resp.status(), 200, "CopyObject should return 200");
+
+        let got = engine.get_object("test-bucket", "dir/dst.bin").await.unwrap();
+        assert_eq!(got, payload, "copied object must be byte-for-byte identical");
+        let head = engine.head_object("test-bucket", "dir/dst.bin").await.unwrap();
+        let src_head = engine.head_object("test-bucket", "dir/src.bin").await.unwrap();
+        assert_eq!(head.size, payload.len() as i64);
+        assert_ne!(head.size, 0, "copy target must not be empty (GH issue #2)");
+        assert_eq!(head.etag, src_head.etag, "copy must preserve the source ETag");
+    }
+
+    /// CopyObject onto an *existing* destination key must overwrite it with the
+    /// source bytes (not leave a stale/empty object behind).
+    #[tokio::test]
+    async fn test_s3_copy_object_overwrites_existing() {
+        use crate::server::s3;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
+        let backends: Vec<BackendHandle> = vec![BackendHandle::new(
+            Box::new(MockBackend::new("mock-a")),
+            "/mnt/mock-a".to_string(),
+            "mock-a".to_string(),
+            10,
+        )];
+        let engine = Arc::new(StorageEngine::from_backends(backends, db));
+        let app = s3::build_router(engine.clone());
+
+        // Destination starts with different (shorter) content.
+        let old = b"old destination contents".to_vec();
+        let put_old = Request::builder()
+            .method("PUT")
+            .uri("/test-bucket/dst.bin")
+            .header("content-type", "application/octet-stream")
+            .header("content-length", old.len().to_string())
+            .body(Body::from(old.clone()))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(put_old).await.unwrap().status(), 200);
+
+        let new = b"a much longer replacement payload that must fully overwrite".to_vec();
+        let put_src = Request::builder()
+            .method("PUT")
+            .uri("/test-bucket/src.bin")
+            .header("content-type", "application/octet-stream")
+            .header("content-length", new.len().to_string())
+            .body(Body::from(new.clone()))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(put_src).await.unwrap().status(), 200);
+
+        let cp = Request::builder()
+            .method("PUT")
+            .uri("/test-bucket/dst.bin")
+            .header("x-amz-copy-source", "/test-bucket/src.bin")
+            .header("content-length", "0")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.clone().oneshot(cp).await.unwrap().status(), 200);
+
+        let got = engine.get_object("test-bucket", "dst.bin").await.unwrap();
+        assert_eq!(got, new, "copy must overwrite the destination with source bytes");
+    }
+
+    /// A binary PUT with a declared Content-Length takes the streaming path
+    /// (no full-body buffering). Verify the bytes still round-trip intact.
+    #[tokio::test]
+    async fn test_s3_binary_put_streams_with_content_length() {
+        use crate::server::s3;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
+        let backends: Vec<BackendHandle> = vec![BackendHandle::new(
+            Box::new(MockBackend::new("mock-a")),
+            "/mnt/mock-a".to_string(),
+            "mock-a".to_string(),
+            10,
+        )];
+        let engine = Arc::new(StorageEngine::from_backends(backends, db));
+        let app = s3::build_router(engine.clone());
+
+        let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/test-bucket/clip.mkv")
+            .header("content-type", "application/octet-stream")
+            .header("content-length", payload.len().to_string())
+            .body(Body::from(payload.clone()))
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), 200);
+
+        let got = engine.get_object("test-bucket", "clip.mkv").await.unwrap();
+        assert_eq!(got, payload, "streamed PUT must round-trip byte-for-byte");
+    }
 }

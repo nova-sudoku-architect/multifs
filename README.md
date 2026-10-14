@@ -34,6 +34,7 @@ multifs serve
 | **S3 copy & versioning** — CopyObject, UploadPartCopy, ListMultipartUploads, ListObjectVersions (`versionId`), PutBucketVersioning | ✅ |
 | **Single-blob MVCC versioning** — copy-on-write overwrite, old version kept for a grace period | ✅ |
 | **HTTP Range streaming** — Range forwarded to the pCloud CDN (start/end) | ✅ |
+| **Streaming PUT + request timeouts** — large binary PUTs stream body → pCloud with `Content-Length` (no whole-file buffering); per-request timeout prevents indefinite hangs | ✅ |
 | **Tiered placement** — cloud-first, local disk as last resort (per-account `priority`) | ✅ |
 | **`vacuum` garbage collection** — reclaims superseded + abandoned versions + abandoned multipart uploads | ✅ |
 | **`import` command** — register existing pCloud file(s) (metadata only, single-file or `--scan`) | ✅ |

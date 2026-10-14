@@ -374,6 +374,7 @@ impl StorageEngine {
         key: &str,
         content_type: Option<&str>,
         charset: Option<&str>,
+        content_length: Option<u64>,
         stream: S,
     ) -> anyhow::Result<ObjectInfo>
     where
@@ -404,7 +405,7 @@ impl StorageEngine {
         tracing::info!("engine: calling upload_stream path={}", remote_path);
         let (actual_path, _file_id, etag, file_size) = backend
             .backend
-            .upload_stream(&remote_path, Box::new(stream))
+            .upload_stream(&remote_path, Box::new(stream), content_length)
             .await?;
 
         let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
@@ -1590,7 +1591,7 @@ impl StorageEngine {
 
         let (actual_path, _file_id, _sha256_etag, file_size) = backends[idx]
             .backend
-            .upload_stream(&part_path, Box::new(hashed_stream))
+            .upload_stream(&part_path, Box::new(hashed_stream), Some(end_exclusive - start))
             .await?;
 
         let part_md5 = hex::encode(hasher.lock().unwrap().clone().finalize());

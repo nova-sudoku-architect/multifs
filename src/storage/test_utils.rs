@@ -61,6 +61,7 @@ impl StorageBackend for MockBackend {
         &self,
         remote_path: &str,
         stream: Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send + Unpin>,
+        _content_length: Option<u64>,
     ) -> anyhow::Result<(String, i64, String, i64)> {
         use sha2::{Digest, Sha256};
         use futures::StreamExt;
@@ -269,8 +270,9 @@ impl StorageBackend for TrackedBackend {
         &self,
         remote_path: &str,
         stream: Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send + Unpin>,
+        content_length: Option<u64>,
     ) -> anyhow::Result<(String, i64, String, i64)> {
-        self.inner.upload_stream(remote_path, stream).await
+        self.inner.upload_stream(remote_path, stream, content_length).await
     }
 
     async fn download(&self, remote_path: &str) -> anyhow::Result<Vec<u8>> {

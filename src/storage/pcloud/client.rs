@@ -29,6 +29,16 @@ impl PCloudClient {
             client: reqwest::Client::builder()
                 .user_agent("multifs/0.1.0")
                 .connect_timeout(std::time::Duration::from_secs(15))
+                // Overall per-request timeout. Without this a stalled transfer
+                // blocks forever (large single-object PUTs used to hang >10 min
+                // with no progress). Tune via MULTIFS_HTTP_TIMEOUT_SECS
+                // (default 1800s = 30 min); 0 disables the cap.
+                .timeout(std::time::Duration::from_secs(
+                    std::env::var("MULTIFS_HTTP_TIMEOUT_SECS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(1800),
+                ))
                 .build()
                 .expect("Failed to build HTTP client"),
             known_dirs: Arc::new(StdMutex::new(HashSet::new())),
@@ -429,9 +439,10 @@ impl PCloudClient {
         &self,
         remote_path: &str,
         stream: Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send + Unpin>,
+        content_length: Option<u64>,
     ) -> anyhow::Result<(String, i64, String, i64)> {
         use sha2::{Digest, Sha256};
-        use std::sync::Mutex;
+        use std::sync::{Arc, Mutex};
 
         let parent = std::path::Path::new(remote_path)
             .parent()
@@ -444,26 +455,47 @@ impl PCloudClient {
             .and_then(|n| n.to_str())
             .unwrap_or("file");
 
-        // Collect the full stream into memory first, compute SHA-256.
-        // reqwest's streaming multipart (Part::stream + Body::wrap_stream) hangs
-        // on S3 PUTs — see AGENTS.md. Buffer-first is the safe path and the
-        // WebDAV handler already does this.
         use futures::StreamExt;
-        let mut all_data = Vec::new();
-        let mut hasher = Sha256::new();
-        let mut stream = stream; // rebind as mutable for StreamExt::next
-        while let Some(chunk) = stream.next().await {
-            let data = chunk?;
-            hasher.update(&data);
-            all_data.extend_from_slice(&data);
-        }
-        let sha256_hex = format!("{:x}", hasher.finalize());
-        tracing::info!("pcloud: collected {} bytes for upload, sha256={}", all_data.len(), sha256_hex);
 
-        let part = reqwest::multipart::Part::bytes(all_data)
+        // Hash the body on the fly (SHA-256 ETag), whether we stream or buffer.
+        let hasher = Arc::new(Mutex::new(Sha256::new()));
+
+        // Build the file part. When the caller declares the content length we
+        // stream the body straight through with a real Content-Length — no
+        // full-file RAM buffering (this is the ≥1 GB single-PUT fix). reqwest's
+        // *chunked* streaming multipart (unknown length) hangs against pCloud's
+        // uploadfile endpoint, so we only stream with a known length and fall
+        // back to buffering otherwise (small / unknown-length bodies).
+        let part = if let Some(len) = content_length {
+            let hasher = hasher.clone();
+            let hashed = stream.map(move |item| {
+                let chunk = item.map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                })?;
+                hasher.lock().unwrap().update(&chunk);
+                Ok::<Bytes, std::io::Error>(chunk)
+            });
+            tracing::info!("pcloud: streaming {} bytes to {} (no buffering)", len, parent);
+            reqwest::multipart::Part::stream_with_length(
+                reqwest::Body::wrap_stream(hashed),
+                len,
+            )
+        } else {
+            // Fallback: collect the whole stream (length unknown / not declared).
+            let mut all_data = Vec::new();
+            let mut stream = stream; // rebind as mutable for StreamExt::next
+            while let Some(chunk) = stream.next().await {
+                let data = chunk?;
+                hasher.lock().unwrap().update(&data);
+                all_data.extend_from_slice(&data);
+            }
+            tracing::info!("pcloud: buffered {} bytes for upload", all_data.len());
+            reqwest::multipart::Part::bytes(all_data)
+        };
+        let part = part
             .file_name(filename.to_string())
             .mime_str("application/octet-stream")
-            .unwrap_or_else(|_| reqwest::multipart::Part::bytes(vec![]));
+            .expect("valid static mime");
 
         let form = reqwest::multipart::Form::new()
             .text("access_token", self.token.clone())
@@ -485,6 +517,8 @@ impl PCloudClient {
         if result != 0 {
             anyhow::bail!("Upload error {}: {}", result, body["error"]);
         }
+
+        let sha256_hex = format!("{:x}", hasher.lock().unwrap().clone().finalize());
 
         let metadata = &body["metadata"];
         let first = metadata.as_array().and_then(|arr| arr.first());
