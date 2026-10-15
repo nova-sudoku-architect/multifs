@@ -504,6 +504,20 @@ mount_prefix = "/multifs/058"
 quota_gb = 4
 
 [[storage.accounts]]
+email = "nova-video-059@atomicmail.ai"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_ATOMIC_059"
+mount_prefix = "/multifs/059"
+quota_gb = 4
+
+[[storage.accounts]]
+email = "nova-video-060@atomicmail.ai"
+backend_type = "pcloud"
+token_env = "PCLOUD_TOKEN_ATOMIC_060"
+mount_prefix = "/multifs/060"
+quota_gb = 4
+
+[[storage.accounts]]
 email = "local-disk"
 backend_type = "local"
 mount_prefix = "/multifs/local"
