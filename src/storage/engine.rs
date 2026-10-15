@@ -1152,6 +1152,53 @@ impl StorageEngine {
         self.meta.count_direct_children(bucket, prefix)
     }
 
+    /// Batched direct-child counts for many prefixes in one round-trip.
+    /// Keyed by the normalized prefix (empty string for the bucket root).
+    pub fn count_children_batch(
+        &self,
+        bucket: &str,
+        prefixes: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, i64>> {
+        self.meta.count_children_batch(bucket, prefixes)
+    }
+
+    /// Batched folder metadata (cover/summary/gif) for many prefixes, keeping
+    /// only fields whose backing object still exists. One metadata query plus
+    /// one batched existence query — avoids the per-folder N+1 of
+    /// [`folder_meta_map`]. Keyed by the exact prefix passed in; prefixes with
+    /// no valid metadata are omitted so the UI degrades gracefully.
+    pub fn folder_meta_batch(
+        &self,
+        bucket: &str,
+        prefixes: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, crate::storage::metadata::FolderMeta>> {
+        let mut metas = self.meta.folder_meta_for_prefixes(bucket, prefixes)?;
+        if metas.is_empty() {
+            return Ok(metas);
+        }
+        // Collect every referenced key so existence can be checked in one shot.
+        let mut keys: Vec<String> = Vec::new();
+        for m in metas.values() {
+            for k in [&m.cover_key, &m.summary_key, &m.preview_gif_key].into_iter().flatten() {
+                keys.push(k.clone());
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        let present = self.meta.existing_keys(bucket, &keys)?;
+        for m in metas.values_mut() {
+            let keep = |k: &mut Option<String>| {
+                if k.as_deref().map(|s| !present.contains(s)).unwrap_or(false) {
+                    *k = None;
+                }
+            };
+            keep(&mut m.cover_key);
+            keep(&mut m.summary_key);
+            keep(&mut m.preview_gif_key);
+        }
+        Ok(metas)
+    }
+
     // -----------------------------------------------------------------
     //  Symlinks (tag folders)
     // -----------------------------------------------------------------

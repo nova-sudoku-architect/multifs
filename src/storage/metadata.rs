@@ -1,6 +1,41 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+
+/// Normalize a folder prefix to canonical form: the bucket root is the empty
+/// string; every other prefix ends in `/`. Mirrors the normalization used by
+/// [`MetadataDb::count_direct_children`] and the batch listing helpers.
+pub fn normalize_prefix(prefix: &str) -> String {
+    if prefix.is_empty() || prefix == "/" {
+        String::new()
+    } else if prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{}/", prefix)
+    }
+}
+
+/// The smallest key strictly above every key that starts with `prefix` — i.e.
+/// the exclusive upper bound of the prefix's range. `prefix_succ("dir1/") ==
+/// Some("dir10")`, so the range `["dir1/", "dir10")` selects exactly the keys
+/// under `dir1/` and excludes siblings like `dir10/...` (which sort above).
+/// Returns `None` for the empty prefix (the bucket root), which has no finite
+/// upper bound.
+pub fn prefix_succ(prefix: &str) -> Option<String> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let mut bytes = prefix.as_bytes().to_vec();
+    for i in (0..bytes.len()).rev() {
+        if bytes[i] != 0xFF {
+            bytes[i] += 1;
+            bytes.truncate(i + 1);
+            return String::from_utf8(bytes).ok();
+        }
+    }
+    None
+}
 
 #[derive(Debug, Clone)]
 pub struct BucketRecord {
@@ -2023,28 +2058,181 @@ impl MetadataDb {
         // `substr()` is 1-indexed; this skips the prefix characters so the
         // remainder can be inspected for a `/` (which would mark a subfolder).
         let skip = (p.len() + 1) as i64;
+        // Range scan `[p, prefix_succ(p))` instead of `key LIKE 'p%'`. `LIKE` is
+        // case-insensitive by default, so SQLite cannot use the key index for
+        // it and falls back to a full table scan; a plain range uses
+        // `sqlite_autoindex_files_1` directly (orders of magnitude faster on a
+        // wide folder). See `count_children_batch` for the batched form.
+        let upper = prefix_succ(&p);
         self.with_conn(|conn| {
-            // Immediate files: remainder has no `/`, and the key is not a
-            // zero-byte folder marker (i.e. does not itself end in `/`).
-            let files: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM files \
-                 WHERE bucket_name = ?1 AND key LIKE ?2 \
-                   AND substr(key, ?3) NOT LIKE '%/%' \
-                   AND key NOT LIKE '%/'",
-                params![bucket, pattern, skip],
-                |r| r.get(0),
-            )?;
-            // Immediate subfolders: distinct first path segment after the prefix.
-            let folders: i64 = conn.query_row(
-                "SELECT COUNT(DISTINCT substr(key, ?3, instr(substr(key, ?3), '/') - 1)) \
-                 FROM files \
-                 WHERE bucket_name = ?1 AND key LIKE ?2 \
-                   AND instr(substr(key, ?3), '/') > 0",
-                params![bucket, pattern, skip],
-                |r| r.get(0),
-            )?;
+            let (files, folders): (i64, i64) = match &upper {
+                Some(u) => conn.query_row(
+                    "SELECT \
+                       (SELECT COUNT(*) FROM files \
+                          WHERE bucket_name = ?1 AND key >= ?2 AND key < ?3 \
+                            AND substr(key, ?4) NOT LIKE '%/%' \
+                            AND key NOT LIKE '%/'), \
+                       (SELECT COUNT(DISTINCT substr(key, ?4, instr(substr(key, ?4), '/') - 1)) \
+                          FROM files \
+                          WHERE bucket_name = ?1 AND key >= ?2 AND key < ?3 \
+                            AND instr(substr(key, ?4), '/') > 0)",
+                    params![bucket, p, u, skip],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?,
+                None => conn.query_row(
+                    "SELECT \
+                       (SELECT COUNT(*) FROM files \
+                          WHERE bucket_name = ?1 \
+                            AND substr(key, ?2) NOT LIKE '%/%' \
+                            AND key NOT LIKE '%/'), \
+                       (SELECT COUNT(DISTINCT substr(key, ?2, instr(substr(key, ?2), '/') - 1)) \
+                          FROM files \
+                          WHERE bucket_name = ?1 \
+                            AND instr(substr(key, ?2), '/') > 0)",
+                    params![bucket, skip],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?,
+            };
             Ok(files + folders)
         })
+    }
+
+    /// Count the direct children (immediate files + immediate subfolders) for
+    /// many prefixes in one connection round-trip. Keyed by the *normalized*
+    /// prefix (empty string for the bucket root). Each prefix is a single
+    /// indexed range scan `[prefix, prefix_succ(prefix))` (see
+    /// [`count_direct_children`] for why not `LIKE`), so this stays fast even
+    /// for a folder with hundreds of children — replacing the old O(children)
+    /// N+1 storm of two `LIKE`-scan queries per child.
+    pub fn count_children_batch(
+        &self,
+        bucket: &str,
+        prefixes: &[String],
+    ) -> anyhow::Result<HashMap<String, i64>> {
+        let mut out: HashMap<String, i64> = HashMap::new();
+        if prefixes.is_empty() {
+            return Ok(out);
+        }
+        let norms: Vec<String> = prefixes.iter().map(|p| normalize_prefix(p)).collect();
+        self.with_conn(|conn| {
+            // Non-root prefixes share one prepared statement (range-bounded).
+            let mut ranged = conn.prepare(
+                "SELECT \
+                   (SELECT COUNT(*) FROM files \
+                      WHERE bucket_name = ?1 AND key >= ?2 AND key < ?3 \
+                        AND substr(key, ?4) NOT LIKE '%/%' \
+                        AND key NOT LIKE '%/') \
+                   + \
+                   (SELECT COUNT(DISTINCT substr(key, ?4, instr(substr(key, ?4), '/') - 1)) \
+                      FROM files \
+                      WHERE bucket_name = ?1 AND key >= ?2 AND key < ?3 \
+                        AND instr(substr(key, ?4), '/') > 0)",
+            )?;
+            for p in &norms {
+                let skip = (p.len() + 1) as i64;
+                let n: i64 = match prefix_succ(p) {
+                    Some(u) => ranged.query_row(params![bucket, p, u, skip], |r| r.get(0))?,
+                    // Bucket root: no upper bound.
+                    None => conn.query_row(
+                        "SELECT \
+                           (SELECT COUNT(*) FROM files \
+                              WHERE bucket_name = ?1 \
+                                AND substr(key, ?2) NOT LIKE '%/%' \
+                                AND key NOT LIKE '%/') \
+                           + \
+                           (SELECT COUNT(DISTINCT substr(key, ?2, instr(substr(key, ?2), '/') - 1)) \
+                              FROM files \
+                              WHERE bucket_name = ?1 \
+                                AND instr(substr(key, ?2), '/') > 0)",
+                        params![bucket, skip],
+                        |r| r.get(0),
+                    )?,
+                };
+                out.insert(p.clone(), n);
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Recorded folder metadata (cover/summary/gif) for many prefixes in a
+    /// single query (chunked). Keyed by the exact prefix string passed in.
+    pub fn folder_meta_for_prefixes(
+        &self,
+        bucket: &str,
+        prefixes: &[String],
+    ) -> anyhow::Result<HashMap<String, FolderMeta>> {
+        let mut out: HashMap<String, FolderMeta> = HashMap::new();
+        if prefixes.is_empty() {
+            return Ok(out);
+        }
+        self.with_conn(|conn| {
+            for chunk in prefixes.chunks(400) {
+                let ph: Vec<String> = (1..=chunk.len()).map(|i| format!("?{}", i + 1)).collect();
+                let sql = format!(
+                    "SELECT prefix, cover_key, summary_key, preview_gif_key, last_modified \
+                     FROM folder_meta WHERE bucket_name = ?1 AND prefix IN ({})",
+                    ph.join(", ")
+                );
+                let mut param_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                param_vec.push(Box::new(bucket.to_string()));
+                for p in chunk {
+                    param_vec.push(Box::new(p.clone()));
+                }
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    param_vec.iter().map(|p| p.as_ref()).collect();
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(param_refs.as_slice(), |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        FolderMeta {
+                            cover_key: r.get(1)?,
+                            summary_key: r.get(2)?,
+                            preview_gif_key: r.get(3)?,
+                            last_modified: r.get(4)?,
+                        },
+                    ))
+                })?;
+                for row in rows {
+                    let (p, m) = row?;
+                    out.insert(p, m);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// The subset of `keys` that currently exist in the bucket (chunked `IN`).
+    /// Used to drop folder-metadata fields whose backing object is gone.
+    pub fn existing_keys(&self, bucket: &str, keys: &[String]) -> anyhow::Result<HashSet<String>> {
+        let mut out: HashSet<String> = HashSet::new();
+        if keys.is_empty() {
+            return Ok(out);
+        }
+        self.with_conn(|conn| {
+            for chunk in keys.chunks(400) {
+                let ph: Vec<String> = (1..=chunk.len()).map(|i| format!("?{}", i + 1)).collect();
+                let sql = format!(
+                    "SELECT key FROM files WHERE bucket_name = ?1 AND key IN ({})",
+                    ph.join(", ")
+                );
+                let mut param_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                param_vec.push(Box::new(bucket.to_string()));
+                for k in chunk {
+                    param_vec.push(Box::new(k.clone()));
+                }
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    param_vec.iter().map(|p| p.as_ref()).collect();
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(param_refs.as_slice(), |r| r.get::<_, String>(0))?;
+                for row in rows {
+                    out.insert(row?);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
     }
 
     // ---- Symlinks (tag folders) ----

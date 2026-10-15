@@ -228,8 +228,7 @@ safe to expose to a wider audience (e.g. over Tailscale) without risking data lo
 |-------|--------|---------|
 | `/` | GET | Single-file embedded UI (vanilla HTML+JS, no build step) |
 | `/api/buckets` | GET | List buckets (name + created_at) |
-| `/api/list?bucket=&prefix=` | GET | List a folder's direct children (prefixes + files + truncated flag) |
-| `/api/download?bucket=&key=` | GET | Stream a file; honors HTTP Range for seeking/streaming |
+| `/api/list?bucket=&prefix=` | GET | List a folder's direct children (prefixes + files + truncated flag) || `/api/download?bucket=&key=` | GET | Stream a file; honors HTTP Range for seeking/streaming |
 
 Enabled via `server.enable_web = true` + `server.web_port` (default 9001). Folder grouping and
 range slicing reuse `group_objects_by_prefix` and `parse_range` from the shared server module.
@@ -489,11 +488,15 @@ multifs fsck [--checksums] [--fix]   Verify DB integrity + backend presence/size
 
 ## Test Coverage
 
-All 136 lib tests pass (`cargo test --lib`). Highlights:
+All 138 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_copy_object_roundtrip` / `test_s3_copy_object_overwrites_existing` —
   CopyObject stores a byte-for-byte copy (size + ETag), incl. overwrite (GH #2).
 - `test_s3_binary_put_streams_with_content_length` — binary PUT with a declared
   `Content-Length` takes the streaming path and round-trips intact.
+- `test_count_children_batch_matches_single` — the batched child-count path agrees
+  with the single-prefix `count_direct_children` and normalizes prefixes (root → `""`).
+- `test_folder_meta_for_prefixes_and_existing_keys` — batched folder metadata plus a
+  single existence check drops fields whose backing object is gone.
 - `test_s3_multipart_part_body_is_consumed_and_stored` — multipart round-trip + assembly.
 - `test_s3_multipart_roundtrip_stores_object` — total size + ETag correctness.
 - `test_concurrent_streaming` — concurrent range streams (range-aware mock).

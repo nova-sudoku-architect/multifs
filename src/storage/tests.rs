@@ -187,6 +187,72 @@ mod tests {
     }
 
     #[test]
+    fn test_count_children_batch_matches_single() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(dir.path().join("test.db").to_str().unwrap()).unwrap();
+        db.create_bucket("test").unwrap();
+
+        // Root: 2 files + 2 subfolders; dir1: 2 files + 1 subfolder; dir2: 1 file.
+        put_committed(&db, "test", "a.txt", 1, "e1", "2026-01-01", "a1", "/r/a.txt");
+        put_committed(&db, "test", "b.txt", 2, "e2", "2026-01-01", "a1", "/r/b.txt");
+        put_committed(&db, "test", "dir1/c.txt", 3, "e3", "2026-01-01", "a1", "/r/dir1/c.txt");
+        put_committed(&db, "test", "dir1/d.txt", 4, "e4", "2026-01-01", "a1", "/r/dir1/d.txt");
+        put_committed(&db, "test", "dir1/sub/e.txt", 5, "e5", "2026-01-01", "a1", "/r/dir1/sub/e.txt");
+        put_committed(&db, "test", "dir2/f.txt", 6, "e6", "2026-01-01", "a1", "/r/dir2/f.txt");
+
+        let prefixes = vec![
+            "".to_string(),
+            "/".to_string(),
+            "dir1".to_string(),
+            "dir1/".to_string(),
+            "dir2/".to_string(),
+            "nope/".to_string(),
+        ];
+        let batch = db.count_children_batch("test", &prefixes).unwrap();
+
+        // Keys are normalized (root -> "", others end in "/").
+        assert_eq!(batch.get(""), Some(&4)); // a.txt,b.txt + dir1,dir2
+        assert_eq!(batch.get("dir1/"), Some(&3)); // c.txt,d.txt + sub
+        assert_eq!(batch.get("dir2/"), Some(&1));
+        assert_eq!(batch.get("nope/"), Some(&0));
+
+        // The batched result must agree with the single-prefix path.
+        for p in ["", "dir1/", "dir2/", "nope/"] {
+            assert_eq!(
+                batch.get(p).copied(),
+                Some(db.count_direct_children("test", p).unwrap()),
+                "mismatch for prefix {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_folder_meta_for_prefixes_and_existing_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(dir.path().join("test.db").to_str().unwrap()).unwrap();
+        db.create_bucket("test").unwrap();
+        put_committed(&db, "test", "dir1/cover.jpg", 1, "e1", "2026-01-01", "a1", "/r/x");
+
+        db.set_folder_cover("test", "dir1/", "dir1/cover.jpg").unwrap();
+        db.set_folder_cover("test", "dir2/", "dir2/cover.jpg").unwrap();
+
+        let prefixes = vec!["dir1/".to_string(), "dir2/".to_string(), "dir3/".to_string()];
+        let metas = db.folder_meta_for_prefixes("test", &prefixes).unwrap();
+        assert_eq!(metas.len(), 2); // dir3 has no row
+        assert_eq!(metas["dir1/"].cover_key.as_deref(), Some("dir1/cover.jpg"));
+        assert_eq!(metas["dir2/"].cover_key.as_deref(), Some("dir2/cover.jpg"));
+
+        // existing_keys returns only keys that really exist in `files`.
+        let keys = vec![
+            "dir1/cover.jpg".to_string(),
+            "dir2/cover.jpg".to_string(),
+        ];
+        let present = db.existing_keys("test", &keys).unwrap();
+        assert!(present.contains("dir1/cover.jpg"));
+        assert!(!present.contains("dir2/cover.jpg"));
+    }
+
+    #[test]
     fn test_symlink_crud_resolve_list() {
         let dir = tempfile::tempdir().unwrap();
         let db = MetadataDb::open(dir.path().join("test.db").to_str().unwrap()).unwrap();

@@ -141,17 +141,25 @@ async fn list_objects(
         }
     }
 
-    // Resolve per-folder metadata (cover/summary/gif) for each folder prefix
-    // (only where recorded AND the object still exists). Omitted → UI degrades.
+    // Resolve per-folder metadata (cover/summary/gif) and child counts for all
+    // child folders in two batched queries total — not one round-trip each.
+    // (The old per-folder path was O(children) queries and dominated latency on
+    // wide folders.) Metadata is kept only where recorded AND the object still
+    // exists, so the UI degrades gracefully.
     let metas = state
         .engine
-        .folder_meta_map(&bucket, &prefixes)
+        .folder_meta_batch(&bucket, &prefixes)
+        .unwrap_or_default();
+    let counts = state
+        .engine
+        .count_children_batch(&bucket, &prefixes)
         .unwrap_or_default();
 
     let prefixes_json: Vec<serde_json::Value> = prefixes
         .into_iter()
         .map(|p| {
-            let child_count = state.engine.count_direct_children(&bucket, &p).unwrap_or(0);
+            let norm = crate::storage::metadata::normalize_prefix(&p);
+            let child_count = counts.get(&norm).copied().unwrap_or(0);
             let m = metas.get(&p);
             json!({
                 "prefix": p,
@@ -183,7 +191,7 @@ async fn list_objects(
             let norm = if p.ends_with('/') { p.to_string() } else { format!("{}/", p) };
             state
                 .engine
-                .folder_meta_map(&bucket, &[norm.clone()])
+                .folder_meta_batch(&bucket, &[norm.clone()])
                 .ok()
                 .and_then(|m| m.get(&norm).cloned())
                 .map(|m| {

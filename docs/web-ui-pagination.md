@@ -1,6 +1,12 @@
 # Web UI — Pagination & Virtual Scroll (design)
 
-Status: **proposed / in progress**
+Status: **superseded / on hold** — William chose the batched-listing route
+(option b) over pagination on 2026-10-15. The N+1 folder-listing cost that
+motivated this design was addressed by `count_children_batch` +
+`folder_meta_batch` (see `docs/architecture.md` → *Read-Only Web UI*), which cut
+a wide-folder listing from ~5 s to tens of ms. The WIP code for this design is
+preserved on branch `wip/web-pagination-20261014`. Kept for reference; revisit
+only if unbounded payloads / DOM size become a problem at scale.
 Owner: coder
 Related: `src/server/web/mod.rs`, `src/server/web/index.html`, `src/storage/engine.rs`,
 `src/storage/metadata.rs`, `src/server/mod.rs`.
