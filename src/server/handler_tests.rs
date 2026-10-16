@@ -1122,4 +1122,25 @@ mod tests {
         );
         assert!(http_date("not-a-date").is_none());
     }
+
+    #[test]
+    fn test_is_valid_thumb_size() {
+        use crate::server::web::is_valid_thumb_size;
+        // Valid: sides in 16..=4096.
+        assert!(is_valid_thumb_size("320x200"));
+        assert!(is_valid_thumb_size("128x80"));
+        assert!(is_valid_thumb_size("322x200")); // no divisibility rule (local resize)
+        // Invalid: too small, too large, malformed.
+        assert!(!is_valid_thumb_size("8x8"));
+        assert!(!is_valid_thumb_size("4097x100"));
+        assert!(!is_valid_thumb_size("axb"));
+        assert!(!is_valid_thumb_size("320"));
+    }
+
+    #[test]
+    fn test_urlencoding() {
+        use crate::server::web::urlencoding;
+        assert_eq!(urlencoding("video/0001/a.mp4"), "video/0001/a.mp4");
+        assert_eq!(urlencoding("a b&c=d"), "a%20b%26c%3Dd");
+    }
 }

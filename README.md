@@ -586,7 +586,7 @@ Deployed as systemd `multifs.service`: binary `/usr/local/bin/multifs`, config
 ## Running tests
 
 ```bash
-cargo test --lib            # unit tests (130 passing) — count must match docs/architecture.md
+cargo test --lib            # unit tests (132 passing) — count must match docs/architecture.md
 cargo test                  # unit + integration tests
 cargo test -- --nocapture   # with output
 cargo clippy                # lints

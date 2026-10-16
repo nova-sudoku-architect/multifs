@@ -501,7 +501,7 @@ multifs fsck [--checksums] [--fix] [--prune-missing] [--apply]
 
 ## Test Coverage
 
-All 130 lib tests pass (`cargo test --lib`). Highlights:
+All 132 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_copy_object_roundtrip` / `test_s3_copy_object_overwrites_existing` —
   CopyObject stores a byte-for-byte copy (size + ETag), incl. overwrite (GH #2).
 - `test_s3_binary_put_streams_with_content_length` — binary PUT with a declared
@@ -526,6 +526,8 @@ All 130 lib tests pass (`cargo test --lib`). Highlights:
   excluding files and deeper descendants; powers `/api/siblings`.
 - `test_if_none_match_hits` / `test_http_date` — `If-None-Match` (strong/weak/
   list/`*`) and RFC-3339→HTTP-date conversion for `/api/download` revalidation.
+- `test_is_valid_thumb_size` / `test_urlencoding` — `/api/thumb` size validation
+  (16..=4096) and the redirect Location encoder.
 
 ---
 

@@ -560,7 +560,7 @@ function folderRowHtml(bucket, f, showThumb) {
   // recorded + present); otherwise keep the standard folder icon.
   let ico;
   if (showThumb && f && f.cover_key) {
-    const purl = '/api/download?' + new URLSearchParams({ bucket, key: f.cover_key });
+    const purl = '/api/thumb?' + new URLSearchParams({ bucket, key: f.cover_key, size: '128x80' });
     ico = `<img class="fthumb" src="${esc(purl)}" alt="" loading="lazy">`;
   } else {
     ico = '<span class="ico icon-folder">📁</span>';
@@ -655,7 +655,7 @@ function renderPreviewMode(bucket, folders, files) {
     for (const f of withPreview) {
       const prefix = f.prefix;
       const name = prefix.replace(/\/$/, '').split('/').pop();
-      const purl = '/api/download?' + new URLSearchParams({ bucket, key: f.cover_key });
+      const purl = '/api/thumb?' + new URLSearchParams({ bucket, key: f.cover_key, size: '320x200' });
       html += `<div class="folder-card" data-prefix="${esc(prefix)}">
         <div class="fthumb"><img src="${esc(purl)}" loading="lazy" alt="${esc(name)}"></div>
         <div class="fname">${esc(name)}${childBadge(f)}${symlinkBadge(f)}</div>
@@ -682,7 +682,7 @@ function renderFolderDetail(bucket, folder) {
     html += `<div class="fd-meta">Last modified: ${esc(fmtMtime(folder.last_modified))}</div>`;
   }
   if (folder.cover_key) {
-    const u = '/api/download?' + new URLSearchParams({ bucket, key: folder.cover_key });
+    const u = '/api/thumb?' + new URLSearchParams({ bucket, key: folder.cover_key, size: '640x400' });
     html += `<div><div class="fd-head">Cover</div><div class="fd-cover"><img src="${esc(u)}" alt="cover"></div></div>`;
   }
   if (folder.preview_gif_key) {
