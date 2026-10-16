@@ -1817,6 +1817,29 @@ impl MetadataDb {
         })
     }
 
+    /// List current (committed) objects stored as multipart composites — their
+    /// `remote_path` is a `__mp__/multipart-<id>` staging dir. Used by multipart
+    /// coalescing (`StorageEngine::coalesce_all`).
+    pub fn list_multipart_composite_objects(&self) -> anyhow::Result<Vec<(String, String)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT f.bucket_name, f.key FROM files f \
+                 JOIN versions v ON v.bucket_name = f.bucket_name AND v.key = f.key \
+                                 AND v.version = f.current_version \
+                 WHERE v.status = 'committed' AND v.remote_path LIKE '%/__mp__/multipart-%' \
+                 ORDER BY f.bucket_name, f.key",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
     pub fn delete_multipart(&self, upload_id: &str) -> anyhow::Result<()> {
         self.with_conn(|conn| {
             conn.execute(

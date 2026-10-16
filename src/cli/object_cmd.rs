@@ -41,6 +41,21 @@ pub enum ObjectSubcommand {
         /// Object path (bucket/key)
         path: String,
     },
+    /// Coalesce completed multipart object(s) into single blobs
+    ///
+    /// Multipart objects are read-assembled from their parts (N round-trips) and
+    /// keep their part rows forever. Coalescing rewrites the assembled bytes as
+    /// one blob under a new version; the old parts become reclaimable by vacuum.
+    Coalesce {
+        /// Object path (bucket/key). Omit when using --all.
+        path: Option<String>,
+        /// Coalesce every multipart object in the pool
+        #[arg(long)]
+        all: bool,
+        /// Show what would be coalesced without changing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 pub async fn run(args: ObjectArgs) -> Result<()> {
@@ -119,6 +134,56 @@ pub async fn run(args: ObjectArgs) -> Result<()> {
             println!("  Last Modified: {}", object.last_modified);
             println!("  Content Type: {}", object.content_type.unwrap_or_default());
             println!("  Account:      {} ({})", object.account_email, object.remote_path);
+        }
+        ObjectSubcommand::Coalesce { path, all, dry_run } => {
+            let fmt = |bytes: i64| -> String {
+                if bytes > 1_073_741_824 {
+                    format!("{:.1} GiB", bytes as f64 / 1_073_741_824.0)
+                } else if bytes > 1_048_576 {
+                    format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
+                } else {
+                    format!("{} bytes", bytes)
+                }
+            };
+            if all {
+                let (count, bytes) = engine.coalesce_all(dry_run).await?;
+                if count == 0 {
+                    println!("No multipart objects to coalesce.");
+                } else if dry_run {
+                    println!("Would coalesce {} object(s) ({}) into single blobs.", count, fmt(bytes));
+                } else {
+                    println!("✅ Coalesced {} object(s) ({} reassembled into single blobs).", count, fmt(bytes));
+                }
+            } else {
+                let Some(p) = path else {
+                    anyhow::bail!("Provide an object path (bucket/key) or use --all");
+                };
+                let parts: Vec<&str> = p.splitn(2, '/').collect();
+                if parts.len() < 2 {
+                    anyhow::bail!("Invalid path: {}. Use bucket/key format.", p);
+                }
+                match engine.coalesce_multipart(parts[0], parts[1], dry_run).await? {
+                    crate::storage::engine::CoalesceOutcome::NotMultipart => {
+                        println!("{} is not a multipart object — nothing to do.", p);
+                    }
+                    crate::storage::engine::CoalesceOutcome::WouldCoalesce { bytes } => {
+                        println!("Would coalesce {} ({}) into a single blob.", p, fmt(bytes));
+                    }
+                    crate::storage::engine::CoalesceOutcome::Coalesced {
+                        old_version,
+                        new_version,
+                        bytes,
+                    } => {
+                        println!(
+                            "✅ Coalesced {} (v{} → v{}, {}); old parts reclaimable by vacuum.",
+                            p,
+                            old_version,
+                            new_version,
+                            fmt(bytes)
+                        );
+                    }
+                }
+            }
         }
     }
 

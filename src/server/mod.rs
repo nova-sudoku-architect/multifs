@@ -235,9 +235,12 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let metrics = metrics::AppMetrics::new();
 
     // Background vacuum: periodically reclaim superseded + abandoned versions.
+    // When `storage.auto_coalesce_multipart` is on, also coalesce completed
+    // multipart objects into single blobs each cycle.
     {
         let vacuum_engine = engine.clone();
         let vacuum_metrics = metrics.clone();
+        let auto_coalesce = cfg.storage.auto_coalesce_multipart;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
             interval.tick().await; // skip the immediate first tick
@@ -256,6 +259,19 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                         }
                     }
                     Err(e) => tracing::warn!("vacuum failed: {}", e),
+                }
+                if auto_coalesce {
+                    match vacuum_engine.coalesce_all(false).await {
+                        Ok((count, bytes)) if count > 0 => {
+                            tracing::info!(
+                                "coalesce: rewrote {} multipart object(s) ({}) as single blobs",
+                                count,
+                                bytes
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("coalesce failed: {}", e),
+                    }
                 }
             }
         });

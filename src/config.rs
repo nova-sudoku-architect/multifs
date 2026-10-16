@@ -101,6 +101,12 @@ pub struct StorageConfig {
     /// List of pCloud accounts
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
+    /// Background multipart coalescing. When true, the daemon periodically
+    /// coalesces completed multipart objects into single blobs (removes per-part
+    /// read round-trips + part-row retention). Off by default; also runnable
+    /// on demand via `multifs object coalesce`. See `coalesce_multipart`.
+    #[serde(default)]
+    pub auto_coalesce_multipart: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +181,7 @@ impl Default for StorageConfig {
             meta_db_path: default_meta_db(),
             placement_strategy: default_placement_strategy(),
             accounts: Vec::new(),
+            auto_coalesce_multipart: false,
         }
     }
 }
