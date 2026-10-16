@@ -318,6 +318,7 @@ overflow tier.
 | **CLI management** — accounts, buckets, objects, shards, folder metadata, audit | ✅ |
 | **Read-only web UI** — browser file navigator (GET-only: list buckets/objects, download) | ✅ |
 | **Web UI column sorting** — click any column header to sort list/preview/names + buckets (persisted) | ✅ |
+| **Web UI virtualization** — `content-visibility` skips off-screen cards; covers hydrate via `IntersectionObserver` (only visible thumbnails fetched) | ✅ |
 | **Folder last-modified** — every folder shows the last add/remove/update in its subtree | ✅ |
 | WebDAV | ❌ Removed |
 | NFS | ❌ Removed (was a stub; code deleted) |
