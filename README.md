@@ -227,7 +227,7 @@ sequenceDiagram
 
     C->>H: POST /b/key?uploadId=X (part list)
     H->>E: complete_multipart_upload()
-    E->>M: compute multipart ETag, commit version<br/>(remote_path = staging dir; parts retained)
+    E->>M: compute multipart ETag, commit version<br/>(remote_path = staging dir, parts retained)
     H-->>C: 200 + final ETag
 
     Note over C,M: DELETE ?uploadId=X (abort) deletes part blobs + rows.<br/>Abandoned uploads (>24h) are swept by vacuum.
@@ -280,7 +280,7 @@ stateDiagram-v2
 flowchart TD
     START([put_object / upload_part]) --> STRAT{placement_strategy}
     STRAT -->|round-robin| RR["idx = counter++ % backends.len()"]
-    STRAT -->|utilization (default)| Q["refresh_quotas() (cached)"]
+    STRAT -->|utilization · default| Q["refresh_quotas() (cached)"]
     Q --> LVL["iterate priority tiers ascending<br/>(0 = preferred first)"]
     LVL --> BEST["pick least-full backend in tier<br/>(fill_ratio = used / quota)"]
     BEST --> FULL{fill_ratio < 1.0?}
