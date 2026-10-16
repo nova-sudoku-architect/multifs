@@ -19,6 +19,11 @@ enable_nfs = false
 enable_web = false
 web_port = 9001
 
+# Metrics + health endpoints (/metrics, /healthz, /readyz) — Prometheus text
+# format. Off by default; enable to wire MultiFS into a scrape/alerting stack.
+enable_metrics = false
+metrics_port = 9100
+
 [tls]
 enabled = false
 # cert_path = "/path/to/server.crt"

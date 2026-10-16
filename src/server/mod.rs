@@ -245,7 +245,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 interval.tick().await;
                 match vacuum_engine.vacuum(false).await {
                     Ok((pending, orphans, multipart)) => {
-                        vacuum_metrics.record_gc((pending + orphans + multipart) as u64);
+                        vacuum_metrics.record_gc(pending + orphans + multipart);
                         if pending > 0 || orphans > 0 || multipart > 0 {
                             tracing::info!(
                                 "vacuum: reclaimed {} pending, {} superseded versions, {} abandoned multipart uploads",
