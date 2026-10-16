@@ -1050,4 +1050,45 @@ mod tests {
         let got = engine.get_object("test-bucket", "clip.mkv").await.unwrap();
         assert_eq!(got, payload, "streamed PUT must round-trip byte-for-byte");
     }
+
+    // =====================================================================
+    // In-memory child-count derivation (web listing fast path)
+    // =====================================================================
+
+    #[test]
+    fn test_count_children_from_keys_root() {
+        use crate::server::count_children_from_keys;
+        let keys = [
+            "a.txt",
+            "b.txt",
+            "dir1/c.txt",
+            "dir1/d.txt",
+            "dir1/sub/e.txt",
+            "dir2/f.txt",
+        ];
+        let c = count_children_from_keys("", keys.iter().copied());
+        // dir1: 2 files + 1 subfolder (sub); dir2: 1 file.
+        assert_eq!(c.get("dir1/"), Some(&3));
+        assert_eq!(c.get("dir2/"), Some(&1));
+        // Root-level files belong to no child folder.
+        assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn test_count_children_from_keys_listing_prefix() {
+        use crate::server::count_children_from_keys;
+        // Mirrors a real listing: prefix "video/", deep subfolders collapse to
+        // one immediate child each.
+        let keys = [
+            "video/0001/a.mp4",
+            "video/0001/b.mp4",
+            "video/0001/x/c.mp4", // x/ is an immediate subfolder of 0001/
+            "video/0001/x/y/d.mp4", // y/ is NOT immediate under 0001/
+            "video/0002/e.mp4",
+        ];
+        let c = count_children_from_keys("video/", keys.iter().copied());
+        assert_eq!(c.get("video/0001/"), Some(&3)); // a,b + subfolder x
+        assert_eq!(c.get("video/0002/"), Some(&1));
+        assert_eq!(c.len(), 2);
+    }
 }
