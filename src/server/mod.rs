@@ -1,5 +1,4 @@
 pub mod s3;
-pub mod nfs;
 pub mod web;
 
 #[cfg(test)]
@@ -45,13 +44,6 @@ pub fn parse_range(range: &str, total_len: usize) -> Option<(usize, usize)> {
 /// names (with trailing /) and files are objects at the current level.
 ///
 /// Used by both S3 (CommonPrefixes) and WebDAV (folder listing).
-/// Guess content type from file extension using mime_guess.
-pub fn content_type_from_path(key: &str) -> String {
-    mime_guess::from_path(key)
-        .first_or_octet_stream()
-        .to_string()
-}
-
 /// Resolve content type for an upload, combining client-provided Content-Type
 /// header with extension-based detection. The S3 handler uses this to handle
 /// curl's default `application/x-www-form-urlencoded` that it sends with --data-binary.

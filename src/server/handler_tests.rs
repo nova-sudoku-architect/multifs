@@ -6,11 +6,10 @@
 #[cfg(test)]
 mod handler_tests {
     use tower::ServiceExt;
-    use crate::server::{parse_range, resolve_content_type, content_type_from_path};
+    use crate::server::{parse_range, resolve_content_type};
     use crate::storage::metadata::MetadataDb;
     use crate::storage::test_utils::MockBackend;
     use crate::storage::engine::{StorageEngine, BackendHandle};
-    use bytes::Bytes;
 
     // =====================================================================
     // Range Header Parsing
@@ -100,19 +99,6 @@ mod handler_tests {
     // =====================================================================
     // Content-Type Resolution
     // =====================================================================
-
-    #[test]
-    fn test_content_type_from_extension() {
-        assert_eq!(content_type_from_path("video.mp4"), "video/mp4");
-        assert_eq!(content_type_from_path("image.jpg"), "image/jpeg");
-        assert_eq!(content_type_from_path("document.pdf"), "application/pdf");
-    }
-
-    #[test]
-    fn test_content_type_no_extension() {
-        let ct = content_type_from_path("file_without_extension");
-        assert_eq!(ct, "application/octet-stream");
-    }
 
     #[test]
     fn test_resolve_ct_extension_wins_over_curl_default() {

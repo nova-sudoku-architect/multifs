@@ -10,9 +10,8 @@ use axum::{
     routing::get, Router,
 };
 use chrono::Utc;
-use futures::StreamExt;
 use quick_xml::events::Event;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tower_http::cors::CorsLayer;
 
 use crate::storage::engine::StorageEngine;
@@ -58,18 +57,6 @@ pub fn build_router(engine: Arc<StorageEngine>) -> Router {
 }
 
 // ---- Error handling ----
-
-#[derive(Serialize)]
-struct S3Error {
-    #[serde(rename = "Code")]
-    code: String,
-    #[serde(rename = "Message")]
-    message: String,
-    #[serde(rename = "Resource")]
-    resource: String,
-    #[serde(rename = "RequestId")]
-    request_id: String,
-}
 
 fn s3_error_xml(code: &str, message: &str, resource: &str) -> String {
     format!(
@@ -282,6 +269,7 @@ async fn delete_bucket(
 
 /// GET /{bucket} — List objects (ListObjectsV2)
 #[derive(Deserialize)]
+#[allow(dead_code)] // deserialized query params; some are parsed but not yet acted on
 struct ListObjectsParams {
     prefix: Option<String>,
     #[serde(rename = "max-keys")]
@@ -1122,7 +1110,6 @@ async fn get_object(
 
     use tokio::sync::mpsc;
     use bytes::Bytes;
-    use futures::stream::StreamExt;
     use std::pin::Pin;
 
     // Parse optional ?versionId=N (fetch a specific version, else current).

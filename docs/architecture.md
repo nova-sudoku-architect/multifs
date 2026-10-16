@@ -31,7 +31,7 @@ blob in place.
 | Symlinks (tag folders) | ✅ Live | Present one folder under multiple paths without duplicating bytes (CLI-created) |
 | Folder last-modified | ✅ Live | Every folder shows the time of the last add/remove/update in its subtree (list + preview modes) |
 | Erasure coding | ❌ Stub | Not deployed (single-blob model; each blob lives on one account) |
-| NFS | ❌ Stub | Port 2049 not exposed |
+| NFS | ❌ Removed | Stub deleted in the dead-code cleanup (2026-10-16) |
 
 ---
 
@@ -501,7 +501,7 @@ multifs fsck [--checksums] [--fix] [--prune-missing] [--apply]
 
 ## Test Coverage
 
-All 129 lib tests pass (`cargo test --lib`). Highlights:
+All 124 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_copy_object_roundtrip` / `test_s3_copy_object_overwrites_existing` —
   CopyObject stores a byte-for-byte copy (size + ETag), incl. overwrite (GH #2).
 - `test_s3_binary_put_streams_with_content_length` — binary PUT with a declared
@@ -516,7 +516,6 @@ All 129 lib tests pass (`cargo test --lib`). Highlights:
 - `test_streaming_range_download` — range slicing (inclusive start / exclusive end).
 - `test_abort_multipart_deletes_parts_from_all_backends` — abort reclaims parts
   scattered across backends (per-account delete, no cross-backend leak).
-- `stream_hasher` — incremental SHA-256 ETag hashing.
 
 ---
 

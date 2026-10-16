@@ -320,7 +320,7 @@ overflow tier.
 | **Web UI column sorting** — click any column header to sort list/preview/names + buckets (persisted) | ✅ |
 | **Folder last-modified** — every folder shows the last add/remove/update in its subtree | ✅ |
 | WebDAV | ❌ Removed |
-| NFS | ❌ Stub (port not exposed) |
+| NFS | ❌ Removed (was a stub; code deleted) |
 | Erasure coding | ❌ Stub (single-blob model; each blob lives on one account) |
 
 ---
@@ -345,7 +345,6 @@ tree: `PCloudBackend` (real), `LocalDiskBackend` (overflow tier), and
 src/
 ├── main.rs                 # clap CLI dispatch
 ├── config.rs               # Config model (server/storage/tls/accounts)
-├── error.rs                # error types
 ├── cli/                    # one module per subcommand (serve, account, bucket, …)
 ├── server/
 │   ├── mod.rs              # shared helpers (range parse, prefix grouping, charset)
@@ -354,7 +353,6 @@ src/
 └── storage/
     ├── engine.rs           # StorageEngine — the single choke point
     ├── metadata.rs         # MetadataDb (SQLite, migrations, queries)
-    ├── placement.rs        # placement planning helpers
     ├── backends/           # StorageBackend trait + pcloud / local_disk impls
     └── pcloud/             # pCloud HTTP client + OAuth
 tests/                      # integration tests (S3, WebDAV, pCloud, shell)
@@ -411,7 +409,7 @@ on the host only and are deliberately not committed to this repo.
 bind = "0.0.0.0"
 s3_port = 9000
 enable_s3 = true
-enable_nfs = false        # NFS is a stub
+enable_nfs = false        # NFS support removed; field kept for config compatibility
 enable_web = false        # read-only web UI (GET-only browser)
 web_port = 9001
 
@@ -588,7 +586,7 @@ Deployed as systemd `multifs.service`: binary `/usr/local/bin/multifs`, config
 ## Running tests
 
 ```bash
-cargo test --lib            # unit tests (129 passing) — count must match docs/architecture.md
+cargo test --lib            # unit tests (124 passing) — count must match docs/architecture.md
 cargo test                  # unit + integration tests
 cargo test -- --nocapture   # with output
 cargo clippy                # lints
@@ -627,8 +625,9 @@ Honest list of what MultiFS is **not** today — read before relying on it.
    that matter elsewhere.
 7. **Web UI is read-only by design, and off by default.** It exposes only GET
    routes; enable it (`server.enable_web = true`) only on a trusted interface.
-8. **NFS and WebDAV are not available.** NFS is a stub (port not exposed);
-   WebDAV has been removed. NFS-adjacent code paths remain only as scaffolding.
+8. **NFS and WebDAV are not available.** WebDAV was removed earlier; the NFS
+   stub was deleted in the dead-code cleanup. `enable_nfs` / `nfs_port` remain in
+   the config schema but do nothing.
 9. **Single-node, single-process.** State lives in one SQLite DB (`meta.db`) and
    one process loop; there is no clustering, leader election, or replication.
    SQLite WAL serializes writers.
@@ -672,8 +671,8 @@ Roughly ordered by impact:
   can auto-tier or auto-expire instead of manual `vacuum`/`audit cleanup`.
 - **Background integrity.** Scheduled `checksum verify --all` + self-healing to
   catch silent backend corruption early.
-- **Remove remaining stubs.** Implement `config set`, and either implement or
-  fully delete NFS scaffolding and any lingering WebDAV references.
+- **Remove remaining stubs.** Implement `config set`, and confirm no lingering
+  WebDAV references remain.
 - **CLI term cleanup.** Rename the `shard` subcommand to `backend` (or `disk`)
   for consistency with the rest of the docs; a breaking CLI change, so deferred.
 

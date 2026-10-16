@@ -19,6 +19,7 @@ use crate::config::AccountConfig;
 /// as the pCloud accounts fill up.
 #[derive(Clone)]
 pub struct LocalDiskBackend {
+    #[allow(dead_code)] // retained for diagnostics; engine tracks the label separately
     label: String,
     root: PathBuf,
     mount_prefix: String,

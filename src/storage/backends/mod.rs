@@ -3,6 +3,7 @@ use bytes::Bytes;
 use futures::Stream;
 
 /// File entry returned by list operations
+#[allow(dead_code)] // part of the StorageBackend interface; not all impls/callers use it
 #[derive(Debug, Clone)]
 pub struct StorageFile {
     pub name: String,
@@ -14,6 +15,7 @@ pub struct StorageFile {
 
 /// Generic storage backend trait.
 /// Implement this to add a new cloud storage provider.
+#[allow(dead_code)] // some trait methods are part of the interface but not yet called
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     /// Human-readable name for this backend instance
