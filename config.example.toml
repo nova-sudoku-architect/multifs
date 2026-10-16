@@ -34,6 +34,9 @@ enabled = false
 meta_db_path = "/var/lib/multifs/meta.db"
 # "Utilization" (default; tiered, least-full wins) or "RoundRobin" (PascalCase)
 placement_strategy = "Utilization"
+# Rewrite completed multipart objects as single blobs (removes per-part reads).
+# Off by default; also runnable on demand: `multifs object coalesce --all`.
+auto_coalesce_multipart = false
 
 # ---------------------------------------------------------------------------
 # Backends

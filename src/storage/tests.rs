@@ -1196,6 +1196,168 @@ mod tests {
         assert_eq!(engine.list_multipart_parts(upload_id).await.unwrap().len(), 2);
     }
 
+    // ---- Multipart coalesce (read optimization) ----
+
+    /// Helper: create a completed 2-part multipart object. Returns (etag, bytes).
+    async fn make_completed_multipart(
+        engine: &crate::storage::engine::StorageEngine,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> (String, Vec<u8>) {
+        engine.create_bucket(bucket).await.unwrap();
+        engine
+            .create_multipart_upload(bucket, key, upload_id, None)
+            .await
+            .unwrap();
+        engine.upload_part(bucket, upload_id, 1, b"part-one").await.unwrap();
+        engine.upload_part(bucket, upload_id, 2, b"part-two").await.unwrap();
+        let etag = engine
+            .complete_multipart_upload(bucket, upload_id, None)
+            .await
+            .unwrap();
+        (etag, b"part-onepart-two".to_vec())
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_multipart_object_preserves_bytes_and_etag() {
+        use crate::storage::engine::CoalesceOutcome;
+        let t = make_test_engine();
+        let engine = &t.engine;
+        let (etag, expected) = make_completed_multipart(
+            engine,
+            "mp-bucket",
+            "big.bin",
+            "multipart-coalesce-1",
+        )
+        .await;
+
+        // Before: multipart composite (remote_path is the __mp__ staging dir).
+        let before = engine.head_object("mp-bucket", "big.bin").await.unwrap();
+        assert!(before.remote_path.contains("__mp__/multipart-"));
+        assert_eq!(engine.get_object("mp-bucket", "big.bin").await.unwrap(), expected);
+
+        let outcome = engine
+            .coalesce_multipart("mp-bucket", "big.bin", false)
+            .await
+            .unwrap();
+        let (old_v, new_v, bytes) = match outcome {
+            CoalesceOutcome::Coalesced { old_version, new_version, bytes } => {
+                (old_version, new_version, bytes)
+            }
+            other => panic!("expected Coalesced, got {:?}", other),
+        };
+        assert_eq!(bytes, expected.len() as i64);
+        assert!(new_v > old_v);
+
+        // After: the current version is a plain single blob (no __mp__ marker),
+        // bytes are identical, and the multipart ETag is preserved.
+        let after = engine.head_object("mp-bucket", "big.bin").await.unwrap();
+        assert!(!after.remote_path.contains("__mp__/multipart-"), "path: {}", after.remote_path);
+        assert_eq!(after.etag, etag, "ETag must be preserved across coalesce");
+        assert_eq!(after.size, expected.len() as i64);
+        assert_eq!(engine.get_object("mp-bucket", "big.bin").await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_dry_run_and_single_blob_are_noops() {
+        use crate::storage::engine::CoalesceOutcome;
+        let t = make_test_engine();
+        let engine = &t.engine;
+
+        // Single-blob object -> NotMultipart.
+        engine.create_bucket("b").await.unwrap();
+        engine.put_object("b", "plain.txt", b"hello").await.unwrap();
+        assert_eq!(
+            engine.coalesce_multipart("b", "plain.txt", false).await.unwrap(),
+            CoalesceOutcome::NotMultipart
+        );
+
+        // Multipart -> dry-run reports the size but changes nothing.
+        let (etag, _bytes) =
+            make_completed_multipart(engine, "mp-bucket", "big.bin", "multipart-coalesce-dry").await;
+        assert_eq!(
+            engine.coalesce_multipart("mp-bucket", "big.bin", true).await.unwrap(),
+            CoalesceOutcome::WouldCoalesce { bytes: 16 }
+        );
+        let still = engine.head_object("mp-bucket", "big.bin").await.unwrap();
+        assert!(still.remote_path.contains("__mp__/multipart-"));
+        assert_eq!(still.etag, etag);
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_all_reports_and_coalesces_multipart_objects() {
+        let t = make_test_engine();
+        let engine = &t.engine;
+        engine.create_bucket("mp-bucket").await.unwrap();
+        make_completed_multipart(engine, "mp-bucket", "a.bin", "multipart-all-a").await;
+        make_completed_multipart(engine, "mp-bucket", "b.bin", "multipart-all-b").await;
+        engine.put_object("mp-bucket", "plain.txt", b"hi").await.unwrap();
+
+        // Dry-run counts only the 2 multipart objects.
+        let (dry_count, dry_bytes) = engine.coalesce_all(true).await.unwrap();
+        assert_eq!(dry_count, 2);
+        assert_eq!(dry_bytes, 32);
+
+        let (count, bytes) = engine.coalesce_all(false).await.unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(bytes, 32);
+
+        // Both are now single blobs; a second pass finds nothing.
+        for k in ["a.bin", "b.bin"] {
+            let o = engine.head_object("mp-bucket", k).await.unwrap();
+            assert!(!o.remote_path.contains("__mp__/multipart-"));
+        }
+        let (again, _) = engine.coalesce_all(false).await.unwrap();
+        assert_eq!(again, 0);
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_then_vacuum_reclaims_parts() {
+        use crate::storage::engine::{BackendHandle, StorageEngine};
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
+        let handles = vec![BackendHandle::new(
+            Box::new(MockBackend::new("mock-a")),
+            "/mnt/mock-a".to_string(),
+            "mock-a".to_string(),
+            10,
+        )];
+        let engine = StorageEngine::from_backends(handles, db);
+        let upload_id = "multipart-coalesce-vac";
+        make_completed_multipart(&engine, "mp-bucket", "big.bin", upload_id).await;
+        assert_eq!(engine.list_multipart_parts(upload_id).await.unwrap().len(), 2);
+
+        engine.coalesce_multipart("mp-bucket", "big.bin", false).await.unwrap();
+        // Parts are still present until the superseded multipart version is vacuumed.
+        assert_eq!(engine.list_multipart_parts(upload_id).await.unwrap().len(), 2);
+
+        // Backdate the superseded multipart version past the grace period.
+        {
+            let old = chrono::Utc::now().timestamp_millis() - (60 * 60 * 1000);
+            let meta = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
+            meta.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE versions SET superseded_at = ?1 \
+                     WHERE bucket_name = 'mp-bucket' AND key = 'big.bin' AND superseded_at IS NOT NULL",
+                    rusqlite::params![old],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        let (_pending, orphans, _multipart) = engine.vacuum(false).await.unwrap();
+        assert_eq!(orphans, 1, "the superseded multipart version should be reclaimed");
+        assert!(
+            engine.list_multipart_parts(upload_id).await.unwrap().is_empty(),
+            "parts must be reclaimed once the multipart version is vacuumed"
+        );
+        // The coalesced object itself is unaffected.
+        assert_eq!(engine.get_object("mp-bucket", "big.bin").await.unwrap(), b"part-onepart-two");
+    }
+
     #[tokio::test]
     async fn test_vacuum_sweeps_abandoned_multipart_upload() {
         use crate::storage::engine::{BackendHandle, StorageEngine};

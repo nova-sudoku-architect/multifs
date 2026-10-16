@@ -306,6 +306,7 @@ overflow tier.
 |---------|--------|
 | **S3-compatible API** — ListBuckets, Create/DeleteBucket, Put/Get/Head/Delete Object, ListObjectsV2 | ✅ |
 | **S3 multipart upload** — Initiate / UploadPart / Complete / ListParts / Abort (rclone > 64 MB) | ✅ |
+| **Multipart coalesce** — rewrite a completed multipart object into a single blob (`multifs object coalesce`, optional background) to drop per-part reads | ✅ |
 | **S3 copy & versioning** — CopyObject, UploadPartCopy, ListMultipartUploads, ListObjectVersions (`versionId`), PutBucketVersioning | ✅ |
 | **Single-blob MVCC versioning** — copy-on-write overwrite, old version kept for a grace period | ✅ |
 | **HTTP Range streaming** — Range forwarded to the pCloud CDN (start/end) | ✅ |
@@ -421,6 +422,7 @@ metrics_port = 9100
 [storage]
 meta_db_path = "/var/lib/multifs/meta.db"
 placement_strategy = "Utilization"   # or "RoundRobin"
+# auto_coalesce_multipart = false   # periodically rewrite multipart objects as single blobs
 
 # pCloud account (cloud backends default to priority 0 = preferred)
 [[storage.accounts]]
@@ -504,6 +506,8 @@ multifs object cp <src> <dst> [-r]
 multifs object rm <bucket>/<key>  Delete an object
 multifs object info <bucket>/<key>
                                   Show object metadata
+multifs object coalesce <bucket>/<key> | --all [--dry-run]
+                                  Rewrite multipart object(s) into a single blob
 
 multifs backend status             Fill levels for all backends (objects + parts)
 multifs backend rebalance [--dry-run]
@@ -647,10 +651,12 @@ Honest list of what MultiFS is **not** today — read before relying on it.
    (`multifs`/`multifs`); the server does not authenticate or authorize callers.
    Do not expose port `9000` to untrusted networks — bind to a private/VPN
    interface (the deployed config binds a Tailscale IP).
-5. **Multipart objects are read-assembled, not rewritten.** Completed multipart
-   uploads keep their part blobs forever and are streamed back part-by-part, so a
-   large object pays a per-part backend round-trip on read and every part row
-   must stay in the DB.
+5. **Multipart objects are read-assembled unless coalesced.** A completed multipart
+   upload keeps its part blobs and is streamed back part-by-part, so a large object
+   pays a per-part backend round-trip on read and every part row stays in the DB.
+   `multifs object coalesce` (or `storage.auto_coalesce_multipart = true`) rewrites
+   the assembled bytes as a single blob, after which reads are one fetch and the old
+   parts are reclaimed by `vacuum`.
 6. **`import` is destructive to unmanaged sources.** An imported object's blob is
    indistinguishable from a MultiFS-owned one, so deleting the record (and later
    `vacuum`) deletes the *source* file on pCloud. Never delete records for files
