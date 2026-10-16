@@ -370,6 +370,9 @@ pub fn load(path: &str) -> anyhow::Result<Config> {
 /// Find the config file in standard locations
 pub fn find_config() -> anyhow::Result<String> {
     let paths = vec![
+        // Documented + packaged location (see README / packaging).
+        "/etc/multifs.toml".to_string(),
+        // Legacy/alternate location (also kept for backwards compatibility).
         "/etc/multifs/config.toml".to_string(),
         "~/.multifs.toml".to_string(),
         "./multifs.toml".to_string(),

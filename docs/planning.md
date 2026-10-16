@@ -81,7 +81,8 @@ live backlog).
   rotation without leaking secrets via argv. *(stage 1 shipped — `config get/set`,
   `account add/update-token/set` with env/stdin tokens; see the CLI reference)*
 - **Packaging.** Ship MultiFS as an installable unit (deb + systemd) with a clean
-  upgrade path. *(issue)*
+  upgrade path. *(stage 1 shipped — `packaging/build-deb.sh` produces a `.deb` with units +
+  conffiles; `.rpm` / static tarball are follow-ups)*
 - **S3 `StorageBackend`.** Add an S3-compatible backend for providers that speak
   S3 (B2/Wasabi/R2/MinIO/AWS). *(design record)*
 - **Quota freshness.** Replace the cached fill-ratio snapshot with a lightweight

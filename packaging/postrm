@@ -1,0 +1,18 @@
+#!/bin/sh
+# postrm — runs after the multifs package files are removed.
+# On "purge" we also remove state/cache. Config (/etc/multifs.toml) is a conffile
+# and is removed by dpkg itself on purge; the env file and state dirs are ours.
+set -e
+
+if [ "$1" = "purge" ]; then
+    rm -rf /var/lib/multifs
+    rm -rf /var/cache/multifs
+    rm -f /etc/multifs.env
+    rm -rf /etc/multifs
+fi
+
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload 2>/dev/null || true
+fi
+
+exit 0
