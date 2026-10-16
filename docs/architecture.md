@@ -239,6 +239,18 @@ so cover art and frame captures are visible without clicking. Text files are ser
 directly in the browser. Charset is detected at upload (BOM / UTF-8 validation) and stored in the
 `charset` column; unset values fall back to UTF-8 for text content.
 
+### Client-side virtualization & lazy covers
+
+The grid views (**Preview** cards + gallery, and **Names**) and the list table use CSS
+`content-visibility: auto` with `contain-intrinsic-size`, so the browser skips layout and
+paint for off-screen cards — a folder with thousands of entries stays scrollable instead of
+laying out every card up front. Cover/gallery images are not requested eagerly: each carries a
+`data-src` and is hydrated by an `IntersectionObserver` (400 px prefetch margin) only as it
+approaches the viewport, so a folder with thousands of subfolders fetches only the handful of
+thumbnails actually visible rather than issuing thousands of `/api/thumb` requests. Both are
+progressive enhancements — with JS or `IntersectionObserver` unavailable the images fall back
+to loading directly.
+
 ### Folder preview page
 
 In **Preview mode**, a folder that has recorded metadata (`folder_meta`) renders a per-folder

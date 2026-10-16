@@ -84,6 +84,18 @@
   .gal-meta { font-size: 11px; color: var(--muted); }
   .folder-cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin: 4px 0 18px; }
   .folder-card { display: flex; flex-direction: column; align-items: center; gap: 6px; cursor: pointer; min-width: 0; }
+  /* Native virtualization: the browser skips layout/paint for off-screen grid
+     items and tiles, so a folder with thousands of cards stays responsive.
+     contain-intrinsic-size gives a placeholder size so scrollbars stay stable. */
+  .gallery, .folder-cards, .names-grid { contain: layout style; }
+  .gal-item, .folder-card, .name-item {
+    content-visibility: auto;
+  }
+  .gal-item { contain-intrinsic-size: auto 220px; }
+  .folder-card { contain-intrinsic-size: auto 260px; }
+  .name-item { contain-intrinsic-size: auto 28px; }
+  /* Table rows virtualized too (list preview of thousands of folders). */
+  .table tbody tr { content-visibility: auto; contain-intrinsic-size: auto 34px; }
   .folder-card .fthumb {
     width: 100%; aspect-ratio: 1 / 1; display: flex; align-items: center; justify-content: center;
     border: 1px solid var(--border); border-radius: 8px; background: var(--panel2); overflow: hidden;
@@ -561,7 +573,7 @@ function folderRowHtml(bucket, f, showThumb) {
   let ico;
   if (showThumb && f && f.cover_key) {
     const purl = '/api/thumb?' + new URLSearchParams({ bucket, key: f.cover_key, size: '128x80' });
-    ico = `<img class="fthumb" src="${esc(purl)}" alt="" loading="lazy">`;
+    ico = `<img class="fthumb lazy" data-src="${esc(purl)}" alt="">`;
   } else {
     ico = '<span class="ico icon-folder">📁</span>';
   }
@@ -642,7 +654,7 @@ function renderPreviewMode(bucket, folders, files) {
       const name = f.key.split('/').pop();
       const durl = '/api/download?' + new URLSearchParams({ bucket, key: f.key });
       html += `<div class="gal-item">
-        <a href="${esc(durl)}" target="_blank"><img src="${esc(durl)}" loading="lazy" alt="${esc(name)}"></a>
+        <a href="${esc(durl)}" target="_blank"><img class="lazy" data-src="${esc(durl)}" alt="${esc(name)}"></a>
         <div class="gal-label">${esc(friendlyLabel(name))}</div>
         <div class="gal-meta">${esc(fmtSize(f.size))}</div>
       </div>`;
@@ -657,7 +669,7 @@ function renderPreviewMode(bucket, folders, files) {
       const name = prefix.replace(/\/$/, '').split('/').pop();
       const purl = '/api/thumb?' + new URLSearchParams({ bucket, key: f.cover_key, size: '320x200' });
       html += `<div class="folder-card" data-prefix="${esc(prefix)}">
-        <div class="fthumb"><img src="${esc(purl)}" loading="lazy" alt="${esc(name)}"></div>
+        <div class="fthumb"><img class="lazy" data-src="${esc(purl)}" alt="${esc(name)}"></div>
         <div class="fname">${esc(name)}${childBadge(f)}${symlinkBadge(f)}</div>
         <div class="fmeta">${esc(fmtMtime(f.last_modified))}</div>
       </div>`;
@@ -1018,6 +1030,32 @@ function mdToHtml(md) {
   return out.join('\n');
 }
 
+// Lazily hydrate cover/gallery images: only set `src` when the element scrolls
+// near the viewport, so a folder with thousands of covers fetches only the
+// handful actually visible. Complements the CSS `content-visibility`
+// virtualization (which skips layout/paint but would still load every <img>).
+let _lazyObserver = null;
+function hydrateLazyImages() {
+  const imgs = main.querySelectorAll('img.lazy[data-src]');
+  if (!imgs.length) return;
+  if (!('IntersectionObserver' in window)) {
+    imgs.forEach(im => { im.src = im.dataset.src; });
+    return;
+  }
+  if (!_lazyObserver) {
+    _lazyObserver = new IntersectionObserver((entries, obs) => {
+      for (const e of entries) {
+        if (e.isIntersecting) {
+          const im = e.target;
+          if (im.dataset.src && !im.src) im.src = im.dataset.src;
+          obs.unobserve(im);
+        }
+      }
+    }, { rootMargin: '400px 0px' }); // preload a little ahead of scroll
+  }
+  imgs.forEach(im => _lazyObserver.observe(im));
+}
+
 async function loadList(bucket, prefix) {
   state.bucket = bucket; state.prefix = prefix;
   renderCrumb(bucket, prefix);
@@ -1050,6 +1088,7 @@ async function loadList(bucket, prefix) {
     html += '<div class="note">Read-only — downloads only. Range requests supported for streaming.</div>';
     main.innerHTML = html;
     if (state.mode === 'preview') loadSummaryText(bucket, data.folder);
+    hydrateLazyImages();
     main.querySelectorAll('th[data-sort]').forEach(th => {
       th.onclick = () => setSort(th.dataset.sort);
     });
