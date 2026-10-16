@@ -31,8 +31,9 @@ enum Cli {
     Bucket(cli::bucket_cmd::BucketArgs),
     /// Manage objects
     Object(cli::object_cmd::ObjectArgs),
-    /// Manage shard distribution
-    Shard(cli::shard_cmd::ShardArgs),
+    /// Manage backend distribution (alias: shard)
+    #[command(visible_alias = "shard")]
+    Backend(cli::backend_cmd::BackendArgs),
     /// Show daemon health and account stats
     Status,
     /// Audit pCloud accounts — find files not managed by MultiFS
@@ -70,7 +71,7 @@ async fn main() -> Result<()> {
         Cli::Account(args) => cli::account_cmd::run(args).await?,
         Cli::Bucket(args) => cli::bucket_cmd::run(args).await?,
         Cli::Object(args) => cli::object_cmd::run(args).await?,
-        Cli::Shard(args) => cli::shard_cmd::run(args).await?,
+        Cli::Backend(args) => cli::backend_cmd::run(args).await?,
         Cli::Status => cli::status::run_status().await?,
         Cli::Audit(args) => cli::audit_cmd::run(args).await?,
         Cli::Import(args) => cli::import_cmd::run(args).await?,

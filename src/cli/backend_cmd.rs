@@ -1,21 +1,21 @@
 use clap::Parser;
 use anyhow::Result;
 
-/// Manage shard distribution
+/// Manage backend distribution
 #[derive(Parser)]
-pub struct ShardArgs {
+pub struct BackendArgs {
     #[command(subcommand)]
-    pub command: ShardSubcommand,
+    pub command: BackendSubcommand,
 }
 
 #[derive(Parser)]
-pub enum ShardSubcommand {
-    /// Show shard fill levels for all accounts
+pub enum BackendSubcommand {
+    /// Show fill levels for all backends (accounts + local disk)
     Status,
-    /// Rebalance objects/chunks from over-full accounts to under-utilized ones
+    /// Rebalance objects/chunks from over-full backends to under-utilized ones
     ///
-    /// Migrates data by downloading from the old account and uploading to the
-    /// least-full account. Each chunk or whole-file object is processed
+    /// Migrates data by downloading from the old backend and uploading to the
+    /// least-full backend. Each chunk or whole-file object is processed
     /// individually — crash-safe since old data isn't deleted until after
     /// the new copy is confirmed.
     Rebalance {
@@ -25,16 +25,16 @@ pub enum ShardSubcommand {
     },
 }
 
-pub async fn run(args: ShardArgs) -> Result<()> {
+pub async fn run(args: BackendArgs) -> Result<()> {
     let cfg_path = crate::config::find_config()?;
     let cfg = crate::config::load(&cfg_path)?;
     let meta = crate::storage::metadata::MetadataDb::open(&cfg.storage.meta_db_path)?;
     let engine = crate::storage::engine::StorageEngine::new(&cfg, meta)?;
 
     match args.command {
-        ShardSubcommand::Status => {
-            let statuses = engine.shard_status().await?;
-            println!("{:<30} {:<12} {:<10} {:<12} {:<12}", "Email", "Objects", "Parts", "Used", "Total");
+        BackendSubcommand::Status => {
+            let statuses = engine.backend_status().await?;
+            println!("{:<30} {:<12} {:<10} {:<12} {:<12}", "Backend", "Objects", "Parts", "Used", "Total");
             println!("{:-<30} {:-<12} {:-<10} {:-<12} {:-<12}", "", "", "", "", "");
             for s in &statuses {
                 let used_str = if s.used_bytes > 1_073_741_824 {
@@ -50,8 +50,8 @@ pub async fn run(args: ShardArgs) -> Result<()> {
                 println!("{:<30} {:<12} {:<10} {:<12} {:<12}", s.email, s.object_count, s.part_count, used_str, total_str);
             }
         }
-        ShardSubcommand::Rebalance { dry_run } => {
-            println!("Rebalancing object distribution across accounts...\n");
+        BackendSubcommand::Rebalance { dry_run } => {
+            println!("Rebalancing object distribution across backends...\n");
             let (migrated, bytes) = engine.rebalance(dry_run).await?;
             if migrated == 0 && !dry_run {
                 println!("✅ Already balanced — no objects needed migration.");

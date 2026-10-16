@@ -36,14 +36,14 @@ pub async fn run_status() -> Result<()> {
             println!("Accounts: {}", cfg.storage.accounts.len());
 
             if let Some(ref engine) = engine {
-                match engine.shard_status().await {
+                match engine.backend_status().await {
                     Ok(statuses) => {
                         for s in &statuses {
                             println!("  {}: {} objects, {}/{} used",
                                 s.email, s.object_count, s.used_bytes, s.total_bytes);
                         }
                     }
-                    Err(e) => println!("  Could not query shards: {}", e),
+                    Err(e) => println!("  Could not query backends: {}", e),
                 }
             }
         }

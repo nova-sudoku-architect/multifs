@@ -474,7 +474,7 @@ multifs bucket create|list|info|delete         Manage buckets
 multifs object cp|list|rm|info      Manage objects
 multifs folder set-cover|set-summary|set-gif|clear|backfill|list   Per-folder metadata
 multifs link [unlink|list-links]    Manage symlinks (tag folders)
-multifs shard status|rebalance      Show/rebalance account fill levels
+multifs backend status|rebalance    Show/rebalance backend fill levels
 multifs audit scan|list-files|reconcile|cleanup   Find/diff/delete orphaned files
 multifs import <email> <path> \      Register an existing pCloud file (metadata only)
     --bucket <b> [--key <k>]

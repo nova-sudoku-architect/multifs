@@ -66,7 +66,7 @@ version and atomically flips the "current version" pointer.
 | **`priority`** | Lower = more preferred. Cloud backends default `0`; local disk `1`. |
 | **Tier** | A group of backends at the same `priority`; tiers are filled in ascending order. |
 | **`fill_ratio`** | `used / quota` for a backend; drives "least-full wins" within a tier. |
-| **Shard** | Legacy CLI term for a backend in the pool — `multifs shard status` shows per-backend fill levels, `shard rebalance` moves data off over-full backends. The underlying concept is a *backend* (a pCloud account or local disk). |
+| **Shard** | Legacy alias for the `backend` subcommand — `multifs backend status` shows per-backend fill levels, `backend rebalance` moves data off over-full backends. The underlying concept is a *backend* (a pCloud account or local disk); `shard` is accepted as a compatibility alias. |
 | **ETag** | For a single-blob object, the **SHA-256 hex** of the blob (also stored as the checksum). For multipart objects, the S3 multipart ETag (MD5-of-part-MD5s `-N`). |
 | **Checksum** | Stored SHA-256 of the live content; `checksum rebuild|verify` detects in-place drift. |
 | **Charset** | Detected text encoding (BOM / UTF-8 validation) stored per version for correct serving. |
@@ -315,7 +315,7 @@ overflow tier.
 | **Content checksums** — SHA-256 stored per blob; `checksum rebuild\|verify` detects in-place drift | ✅ |
 | **`fsck` health check** — DB integrity + backend presence/size + optional checksum verify (and `--prune-missing`) | ✅ |
 | **Symlinks / tag folders** — present one folder under multiple paths without duplicating bytes | ✅ |
-| **CLI management** — accounts, buckets, objects, shards, folder metadata, audit | ✅ |
+| **CLI management** — accounts, buckets, objects, backends, folder metadata, audit | ✅ |
 | **Read-only web UI** — browser file navigator (GET-only: list buckets/objects, download) | ✅ |
 | **Web UI column sorting** — click any column header to sort list/preview/names + buckets (persisted) | ✅ |
 | **Web UI virtualization** — `content-visibility` skips off-screen cards; covers hydrate via `IntersectionObserver` (only visible thumbnails fetched) | ✅ |
@@ -501,9 +501,10 @@ multifs object rm <bucket>/<key>  Delete an object
 multifs object info <bucket>/<key>
                                   Show object metadata
 
-multifs shard status              Backend fill levels (objects + parts)
-multifs shard rebalance [--dry-run]
+multifs backend status             Fill levels for all backends (objects + parts)
+multifs backend rebalance [--dry-run]
                                   Move data over-full → under-full backends
+                                  (`shard` kept as a hidden-compatible alias)
 
 multifs folder set-cover <bucket> <prefix> <key>
                                   Set a folder's cover image

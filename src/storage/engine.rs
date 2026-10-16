@@ -26,7 +26,7 @@ pub struct ObjectInfo {
 }
 
 #[derive(Debug, Clone)]
-pub struct ShardStatus {
+pub struct BackendStatus {
     pub email: String,
     pub object_count: i64,
     pub part_count: i64,
@@ -1486,10 +1486,10 @@ impl StorageEngine {
     }
 
     // -----------------------------------------------------------------
-    //  Shard status
+    //  Backend status
     // -----------------------------------------------------------------
 
-    pub async fn shard_status(&self) -> anyhow::Result<Vec<ShardStatus>> {
+    pub async fn backend_status(&self) -> anyhow::Result<Vec<BackendStatus>> {
         let mut statuses = Vec::new();
         for handle in self.backends.iter() {
             let obj_count = self.meta.count_objects_for_account(&handle.label)?;
@@ -1497,7 +1497,7 @@ impl StorageEngine {
             let total_size = self.meta.account_total_size(&handle.label)?;
             let quota = handle.quota_gb as i64 * 1_073_741_824;
             if let Ok((used, total)) = handle.backend.check_quota().await {
-                statuses.push(ShardStatus {
+                statuses.push(BackendStatus {
                     email: handle.label.clone(),
                     object_count: obj_count,
                     part_count,
@@ -1505,7 +1505,7 @@ impl StorageEngine {
                     total_bytes: total,
                 });
             } else {
-                statuses.push(ShardStatus {
+                statuses.push(BackendStatus {
                     email: handle.label.clone(),
                     object_count: obj_count,
                     part_count,
@@ -1909,7 +1909,7 @@ impl StorageEngine {
     // -----------------------------------------------------------------
 
     pub async fn rebalance(&self, dry_run: bool) -> anyhow::Result<(u64, i64)> {
-        let statuses = self.shard_status().await?;
+        let statuses = self.backend_status().await?;
         if statuses.len() < 2 {
             anyhow::bail!("Need at least 2 backends to rebalance");
         }
