@@ -118,7 +118,7 @@ pub async fn run(args: ObjectArgs) -> Result<()> {
             println!("  ETag:         {}", object.etag);
             println!("  Last Modified: {}", object.last_modified);
             println!("  Content Type: {}", object.content_type.unwrap_or_default());
-            println!("  Shard:        {} ({})", object.account_email, object.remote_path);
+            println!("  Account:      {} ({})", object.account_email, object.remote_path);
         }
     }
 

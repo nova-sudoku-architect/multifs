@@ -2,6 +2,23 @@
 
 Rules for any AI agent (and human) working on this repo. Treat these as constraints, not suggestions.
 
+## Never commit deployment configs — non-negotiable
+
+**Deployment/instance configuration never goes in this repo.** A deployment config
+describes one specific host (real account emails, bind addresses, TLS domains,
+per-account quotas, local paths). It is environment-specific and often sensitive,
+so it must stay on the host that uses it (e.g. `/etc/multifs.toml`).
+
+- Do **not** add, restore, or commit a `config.deploy.toml` (or any real instance
+  config). It is git-ignored for a reason — leave it that way.
+- The only config artifact in the repo is [`config.example.toml`](config.example.toml):
+  a **generic, commented template** with placeholder values. It is a schema
+  reference, **not** a copy of any deployment.
+- You may consult a live config to understand the schema, then hand-write a
+  generic example from it. Do not paste it, real account names, quotas, IPs, or
+  domains into the repo.
+- Secrets are a separate rule (see [Secrets](#secrets)): env vars only.
+
 ## Keep docs in sync with code — non-negotiable
 
 Whenever you change code, update the docs in the **same commit** (or a follow-up commit before the change is considered done). A change that alters behavior, CLI, config, or data model without a matching doc update is **incomplete**.
@@ -12,14 +29,13 @@ Whenever you change code, update the docs in the **same commit** (or a follow-up
 |------|----------------|--------------------------|
 | `README.md` | Features table, CLI reference, config, GC section | features, CLI commands/flags, placement, vacuum/import behavior |
 | `docs/architecture.md` | Data model, MVCC read/write/delete paths, multipart, GC, placement, backend interface, known issues, **test count** | schema, engine logic, storage backends, known issues, `cargo test --lib` count |
-| `config.example.toml` | Annotated config schema | `src/config.rs` fields (add/remove/rename, defaults) |
-| `config.deploy.toml` | Deployed-config mirror | when the live `/etc/multifs.toml` changes |
+| `config.example.toml` | Annotated **generic** config template | `src/config.rs` fields (add/remove/rename, defaults) |
 
 ### Checklist before committing a behavior change
 
 - [ ] `README.md` features / CLI / config updated
 - [ ] `docs/architecture.md` updated — **including the test count**, which must match `cargo test --lib`
-- [ ] config examples updated if `src/config.rs` changed
+- [ ] config examples updated if `src/config.rs` changed (generic template only — no deployment values)
 - [ ] No stale claims (grep for removed features: `WebDAV`, `chunking`, `32 MB`, `erasure`, `page cache`)
 
 ### Rule of thumb

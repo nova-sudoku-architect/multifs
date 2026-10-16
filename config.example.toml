@@ -1,16 +1,21 @@
 # MultiFS Configuration — Example
 #
-# MultiFS aggregates multiple storage backends (pCloud, local disk) into a single
-# S3-compatible object storage endpoint.
+# Template for a MultiFS instance. Copy to /etc/multifs.toml (or pass with
+# `--config`) and edit for your environment.
+#
+# NOTE: this file is a *generic* template. Deployment-specific values (real
+# account emails, bind addresses, TLS domains, quotas) belong in your own
+# instance config on the host — do NOT commit those.
 
 [server]
-bind = "0.0.0.0"
+bind = "127.0.0.1"        # bind to a private/VPN interface; the S3 API has no auth
 s3_port = 9000
-nfs_port = 2049        # stub — NFS not implemented
+nfs_port = 2049           # stub — NFS is not implemented
 enable_s3 = true
 enable_nfs = false
 
-# Read-only web UI (browser file navigator; GET-only, no writes/deletes)
+# Read-only web UI (browser file navigator; GET-only — no writes/deletes).
+# Off by default; enable only on a trusted network.
 enable_web = false
 web_port = 9001
 
@@ -18,37 +23,45 @@ web_port = 9001
 enabled = false
 # cert_path = "/path/to/server.crt"
 # key_path  = "/path/to/server.key"
-# domain    = "example.com"
+# domain    = "files.example.com"
 
 [storage]
 meta_db_path = "/var/lib/multifs/meta.db"
-cache_path = "/var/cache/multifs"
-cache_size_mb = 5120
-cache_chunks = 10
-# "utilization" (tiered, default) or "round-robin"
-placement_strategy = "Utilization"   # or "RoundRobin"
+# "utilization" (default; tiered, least-full wins) or "round-robin"
+placement_strategy = "Utilization"
 
-# ---- pCloud account (cloud backends default to priority 0 = preferred) ----
-[[storage.accounts]]
-email = "nova-video-01@agentmail.to"
-backend_type = "pcloud"          # "pcloud" or "local"
-token_env = "PCLOUD_TOKEN_VIDEO_01"   # env var holding the OAuth token
-mount_prefix = "/multifs/01"
-quota_gb = 10
+# ---------------------------------------------------------------------------
+# Backends
+#
+# One [[storage.accounts]] block per backend. `backend_type` selects the
+# implementation ("pcloud" or "local"); cloud backends default to priority 0.
+# Secrets are NEVER written here — `token_env` names an environment variable
+# that holds the OAuth token.
+# ---------------------------------------------------------------------------
 
+# ---- pCloud account (cloud tier, priority 0 = preferred) ----
 [[storage.accounts]]
-email = "nova-video-02@agentmail.to"
+email = "account-01@example.com"          # label / account email
 backend_type = "pcloud"
-token_env = "PCLOUD_TOKEN_VIDEO_02"
-mount_prefix = "/multifs/02"
-quota_gb = 9
+token_env = "PCLOUD_TOKEN_ACCOUNT_01"      # env var holding the OAuth token
+mount_prefix = "/multifs/01"               # base path blobs are stored under
+quota_gb = 10                              # capacity used for placement math
 
-# ---- Local disk backend (priority 1 = last resort) ----
+# Add more cloud accounts by repeating the block (each with its own token_env
+# and a unique mount_prefix).
+# [[storage.accounts]]
+# email = "account-02@example.com"
+# backend_type = "pcloud"
+# token_env = "PCLOUD_TOKEN_ACCOUNT_02"
+# mount_prefix = "/multifs/02"
+# quota_gb = 10
+
+# ---- Local disk backend (overflow tier, priority 1 = last resort) ----
 # Writes only spill here when every cloud account is full.
 [[storage.accounts]]
 email = "local-disk"
 backend_type = "local"
 mount_prefix = "/multifs/local"
-path = "/var/lib/multifs/disk"   # required for backend_type = "local"
-quota_gb = 80
-priority = 1                     # lower = preferred; cloud defaults to 0
+path = "/var/lib/multifs/disk"             # required for backend_type = "local"
+quota_gb = 50
+priority = 1                               # lower = preferred; cloud defaults to 0

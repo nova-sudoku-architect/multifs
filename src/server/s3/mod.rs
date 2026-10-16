@@ -1190,11 +1190,11 @@ async fn get_object(
 
     use tokio_stream::wrappers::ReceiverStream;
 
-    // Range slicing is handled inside the engine for chunked files.
+    // Range slicing is handled inside the engine (multipart composites included).
     //
     // IMPORTANT: propagate stream errors to the client instead of silently
     // dropping them. Previously `.filter_map(|r| async move { r.ok() })`
-    // swallowed any Err emitted by the underlying pCloud/chunked read.
+    // swallowed any Err emitted by the underlying pCloud/multipart read.
     // The response already declared a full Content-Length, so a dropped Err
     // left the client with a 200 but a truncated/empty body — which rclone
     // surfaced as "empty response payload / EOF" / "Failed to calculate dst
