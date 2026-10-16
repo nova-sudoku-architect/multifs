@@ -162,6 +162,60 @@ pub fn group_objects_by_prefix<'a>(
     (prefixes, files)
 }
 
+/// Number of direct children (immediate files + immediate subfolders) for every
+/// child folder of `prefix`, derived in **one pass** over that folder's full
+/// listing.
+///
+/// `prefix` is the folder being listed (empty string for the bucket root, else
+/// with a trailing `/`); `keys` are the object keys returned for that listing
+/// (the same set fed to [`group_objects_by_prefix`]). The result is keyed by the
+/// child prefix in canonical form (trailing `/`). It is exact for a
+/// non-truncated listing and matches [`MetadataDb::count_children_batch`], but
+/// without the per-child folder query (O(children) → O(keys)).
+pub fn count_children_from_keys<'a, I>(
+    prefix: &str,
+    keys: I,
+) -> std::collections::HashMap<String, i64>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    use std::collections::{HashMap, HashSet};
+    let mut files: HashMap<String, i64> = HashMap::new();
+    // Distinct immediate subfolders seen under each child folder (for dedup).
+    let mut subfolders: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for k in keys {
+        // Rest of the key below the listed folder (skip a leading `prefix`).
+        let rest = k.strip_prefix(prefix).unwrap_or(k);
+        // First path segment below `prefix` = the child folder name.
+        let Some(j) = rest.find('/') else {
+            // A file directly under `prefix` — not a child of a child folder.
+            continue;
+        };
+        let child = format!("{}{}/", prefix, &rest[..j]);
+        let rest2 = &rest[j + 1..];
+        match rest2.find('/') {
+            // A file directly under `child`.
+            None => *files.entry(child).or_insert(0) += 1,
+            // A deeper key → its first segment below `child` is an immediate
+            // subfolder of `child` (dedup; only the first segment matters, so
+            // arbitrarily deep keys still count as one subfolder).
+            Some(j2) => {
+                subfolders
+                    .entry(child)
+                    .or_default()
+                    .insert(rest2[..j2].to_string());
+            }
+        }
+    }
+
+    let mut out = files;
+    for (child, subs) in subfolders {
+        *out.entry(child).or_insert(0) += subs.len() as i64;
+    }
+    out
+}
+
 /// Run all enabled protocol servers
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let meta = crate::storage::metadata::MetadataDb::open(&cfg.storage.meta_db_path)?;

@@ -141,19 +141,36 @@ async fn list_objects(
         }
     }
 
-    // Resolve per-folder metadata (cover/summary/gif) and child counts for all
-    // child folders in two batched queries total — not one round-trip each.
-    // (The old per-folder path was O(children) queries and dominated latency on
-    // wide folders.) Metadata is kept only where recorded AND the object still
-    // exists, so the UI degrades gracefully.
+    // Resolve per-folder metadata (cover/summary/gif) in one batched query, and
+    // derive child counts in-memory from the listing we already fetched — no
+    // per-child-folder query at all. Metadata is kept only where recorded AND
+    // the object still exists, so the UI degrades gracefully.
     let metas = state
         .engine
         .folder_meta_batch(&bucket, &prefixes)
         .unwrap_or_default();
-    let counts = state
-        .engine
-        .count_children_batch(&bucket, &prefixes)
-        .unwrap_or_default();
+    let list_prefix =
+        crate::storage::metadata::normalize_prefix(prefix.as_deref().unwrap_or(""));
+    let mut counts = crate::server::count_children_from_keys(
+        &list_prefix,
+        objects.iter().map(|o| o.key.as_str()),
+    );
+    // Symlinked (tag) folders are merged in from elsewhere and so are not in the
+    // listing — resolve just those via the batched query so their badge stays
+    // correct. Normally this set is empty (all real child folders come from the
+    // listing), so the O(children) query cost is avoided on the hot path.
+    {
+        let missing: Vec<String> = prefixes
+            .iter()
+            .map(|p| crate::storage::metadata::normalize_prefix(p))
+            .filter(|p| !counts.contains_key(p))
+            .collect();
+        if !missing.is_empty() {
+            if let Ok(extra) = state.engine.count_children_batch(&bucket, &missing) {
+                counts.extend(extra);
+            }
+        }
+    }
 
     let prefixes_json: Vec<serde_json::Value> = prefixes
         .into_iter()
