@@ -501,7 +501,7 @@ multifs fsck [--checksums] [--fix] [--prune-missing] [--apply]
 
 ## Test Coverage
 
-All 124 lib tests pass (`cargo test --lib`). Highlights:
+All 125 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_copy_object_roundtrip` / `test_s3_copy_object_overwrites_existing` —
   CopyObject stores a byte-for-byte copy (size + ETag), incl. overwrite (GH #2).
 - `test_s3_binary_put_streams_with_content_length` — binary PUT with a declared
@@ -516,6 +516,9 @@ All 124 lib tests pass (`cargo test --lib`). Highlights:
 - `test_streaming_range_download` — range slicing (inclusive start / exclusive end).
 - `test_abort_multipart_deletes_parts_from_all_backends` — abort reclaims parts
   scattered across backends (per-account delete, no cross-backend leak).
+- `test_list_objects_prefix_range_boundary` — the prefix filter's indexed range
+  scan `[p, prefix_succ(p))` selects exactly the keys under a folder and preserves
+  S3 string-prefix semantics (does not leak siblings like `dir10/` into `dir1/`).
 
 ---
 

@@ -1279,38 +1279,49 @@ impl MetadataDb {
         start_after: Option<&str>,
         max_keys: i64,
     ) -> anyhow::Result<Vec<ObjectRecord>> {
+        // An empty prefix means "the whole bucket" (branch 4 below).
+        let prefix = prefix.filter(|p| !p.is_empty());
         self.with_conn(|conn| {
             let (sql, param_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match (
                 prefix,
                 start_after,
             ) {
                 (Some(p), Some(sa)) => {
-                    let pattern = format!("{}%", p);
+                    // Range scan `[p, prefix_succ(p))` instead of `key LIKE 'p%'`.
+                    // SQLite cannot use the `(bucket_name, key)` index for a
+                    // case-insensitive `LIKE`, so the old form scanned the whole
+                    // bucket (O(bucket) per listing). The range uses the index
+                    // directly — same reasoning as the `count_*` helpers.
+                    let upper = prefix_succ(p)
+                        .expect("non-empty prefix always has a successor");
                     (
                         "SELECT v.key, v.size, v.etag, v.last_modified, v.content_type, \
                          v.account_email, v.remote_path, v.bucket_name, v.version, v.charset \
                          FROM files f JOIN versions v ON v.bucket_name = f.bucket_name AND v.key = f.key AND v.version = f.current_version \
-                         WHERE f.bucket_name = ?1 AND f.key LIKE ?2 AND f.key > ?3 \
-                         ORDER BY f.key LIMIT ?4",
+                         WHERE f.bucket_name = ?1 AND f.key >= ?2 AND f.key < ?3 AND f.key > ?4 \
+                         ORDER BY f.key LIMIT ?5",
                         vec![
                             Box::new(bucket.to_string()),
-                            Box::new(pattern),
+                            Box::new(p.to_string()),
+                            Box::new(upper),
                             Box::new(sa.to_string()),
                             Box::new(max_keys),
                         ],
                     )
                 }
                 (Some(p), None) => {
-                    let pattern = format!("{}%", p);
+                    let upper = prefix_succ(p)
+                        .expect("non-empty prefix always has a successor");
                     (
                         "SELECT v.key, v.size, v.etag, v.last_modified, v.content_type, \
                          v.account_email, v.remote_path, v.bucket_name, v.version, v.charset \
                          FROM files f JOIN versions v ON v.bucket_name = f.bucket_name AND v.key = f.key AND v.version = f.current_version \
-                         WHERE f.bucket_name = ?1 AND f.key LIKE ?2 \
-                         ORDER BY f.key LIMIT ?3",
+                         WHERE f.bucket_name = ?1 AND f.key >= ?2 AND f.key < ?3 \
+                         ORDER BY f.key LIMIT ?4",
                         vec![
                             Box::new(bucket.to_string()),
-                            Box::new(pattern),
+                            Box::new(p.to_string()),
+                            Box::new(upper),
                             Box::new(max_keys),
                         ],
                     )
