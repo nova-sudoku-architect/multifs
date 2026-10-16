@@ -53,6 +53,21 @@ pub struct BackendMetric {
     pub quota_bytes: i64,
 }
 
+/// Outcome of a multipart-coalesce attempt (see [`StorageEngine::coalesce_multipart`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoalesceOutcome {
+    /// The object is not a multipart composite — nothing to do.
+    NotMultipart,
+    /// Dry-run: the object *would* be coalesced (`bytes` = assembled size).
+    WouldCoalesce { bytes: i64 },
+    /// Coalesced: parts replaced by a single blob under a new version.
+    Coalesced {
+        old_version: i64,
+        new_version: i64,
+        bytes: i64,
+    },
+}
+
 impl BackendHandle {
     pub fn new(
         backend: Box<dyn StorageBackend>,
@@ -606,6 +621,121 @@ impl StorageEngine {
     /// Parse a multipart upload_id from a remote_path that carries the staged
     /// multipart marker `__mp__/multipart-<upload_id>/` (or `.../<upload_id>`).
     /// Returns Some(upload_id) if the path looks like a multipart composite.
+    /// Coalesce a completed multipart object into a single blob (copy-on-write).
+    ///
+    /// Reads the persisted parts, uploads the concatenation as ONE blob under a
+    /// fresh version, and commits it — which supersedes the multipart version.
+    /// The old part blobs + `multipart_parts` rows are then reclaimed by
+    /// `vacuum` after the grace period: a superseded version's `remote_path` is
+    /// the `__mp__/multipart-<id>` staging dir, so vacuum's existing multipart
+    /// branch deletes the parts per-account and drops the rows — no special
+    /// handling needed here. After coalesce, reads do a single backend fetch
+    /// instead of assembling N parts.
+    ///
+    /// The S3 multipart ETag is preserved on the new version so `HeadObject` /
+    /// `GetObject` clients see no change; the assembled bytes' SHA-256 is
+    /// recorded as the integrity checksum (multipart objects otherwise have none).
+    ///
+    /// No-op (`NotMultipart`) for single-blob objects. Crash-safe: the old parts
+    /// survive until the new version is committed, so a failure mid-coalesce
+    /// loses nothing (the staging blob is orphaned and swept by vacuum).
+    pub async fn coalesce_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        dry_run: bool,
+    ) -> anyhow::Result<CoalesceOutcome> {
+        let obj = self
+            .meta
+            .get_object(bucket, key)?
+            .ok_or_else(|| anyhow::anyhow!("Object not found: {}/{}", bucket, key))?;
+        let Some(upload_id) = Self::multipart_upload_id(&obj.remote_path) else {
+            return Ok(CoalesceOutcome::NotMultipart);
+        };
+
+        if dry_run {
+            return Ok(CoalesceOutcome::WouldCoalesce { bytes: obj.size });
+        }
+
+        // Assemble the parts into one buffer, then write it back as a single blob.
+        let data = self.get_multipart_object(bucket, key, &upload_id).await?;
+        let size = data.len() as i64;
+        if size != obj.size {
+            tracing::warn!(
+                "coalesce {}/{}: assembled {} bytes but metadata records {}",
+                bucket,
+                key,
+                size,
+                obj.size
+            );
+        }
+
+        let backends = &*self.backends;
+        if backends.is_empty() {
+            anyhow::bail!("No storage backends configured");
+        }
+        if self.placement == PlacementStrategy::Utilization {
+            let _ = self.refresh_quotas().await;
+        }
+        let idx = self.pick_backend().await?;
+        let backend = &backends[idx];
+
+        let (version, remote_path) = self
+            .meta
+            .reserve_version(bucket, key, &backend.label, &backend.mount_prefix)?;
+        let (remote_path_actual, _) = backend.backend.upload(&remote_path, &data).await?;
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+
+        // Preserve the multipart ETag; the object identity/ETag is unchanged for
+        // clients. The parts folder link is dropped (remote_path is now a plain
+        // blob), so the superseded multipart version becomes reclaimable.
+        self.meta.commit_version(
+            bucket,
+            key,
+            version,
+            size,
+            &obj.etag,
+            &now,
+            obj.content_type.as_deref(),
+            &remote_path_actual,
+        )?;
+        // The assembled bytes are now a single blob — record a SHA-256 checksum.
+        let checksum = hex::encode(Sha256::digest(&data));
+        self.meta.set_checksum(bucket, key, version, &checksum)?;
+        self.meta
+            .set_charset(bucket, key, version, obj.charset.as_deref())?;
+
+        Ok(CoalesceOutcome::Coalesced {
+            old_version: obj.version,
+            new_version: version,
+            bytes: size,
+        })
+    }
+
+    /// Coalesce every multipart composite object. Returns `(count, bytes)`.
+    /// With `dry_run`, counts what *would* be coalesced without changing anything.
+    pub async fn coalesce_all(&self, dry_run: bool) -> anyhow::Result<(u64, i64)> {
+        let objs = self.meta.list_multipart_composite_objects()?;
+        let mut count = 0u64;
+        let mut bytes = 0i64;
+        for (bucket, key) in objs {
+            match self.coalesce_multipart(&bucket, &key, dry_run).await {
+                Ok(CoalesceOutcome::Coalesced {
+                    bytes: b, ..
+                })
+                | Ok(CoalesceOutcome::WouldCoalesce { bytes: b }) => {
+                    count += 1;
+                    bytes += b;
+                }
+                Ok(CoalesceOutcome::NotMultipart) => {}
+                Err(e) => {
+                    tracing::warn!("coalesce {}/{} failed: {}", bucket, key, e);
+                }
+            }
+        }
+        Ok((count, bytes))
+    }
+
     fn multipart_upload_id(remote_path: &str) -> Option<String> {
         // Staged paths look like: /multifs/<acct>/<bucket>/__mp__/multipart-<id>/N
         // after complete we store the upload dir: /multifs/<acct>/<bucket>/__mp__/multipart-<id>

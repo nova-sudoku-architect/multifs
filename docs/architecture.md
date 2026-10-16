@@ -432,6 +432,25 @@ Each part is stored as one standalone blob under `{mount}/{bucket}/__mp__/{uploa
 - **Abort** (`DELETE /key?uploadId=X`) → deletes the staged part blobs and the
   `multipart_uploads` + `multipart_parts` rows. Idempotent; no-op on completed uploads.
 
+### Multipart coalesce (read optimization)
+
+A completed multipart object is normally read-assembled from its parts (N backend
+round-trips) and keeps its `multipart_parts` rows indefinitely. **Coalescing** rewrites
+the assembled bytes into a **single blob** under a new version:
+
+- **On demand:** `multifs object coalesce <bucket>/<key>` or `--all` (with `--dry-run`).
+- **Background:** `storage.auto_coalesce_multipart = true` — the 10-minute maintenance loop
+  coalesces after each vacuum.
+
+`coalesce_multipart` reads the parts, uploads the concatenation via `reserve_version` +
+`commit_version` (copy-on-write), and preserves the **S3 multipart ETag** on the new version
+so `HeadObject`/`GetObject` clients see no change; the assembled bytes get a SHA-256
+checksum (multipart objects otherwise have none). The superseded multipart version's
+`remote_path` is the `__mp__/multipart-<id>` staging dir, so `vacuum`'s existing multipart
+branch reclaims the old part blobs (per-account) and drops the part rows — no special
+handling. No-op for single-blob objects; crash-safe (old parts survive until the new
+version commits). After coalescing, reads are a single backend fetch.
+
 ---
 
 ## How a Backend Works (Protocol)
@@ -598,7 +617,7 @@ multifs fsck [--checksums] [--fix] [--prune-missing] [--apply]
 
 ## Test Coverage
 
-All 137 lib tests pass (`cargo test --lib`). Highlights:
+All 141 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_copy_object_roundtrip` / `test_s3_copy_object_overwrites_existing` —
   CopyObject stores a byte-for-byte copy (size + ETag), incl. overwrite (GH #2).
 - `test_s3_binary_put_streams_with_content_length` — binary PUT with a declared
@@ -625,6 +644,13 @@ All 137 lib tests pass (`cargo test --lib`). Highlights:
   list/`*`) and RFC-3339→HTTP-date conversion for `/api/download` revalidation.
 - `test_is_valid_thumb_size` / `test_urlencoding` — `/api/thumb` size validation
   (16..=4096) and the redirect Location encoder.
+- `test_coalesce_multipart_object_preserves_bytes_and_etag` — coalescing a multipart
+  object yields a single-blob version with identical bytes and the multipart ETag kept.
+- `test_coalesce_dry_run_and_single_blob_are_noops` — dry-run reports without
+  changing anything; single-blob objects report `NotMultipart`.
+- `test_coalesce_all_reports_and_coalesces_multipart_objects` — pool-wide sweep.
+- `test_coalesce_then_vacuum_reclaims_parts` — the superseded multipart version is
+  reclaimed by vacuum and its part rows disappear.
 - `test_metrics_exposition_renders_counters_and_gauges` — `/metrics` renders the
   Prometheus text format (counters, gauges, `# TYPE`/`# HELP` lines).
 - `test_readyz_ok_with_backend_and_db` / `test_readyz_503_without_backends` /
