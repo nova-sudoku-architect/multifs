@@ -33,7 +33,8 @@ Whenever you change code, update the docs in the **same commit** (or a follow-up
 
 ### Checklist before committing a behavior change
 
-- [ ] `README.md` features / CLI / config updated
+- [ ] `README.md` features / CLI / config updated — and, before any PR merges, the
+      [README review gate](#readme-review-gate--mandatory-on-every-pr) is satisfied
 - [ ] `docs/architecture.md` updated — **including the test count**, which must match `cargo test --lib`
 - [ ] config examples updated if `src/config.rs` changed (generic template only — no deployment values)
 - [ ] No stale claims (grep for removed features: `WebDAV`, `chunking`, `32 MB`, `erasure`, `page cache`)
@@ -66,18 +67,54 @@ Open an issue describing the enhancement **before** implementing. It must captur
 1. Branch off `main`: `feat/…`, `perf/…`, `refactor/…`, `fix/…`, or `docs/…` (one
    branch per issue).
 2. Commit with a conventional-commit message; keep docs in sync (above).
-3. Open a PR that links the issue (`Closes #N` where it completes it). The PR body
+3. **Review the README for alignment** — mandatory, on every PR (see
+   [README review gate](#readme-review-gate--mandatory-on-every-pr)). Read the
+   README top-to-bottom against your change and fix anything it now contradicts.
+4. Open a PR that links the issue (`Closes #N` where it completes it). The PR body
    must state:
    - **what changed and why**,
    - **what was evaluated** — alternatives considered and why rejected (design,
      perf, security trade-offs),
    - **verification evidence** — `cargo test --lib` count, `cargo clippy`,
      and any manual/live check,
+   - **README review** — the explicit statement required by the gate below
+     (reviewed ✅ + what changed, or N/A + why the README needs no change),
    - **docs updated** + any CLI / config / data-model impact.
    - For security-sensitive work (auth, quotas, exposure), document the threat
      model and the safe-default decision.
-4. Merge (`--no-ff` merge or squash) keeping the issue reference so history is
-   traceable, then delete the branch.
+5. Merge (`--no-ff` merge or squash) keeping the issue reference so history is
+   traceable, then delete the branch. **A PR is not ready to merge until the
+   README review gate is satisfied.**
+
+### README review gate — mandatory on every PR
+
+`README.md` is the front door: the features table, CLI reference, config example,
+and architecture prose. A change that alters behavior, the CLI, config, the data
+model, performance characteristics, or the deployment surface can silently
+contradict it. **Every PR must explicitly review the README and confirm
+alignment — no exceptions.**
+
+Before requesting merge, walk the README against the diff and confirm each of:
+
+- [ ] **Features table** — any new/removed/changed capability is reflected (status
+      row added, reworded, or removed).
+- [ ] **CLI reference** — every added/changed/removed command, subcommand, flag,
+      or alias appears, with accurate usage.
+- [ ] **Config example / reference** — any config field added/renamed/removed is
+      reflected in `config.example.toml` **and** the README config section.
+- [ ] **Diagrams & prose** — sequence/flow diagrams still match the code; no stale
+      claims about removed features (`WebDAV`, `chunking`, `32 MB`, `erasure`,
+      `page cache`, `shard`, …).
+- [ ] **Numbers** — any quoted count/number (accounts, test count, ports, limits)
+      is still correct.
+
+The PR body must contain a **README review** line, one of:
+
+- `README reviewed — updated: <what changed>` , or
+- `README reviewed — no change needed: <why it stays accurate>` .
+
+If the README genuinely needs no change, say so explicitly (and why) — an absent
+README mention is a blocking gap, not an implicit "N/A".
 
 **Exempt:** pure typo/comment fixes and doc-only nits may go straight to `main`.
 When in doubt, open an issue.
