@@ -33,6 +33,7 @@ pub fn build_router(engine: Arc<StorageEngine>) -> Router {
         .route("/", get(index))
         .route("/api/buckets", get(list_buckets))
         .route("/api/list", get(list_objects))
+        .route("/api/siblings", get(list_siblings))
         .route("/api/download", get(download))
         .with_state(state)
 }
@@ -231,6 +232,24 @@ async fn list_objects(
         "folder": folder_json,
         "truncated": truncated,
     }))
+}
+
+/// Lightweight: immediate child folders under `prefix` (names only), for the
+/// prev/next sibling nav. Replaces the UI's previous second full `/api/list` on
+/// the parent folder.
+async fn list_siblings(
+    State(state): State<WebState>,
+    Query(q): Query<ListQuery>,
+) -> Response {
+    let bucket = match q.bucket {
+        Some(b) if !b.is_empty() => b,
+        _ => return json_error(StatusCode::BAD_REQUEST, "missing 'bucket' parameter"),
+    };
+    let prefix = crate::storage::metadata::normalize_prefix(q.prefix.as_deref().unwrap_or(""));
+    match state.engine.list_child_prefixes(&bucket, &prefix) {
+        Ok(prefixes) => json_response(json!({ "bucket": bucket, "prefix": prefix, "prefixes": prefixes })),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }
 
 #[derive(Deserialize)]

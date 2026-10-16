@@ -501,7 +501,7 @@ multifs fsck [--checksums] [--fix] [--prune-missing] [--apply]
 
 ## Test Coverage
 
-All 127 lib tests pass (`cargo test --lib`). Highlights:
+All 128 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_copy_object_roundtrip` / `test_s3_copy_object_overwrites_existing` —
   CopyObject stores a byte-for-byte copy (size + ETag), incl. overwrite (GH #2).
 - `test_s3_binary_put_streams_with_content_length` — binary PUT with a declared
@@ -522,6 +522,8 @@ All 127 lib tests pass (`cargo test --lib`). Highlights:
 - `test_count_children_from_keys_*` — the in-memory child-count derivation
   agrees with the batched/per-prefix DB scan (folders collapse to their
   immediate subfolder; deep keys count once).
+- `test_list_child_prefixes` — immediate child folders only (sorted, canonical),
+  excluding files and deeper descendants; powers `/api/siblings`.
 
 ---
 

@@ -2365,6 +2365,42 @@ impl MetadataDb {
         Ok(out)
     }
 
+    /// Immediate child folder prefixes directly under `prefix` (canonical form,
+    /// trailing `/`), in sorted order. One indexed range scan over
+    /// `[prefix, prefix_succ(prefix))` plus a DISTINCT on the first path segment
+    /// — no full listing, no per-child query. Powers the web UI's prev/next
+    /// sibling navigation without re-fetching the parent folder's whole listing.
+    pub fn list_child_prefixes(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let p = normalize_prefix(prefix);
+        let skip = (p.len() + 1) as i64; // 1-indexed substr start past the prefix
+        self.with_conn(|conn| {
+            let sql = "SELECT DISTINCT substr(key, ?2, instr(substr(key, ?2), '/') - 1) \
+                       FROM files \
+                       WHERE bucket_name = ?1 AND key >= ?3 AND key < ?4 \
+                         AND instr(substr(key, ?2), '/') > 0 \
+                       ORDER BY 1";
+            let mut stmt = conn.prepare(sql)?;
+            let upper = prefix_succ(&p);
+            // Root prefix has no successor: use an unbounded upper term.
+            let (lo, hi) = match &upper {
+                Some(u) => (p.clone(), u.clone()),
+                None => (p.clone(), "\u{10FFFF}".to_string()),
+            };
+            let rows = stmt.query_map(params![bucket, skip, lo, hi], |r| {
+                r.get::<_, String>(0)
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(format!("{}{}/", p, row?));
+            }
+            Ok(out)
+        })
+    }
+
     /// Resolve a link path or a path under a link. Returns
     /// `Some((target_bucket, target_key, remainder))` where `remainder` is the
     /// portion of `key_or_prefix` beyond the matched symlink key (empty for an
