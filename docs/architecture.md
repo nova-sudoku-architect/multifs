@@ -647,7 +647,7 @@ multifs fsck [--checksums] [--fix] [--prune-missing] [--apply]
 
 ## Test Coverage
 
-All 150 lib tests pass (`cargo test --lib`). Highlights:
+All 157 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_copy_object_roundtrip` / `test_s3_copy_object_overwrites_existing` —
   CopyObject stores a byte-for-byte copy (size + ETag), incl. overwrite (GH #2).
 - `test_s3_binary_put_streams_with_content_length` — binary PUT with a declared
@@ -689,6 +689,12 @@ All 150 lib tests pass (`cargo test --lib`). Highlights:
   `test_verify_rejects_skewed_date` — rejection paths.
 - `test_access_keys_parse` / `test_auth_mode_from_config` / `test_canonical_query_sorts` —
   key parsing, mode selection, and canonical query ordering.
+- `test_set_scalar_keys` / `test_set_rejects_bad_values` / `test_get_scalar_keys` — the
+  `config set/get` allow-list, validation, and rejection of unknown/non-scalar keys.
+- `test_save_atomic_roundtrip_and_backup` — atomic config write round-trips and keeps a `.bak`.
+- `test_upsert_env_file_preserves_and_updates` / `test_upsert_env_file_creates_missing` —
+  env-file token storage (0600, preserve other lines, no duplicate keys).
+- `test_get_access_keys_redacted` — `config get server.access_keys` never leaks key material.
 - `test_metrics_exposition_renders_counters_and_gauges` — `/metrics` renders the
   Prometheus text format (counters, gauges, `# TYPE`/`# HELP` lines).
 - `test_readyz_ok_with_backend_and_db` / `test_readyz_503_without_backends` /

@@ -70,9 +70,17 @@ they live in `/etc/multifs.env` (sourced by systemd) / `~/.openclaw/.env`.
 
 To add a pCloud account:
 
-1. Get an OAuth token: `multifs account add <email>` (or the manual OAuth flow).
-2. Add an `[[storage.accounts]]` block to the config.
+1. Get an OAuth token (via the pCloud OAuth flow) and export it, then run
+   `multifs account add <email> --token-env PCLOUD_TOKEN_X` (or
+   `--token-stdin` to pipe it). The token **value** is written to the env file
+   (`/etc/multifs.env`, mode `0600`); only its `token_env` **name** goes in the
+   config. Tokens are never passed as plain arguments (no shell-history leak).
+2. That command also appends the `[[storage.accounts]]` block to the config.
 3. Restart: `sudo systemctl restart multifs.service`.
+
+To rotate a token later: `multifs account update-token <email> --token-env VAR`
+(validates against pCloud unless `--no-verify`). Non-secret fields:
+`multifs account set <email> --quota-gb N --priority P --mount-prefix /p`.
 
 ### S3 authentication (SigV4)
 

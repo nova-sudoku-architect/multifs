@@ -12,12 +12,24 @@ pub struct AccountArgs {
 pub enum AccountSubcommand {
     /// List configured pCloud accounts
     List,
-    /// Add a new pCloud account with email and OAuth token. Validates token, auto-detects quota, and saves to config.
+    /// Add a new pCloud account (validates the token, auto-detects quota)
+    ///
+    /// The token is read from `--token-env <VAR>`, from the environment, or from
+    /// stdin (prompted) — never from a positional argument, so it doesn't leak
+    /// into shell history or the process list. The token value is written to the
+    /// env file (mode 0600); only its `token_env` **name** goes in the config.
     Add {
         /// Email of the pCloud account
         email: String,
-        /// OAuth access token (get from pCloud OAuth app)
-        token: String,
+        /// Read the token from this environment variable
+        #[arg(long)]
+        token_env: Option<String>,
+        /// Read the token from non-interactive stdin (`-` for a pipe)
+        #[arg(long)]
+        token_stdin: bool,
+        /// Env file to store the token in (default: /etc/multifs.env)
+        #[arg(long)]
+        env_file: Option<String>,
     },
     /// Remove an account from rotation
     Remove {
@@ -29,10 +41,41 @@ pub enum AccountSubcommand {
         /// Email of the pCloud account
         email: String,
     },
-    /// Refresh OAuth token for an account
+    /// Refresh OAuth token for an account (OAuth flow)
     Refresh {
         /// Email of the pCloud account
         email: String,
+    },
+    /// Rotate an account's OAuth token (from env/stdin) and optionally verify it
+    UpdateToken {
+        /// Email of the pCloud account
+        email: String,
+        /// Read the token from this environment variable
+        #[arg(long)]
+        token_env: Option<String>,
+        /// Read the token from non-interactive stdin
+        #[arg(long)]
+        token_stdin: bool,
+        /// Env file to store the token in (default: /etc/multifs.env)
+        #[arg(long)]
+        env_file: Option<String>,
+        /// Skip the pCloud API validation of the new token
+        #[arg(long)]
+        no_verify: bool,
+    },
+    /// Update non-secret fields of an existing account
+    Set {
+        /// Email of the pCloud account
+        email: String,
+        /// Quota in GB
+        #[arg(long)]
+        quota_gb: Option<u64>,
+        /// Placement priority (lower = preferred)
+        #[arg(long)]
+        priority: Option<u32>,
+        /// Mount prefix (e.g. /multifs/07)
+        #[arg(long)]
+        mount_prefix: Option<String>,
     },
 }
 
@@ -46,10 +89,66 @@ pub fn token_env_name(email: &str) -> String {
     format!("PCLOUD_TOKEN_{}", suffix)
 }
 
+/// Default env file that holds token values on the host.
+pub fn default_env_file() -> String {
+    "/etc/multifs.env".to_string()
+}
+
 /// Generate a mount prefix for the n-th account.
 /// Example: index 0 → "/multifs/00", index 5 → "/multifs/05"
 pub fn mount_prefix_for_index(index: usize) -> String {
     format!("/multifs/{:02}", index)
+}
+
+/// Resolve a token from `--token-env VAR` or `--token-stdin` (or prompt).
+/// Returns `None` only when the user aborted an interactive prompt.
+fn read_token(token_env: &Option<String>, token_stdin: bool) -> Result<Option<String>> {
+    if let Some(var) = token_env {
+        let v = std::env::var(var)
+            .map_err(|_| anyhow::anyhow!("environment variable {} is not set", var))?;
+        return Ok(Some(v.trim().to_string()));
+    }
+    if token_stdin {
+        use std::io::Read;
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        let t = s.trim().to_string();
+        if t.is_empty() {
+            anyhow::bail!("no token on stdin");
+        }
+        return Ok(Some(t));
+    }
+    // Interactive prompt (best-effort; falls back to error if no TTY).
+    use std::io::Write;
+    eprint!("OAuth token (input hidden where supported): ");
+    let _ = std::io::stderr().flush();
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s)?;
+    let t = s.trim().to_string();
+    if t.is_empty() {
+        anyhow::bail!("no token provided");
+    }
+    Ok(Some(t))
+}
+
+/// Validate a token against pCloud and return (quota_gb, used_gb).
+async fn validate_token(email: &str, token: &str) -> Result<(Option<u64>, f64)> {
+    let client = reqwest::Client::new();
+    let url = format!("https://eapi.pcloud.com/userinfo?access_token={}", token);
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("token validation failed (HTTP {}). Check the token.", resp.status());
+    }
+    let info: serde_json::Value = resp.json().await?;
+    if info.get("result").and_then(|v| v.as_i64()) != Some(0) {
+        let error = info.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+        anyhow::bail!("invalid token for {}: pCloud API error: {}", email, error);
+    }
+    let quota_gb = info["quota"]
+        .as_i64()
+        .map(|q| (q as f64 / 1_073_741_824.0).ceil() as u64);
+    let used_gb = info["usedquota"].as_i64().unwrap_or(0) as f64 / 1_073_741_824.0;
+    Ok((quota_gb, used_gb))
 }
 
 pub async fn run(args: AccountArgs) -> Result<()> {
@@ -59,7 +158,7 @@ pub async fn run(args: AccountArgs) -> Result<()> {
             let cfg = crate::config::load(&cfg_path)?;
             if cfg.storage.accounts.is_empty() {
                 println!("No accounts configured.");
-                println!("Add one: multifs account add <email> <token>");
+                println!("Add one: multifs account add <email> --token-env VAR");
                 return Ok(());
             }
             println!("{:<30} {:<10} {:<20} {:<15}", "Email", "Quota", "Mount Prefix", "Token Env");
@@ -74,32 +173,16 @@ pub async fn run(args: AccountArgs) -> Result<()> {
             }
         }
 
-        AccountSubcommand::Add { email, token } => {
+        AccountSubcommand::Add { email, token_env, token_stdin, env_file } => {
             println!("============================================");
             println!("  Adding pCloud account: {}", email);
             println!("============================================");
             println!();
 
-            // 1. Validate token by checking quota via pCloud API
-            let client = reqwest::Client::new();
-            let quota_url = format!("https://eapi.pcloud.com/userinfo?access_token={}", token);
-            let resp = client.get(&quota_url).send().await?;
-            if !resp.status().is_success() {
-                anyhow::bail!("Token validation failed (HTTP {}). Check your token.", resp.status());
-            }
-            let info: serde_json::Value = resp.json().await?;
-            if info.get("result").and_then(|v| v.as_i64()) != Some(0) {
-                let error = info.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
-                anyhow::bail!("Invalid token: pCloud API error: {}", error);
-            }
-
-            let quota_gb = info["quota"]
-                .as_i64()
-                .map(|q| (q as f64 / 1_073_741_824.0).ceil() as u64);
-
-            let used = info["usedquota"].as_i64().unwrap_or(0);
-            let used_gb = used as f64 / 1_073_741_824.0;
-
+            // 1. Read the token (env / stdin — never argv) and validate it.
+            let token = read_token(&token_env, token_stdin)?
+                .ok_or_else(|| anyhow::anyhow!("no token provided"))?;
+            let (quota_gb, used_gb) = validate_token(&email, &token).await?;
             match quota_gb {
                 Some(q) => println!("✅ Token valid — Quota: {} GB ({:.1} GB used)", q, used_gb),
                 None => println!("✅ Token valid — Used: {:.1} GB", used_gb),
@@ -115,13 +198,13 @@ pub async fn run(args: AccountArgs) -> Result<()> {
             let mount_prefix = mount_prefix_for_index(existing_count);
 
             // 3. Generate token env name
-            let token_env = token_env_name(&email);
+            let token_env_name_str = token_env_name(&email);
 
             println!("Mount prefix: {}", mount_prefix);
-            println!("Token env:    {}", token_env);
+            println!("Token env:    {}", token_env_name_str);
             println!();
 
-            // 4. Add to config
+            // 4. Add to config (atomic write; secret only goes to the env file).
             let mut cfg = crate::config::load(&cfg_path)?;
 
             if cfg.storage.accounts.iter().any(|a| a.email == email) {
@@ -131,7 +214,7 @@ pub async fn run(args: AccountArgs) -> Result<()> {
             let new_account = crate::config::AccountConfig {
                 email: email.clone(),
                 backend_type: Some("pcloud".to_string()),
-                token_env: Some(token_env.clone()),
+                token_env: Some(token_env_name_str.clone()),
                 mount_prefix,
                 quota_gb,
                 path: None,
@@ -140,14 +223,14 @@ pub async fn run(args: AccountArgs) -> Result<()> {
             };
 
             cfg.storage.accounts.push(new_account);
-            crate::config::save(&cfg_path, &cfg)?;
+            crate::config::save_atomic(&cfg_path, &cfg)?;
 
-            // 5. Print instructions
+            // 5. Store the secret in the env file (0600), never in the config.
+            let env_path = env_file.unwrap_or_else(default_env_file);
+            crate::config::upsert_env_file(&env_path, &token_env_name_str, &token)?;
+
             println!("✅ Account added to config: {}", cfg_path);
-            println!();
-            println!("📝 Add this line to your ~/.openclaw/.env file:");
-            println!();
-            println!("   {}={}", token_env, token);
+            println!("✅ Token written to env file: {} (mode 0600)", env_path);
             println!();
             println!("Then restart MultiFS:");
             println!();
@@ -205,12 +288,75 @@ pub async fn run(args: AccountArgs) -> Result<()> {
 
             let new_token = crate::storage::pcloud::auth::run_oauth_flow(&email).await?;
 
-            let token_env = token_env_name(&email);
+            let token_env_name_str = token_env_name(&email);
+            let env_path = default_env_file();
+            crate::config::upsert_env_file(&env_path, &token_env_name_str, &new_token)?;
 
-            println!("✅ Token refreshed for {}.", email);
-            println!();
-            println!("📝 Update ~/.openclaw/.env:");
-            println!("   {}={}", token_env, new_token);
+            println!("✅ Token refreshed for {} and written to {}", email, env_path);
+            println!("   (mode 0600; value not printed)");
+        }
+
+        AccountSubcommand::UpdateToken {
+            email,
+            token_env,
+            token_stdin,
+            env_file,
+            no_verify,
+        } => {
+            let cfg_path = crate::config::find_config()?;
+            let cfg = crate::config::load(&cfg_path)?;
+            let token_env_name_str = cfg
+                .storage
+                .accounts
+                .iter()
+                .find(|a| a.email == email)
+                .and_then(|a| a.token_env.clone())
+                .unwrap_or_else(|| token_env_name(&email));
+
+            let token = read_token(&token_env, token_stdin)?
+                .ok_or_else(|| anyhow::anyhow!("no token provided"))?;
+
+            if !no_verify {
+                let (quota_gb, used_gb) = validate_token(&email, &token).await?;
+                match quota_gb {
+                    Some(q) => println!("✅ Token valid — Quota: {} GB ({:.1} GB used)", q, used_gb),
+                    None => println!("✅ Token valid — Used: {:.1} GB", used_gb),
+                }
+            }
+
+            let env_path = env_file.unwrap_or_else(default_env_file);
+            crate::config::upsert_env_file(&env_path, &token_env_name_str, &token)?;
+            println!("✅ Token for {} written to {} as {} (mode 0600)", email, env_path, token_env_name_str);
+        }
+
+        AccountSubcommand::Set { email, quota_gb, priority, mount_prefix } => {
+            let cfg_path = crate::config::find_config()?;
+            let mut cfg = crate::config::load(&cfg_path)?;
+            let acct = cfg
+                .storage
+                .accounts
+                .iter_mut()
+                .find(|a| a.email == email)
+                .ok_or_else(|| anyhow::anyhow!("Account not found: {}", email))?;
+            let mut changed = Vec::new();
+            if let Some(q) = quota_gb {
+                acct.quota_gb = Some(q);
+                changed.push(format!("quota_gb={}", q));
+            }
+            if let Some(p) = priority {
+                acct.priority = Some(p);
+                changed.push(format!("priority={}", p));
+            }
+            if let Some(m) = mount_prefix {
+                acct.mount_prefix = m.clone();
+                changed.push(format!("mount_prefix={}", m));
+            }
+            if changed.is_empty() {
+                println!("Nothing to change. Pass --quota-gb / --priority / --mount-prefix.");
+                return Ok(());
+            }
+            crate::config::save_atomic(&cfg_path, &cfg)?;
+            println!("✅ Updated {}: {}", email, changed.join(", "));
         }
     }
     Ok(())
