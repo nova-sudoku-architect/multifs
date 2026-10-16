@@ -74,6 +74,13 @@ pub struct ServerConfig {
     /// Metrics/health port (Prometheus scrape target)
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
+    /// S3 SigV4 access keys as `ACCESS_KEY_ID:SECRET,AK2:SK2`. When non-empty,
+    /// every S3 request must be signed with one of these keys (SignatureDoesNotMatch
+    /// / AccessDenied on failure). When empty, the endpoint is **unauthenticated**
+    /// (local/dev only) and a startup warning is emitted. Secrets belong in env vars,
+    /// not the config file — set this from an env (e.g. `MULTIFS_ACCESS_KEYS`).
+    #[serde(default)]
+    pub access_keys: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -171,6 +178,7 @@ impl Default for ServerConfig {
             web_port: default_web_port(),
             enable_metrics: false,
             metrics_port: default_metrics_port(),
+            access_keys: String::new(),
         }
     }
 }

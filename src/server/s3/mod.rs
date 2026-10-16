@@ -6,6 +6,7 @@ use axum::{
     body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
+    middleware,
     response::{IntoResponse, Response},
     routing::get, Router,
 };
@@ -15,6 +16,9 @@ use serde::Deserialize;
 use tower_http::cors::CorsLayer;
 
 use crate::storage::engine::StorageEngine;
+
+pub mod auth;
+use auth::AuthMode;
 
 /// Shared application state
 #[derive(Clone)]
@@ -38,8 +42,16 @@ fn parse_query(query_str: &str) -> std::collections::HashMap<String, String> {
     out
 }
 
-/// Build the S3-compatible router
+/// Build the S3-compatible router (unauthenticated). Used by tests and as the
+/// default; the server uses [`build_router_with_auth`].
+#[allow(dead_code)] // used by handler_tests (cfg(test)); bin target uses build_router_with_auth
 pub fn build_router(engine: Arc<StorageEngine>) -> Router {
+    build_router_with_auth(engine, AuthMode::Disabled)
+}
+
+/// Build the S3 router with an explicit auth mode. When `auth` is
+/// [`AuthMode::SigV4`], every request must carry a valid SigV4 signature.
+pub fn build_router_with_auth(engine: Arc<StorageEngine>, auth: AuthMode) -> Router {
     let state = S3State {
         engine,
     };
@@ -53,6 +65,7 @@ pub fn build_router(engine: Arc<StorageEngine>) -> Router {
         .route("/{bucket}/{*key}", get(get_object).head(head_object).put(put_object).post(put_object).delete(delete_object))
         .layer(CorsLayer::permissive())
         .layer(DefaultBodyLimit::max(2_147_483_648))
+        .layer(middleware::from_fn_with_state(auth, auth::require_sigv4))
         .with_state(state)
 }
 

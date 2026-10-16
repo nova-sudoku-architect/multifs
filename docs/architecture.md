@@ -416,6 +416,36 @@ leaking bytes.
 
 ---
 
+## S3 Request Authentication (SigV4)
+
+Optional AWS Signature Version 4 verification, off by default. Configured via
+`server.access_keys` (`"AKID:SECRET[,AKID2:SECRET2]"`); empty → the endpoint is
+unauthenticated and the daemon logs a startup warning. Enforced by the
+`auth::require_sigv4` axum middleware layered on the S3 router (a pass-through when
+disabled).
+
+Verification (`server/s3/auth.rs`) mirrors the AWS algorithm:
+
+1. Parse `Authorization: AWS4-HMAC-SHA256 Credential=AKID/date/region/s3/aws4_request,
+   SignedHeaders=…, Signature=…`.
+2. Resolve the secret by access-key id (unknown → `403 AccessDenied`).
+3. Rebuild the **canonical request** from the actual method/URI/query + only the
+   signed headers, using `x-amz-content-sha256` as the payload hash.
+4. Derive `kSigning = HMAC(HMAC(HMAC(HMAC("AWS4"+secret, date), region), "s3"),
+   "aws4_request")` and recompute the signature; **constant-time** compare
+   (`SignatureDoesNotMatch` on mismatch).
+5. Reject `x-amz-date` outside a **15-minute** skew window (`RequestTimeTooSkewed`).
+
+Dependency-light: `hmac` + the existing `sha2`/`hex` — no AWS SDK. Covered by the
+**official AWS SigV4 test-suite `get-vanilla` vector** plus sign→verify round-trips
+(tampered signature, unknown key, skewed date, query-string requests).
+
+> Scope: **header**-based SigV4 only. Presigned query URLs and STS temporary
+> credentials are not yet supported. Per-key policies/quotas/multi-tenancy are a
+> later stage (issue #6) — any valid key currently reaches every bucket.
+
+---
+
 ## S3 Multipart Upload
 
 Each part is stored as one standalone blob under `{mount}/{bucket}/__mp__/{upload_id}/{part_number}`.
@@ -617,7 +647,7 @@ multifs fsck [--checksums] [--fix] [--prune-missing] [--apply]
 
 ## Test Coverage
 
-All 141 lib tests pass (`cargo test --lib`). Highlights:
+All 150 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_copy_object_roundtrip` / `test_s3_copy_object_overwrites_existing` —
   CopyObject stores a byte-for-byte copy (size + ETag), incl. overwrite (GH #2).
 - `test_s3_binary_put_streams_with_content_length` — binary PUT with a declared
@@ -651,6 +681,14 @@ All 141 lib tests pass (`cargo test --lib`). Highlights:
 - `test_coalesce_all_reports_and_coalesces_multipart_objects` — pool-wide sweep.
 - `test_coalesce_then_vacuum_reclaims_parts` — the superseded multipart version is
   reclaimed by vacuum and its part rows disappear.
+- `test_official_get_vanilla_vector` — the SigV4 signing-key derivation reproduces the
+  official AWS test-suite `get-vanilla` signature.
+- `test_verify_accepts_well_formed_request` / `test_verify_roundtrip_with_query` —
+  self-signed requests verify; a tampered query fails.
+- `test_verify_rejects_tampered_signature` / `test_verify_rejects_unknown_key` /
+  `test_verify_rejects_skewed_date` — rejection paths.
+- `test_access_keys_parse` / `test_auth_mode_from_config` / `test_canonical_query_sorts` —
+  key parsing, mode selection, and canonical query ordering.
 - `test_metrics_exposition_renders_counters_and_gauges` — `/metrics` renders the
   Prometheus text format (counters, gauges, `# TYPE`/`# HELP` lines).
 - `test_readyz_ok_with_backend_and_db` / `test_readyz_503_without_backends` /

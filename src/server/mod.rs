@@ -234,6 +234,18 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // In-process observability counters (served on `/metrics` when enabled).
     let metrics = metrics::AppMetrics::new();
 
+    // S3 request authentication (SigV4). Empty config → unauthenticated (warn).
+    let auth_mode = s3::auth::AuthMode::from_config(&cfg.server.access_keys)?;
+    if cfg.server.enable_s3 {
+        if auth_mode.is_enabled() {
+            tracing::info!("S3 SigV4 authentication enabled");
+        } else {
+            tracing::warn!(
+                "S3 endpoint is UNAUTHENTICATED (no server.access_keys configured) — do not expose it to untrusted networks"
+            );
+        }
+    }
+
     // Background vacuum: periodically reclaim superseded + abandoned versions.
     // When `storage.auto_coalesce_multipart` is on, also coalesce completed
     // multipart objects into single blobs each cycle.
@@ -281,7 +293,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
 
     if cfg.server.enable_s3 {
-        let s3_app = s3::build_router(engine.clone())
+        let s3_app = s3::build_router_with_auth(engine.clone(), auth_mode)
             .layer(middleware::from_fn_with_state(
                 metrics.clone(),
                 metrics::track_metrics,

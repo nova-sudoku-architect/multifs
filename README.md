@@ -104,6 +104,7 @@ implementing the `StorageBackend` trait.
 | **Web UI virtualization** — `content-visibility` skips off-screen cards; covers hydrate via `IntersectionObserver` (only visible thumbnails fetched) | ✅ |
 | **Observability** — optional Prometheus `/metrics` (requests, bytes in/out, per-backend fill, GC reclaimed) + `/healthz` / `/readyz` health endpoints | ✅ |
 | **Folder last-modified** — every folder shows the last add/remove/update in its subtree | ✅ |
+| **S3 SigV4 authentication** — optional header-based signature verification (`server.access_keys`); unauthenticated by default | ✅ |
 | WebDAV | ❌ Removed |
 | NFS | ❌ Removed (was a stub; code deleted) |
 | Erasure coding | ❌ Stub (single-blob model; each blob lives on one account) |

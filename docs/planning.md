@@ -25,10 +25,13 @@ Honest list of what MultiFS is **not** today — read before relying on it.
    and auth failures (`2094`) fail the request immediately rather than retrying
    or falling back to another account. A transient backend error surfaces as a
    failed upload.
-4. **Static, unenforced credentials.** The S3 endpoint accepts a fixed key/secret
-   (`multifs`/`multifs`); the server does not authenticate or authorize callers.
-   Do not expose port `9000` to untrusted networks — bind to a private/VPN
-   interface (the deployed config binds a Tailscale IP).
+4. **Credentials are optional and coarse.** The S3 endpoint is **unauthenticated by
+   default**; set `server.access_keys` to require AWS SigV4 signature verification
+   (see the [operator guide](operator-guide.md#s3-authentication-sigv4)). There are not
+   yet **per-key access policies, quotas, or multi-tenancy** — any valid key can reach
+   every bucket. Until those land, do not expose port `9000` to untrusted networks unless
+   `access_keys` is set; otherwise bind to a private/VPN interface (the deployed config
+   binds a Tailscale IP).
 5. **Multipart objects are read-assembled unless coalesced.** A completed multipart
    upload keeps its part blobs and is streamed back part-by-part, so a large object
    pays a per-part backend round-trip on read and every part row stays in the DB.
@@ -68,8 +71,9 @@ live backlog).
   accounts (the code already reserves the `.c1` blob slot and a chunk-index
   field), so a single account failure doesn't lose data. Add a repair/scrubber
   pass (`fsck --repair`) that reconstructs missing blobs.
-- **Authentication & multi-tenancy.** Real S3 SigV4 auth, per-key access
-  policies and quotas so the endpoint can be safely shared. *(issue)*
+- **Authentication & multi-tenancy.** Per-key access policies and quotas, and bucket
+  namespacing, so the endpoint can be safely shared by multiple tenants. *(stage 1 —
+  header-based SigV4 verification — is shipped; policies/quotas/tenancy remain)*.
 - **Upload resilience.** Retry with exponential backoff on `429`/transient
   errors, and **automatic failover** to another account when a backend is
   quota-full or unauthorized.
@@ -90,6 +94,7 @@ live backlog).
 
 ### Recently shipped
 
+- **S3 SigV4 authentication** — optional header-based signature verification (`server.access_keys`).
 - **Observability** — `/metrics` + `/healthz` + `/readyz`.
 - **Multipart read optimization** — `multifs object coalesce` (single-blob rewrite).
 - **CLI term cleanup** — `shard` → `backend` (with compat alias).
