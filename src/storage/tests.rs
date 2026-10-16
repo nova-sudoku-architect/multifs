@@ -276,6 +276,35 @@ mod tests {
         }
     }
 
+    /// `list_child_prefixes` powers the web UI's prev/next sibling nav without a
+    /// full parent listing. It must return exactly the immediate child folders
+    /// (canonical, sorted), excluding files and deeper descendants.
+    #[test]
+    fn test_list_child_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(dir.path().join("test.db").to_str().unwrap()).unwrap();
+        db.create_bucket("test").unwrap();
+
+        put_committed(&db, "test", "a.txt", 1, "e", "2026-01-01", "a1", "/r");
+        put_committed(&db, "test", "dir1/c.txt", 1, "e", "2026-01-01", "a1", "/r");
+        put_committed(&db, "test", "dir1/sub/e.txt", 1, "e", "2026-01-01", "a1", "/r");
+        put_committed(&db, "test", "dir1/sub/deep/f.txt", 1, "e", "2026-01-01", "a1", "/r");
+        put_committed(&db, "test", "dir2/g.txt", 1, "e", "2026-01-01", "a1", "/r");
+        put_committed(&db, "test", "dir10/h.txt", 1, "e", "2026-01-01", "a1", "/r");
+
+        // Root: dir1, dir2, dir10 (sorted). a.txt is a file, not a folder.
+        assert_eq!(
+            db.list_child_prefixes("test", "").unwrap(),
+            vec!["dir1/".to_string(), "dir10/".to_string(), "dir2/".to_string()]
+        );
+        // Under dir1/: only the immediate subfolder `sub` — not `sub/deep`.
+        assert_eq!(db.list_child_prefixes("test", "dir1/").unwrap(), vec!["dir1/sub/".to_string()]);
+        // Leaf folder has no child folders.
+        assert!(db.list_child_prefixes("test", "dir2/").unwrap().is_empty());
+        // No false siblings from the `dir1` string prefix.
+        assert_eq!(db.list_child_prefixes("test", "dir2/").unwrap().len(), 0);
+    }
+
     #[test]
     fn test_folder_meta_for_prefixes_and_existing_keys() {
         let dir = tempfile::tempdir().unwrap();

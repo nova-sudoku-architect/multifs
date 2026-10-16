@@ -1257,6 +1257,22 @@ impl StorageEngine {
             .collect())
     }
 
+    /// Immediate child folder prefixes (canonical, trailing `/`) directly under
+    /// `prefix`, sorted. Lights the web UI's prev/next sibling nav without
+    /// re-fetching the parent folder's whole listing. Symlinked (tag) folders
+    /// directly under `prefix` are merged in.
+    pub fn list_child_prefixes(&self, bucket: &str, prefix: &str) -> anyhow::Result<Vec<String>> {
+        let mut out = self.meta.list_child_prefixes(bucket, prefix)?;
+        for sp in self.symlink_prefixes_under(bucket, Some(prefix))? {
+            if !out.contains(&sp) {
+                out.push(sp);
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     /// Resolve a listing prefix through symlinks, depth-capped to avoid loops.
     /// Returns `Some((link_prefix, target_prefix))` when `prefix` is (or lies
     /// under) a symlink: list `target_prefix` and re-present keys under

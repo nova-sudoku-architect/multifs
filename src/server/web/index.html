@@ -417,14 +417,13 @@ async function resolveSiblings() {
   const q = new URLSearchParams({ bucket: state.bucket });
   if (parent) q.set('prefix', parent);
   try {
-    const data = await jfetch('/api/list?' + q.toString());
-    const folders = (data.prefixes || []).map(p => typeof p === 'string' ? p : p.prefix);
-    // Only folders at the *immediate* child level of `parent`.
-    const depth = parent ? parent.split('/').filter(Boolean).length + 1 : 1;
-    siblings.list = folders.filter(p => {
-      const segs = p.replace(/\/$/, '').split('/').filter(Boolean);
-      return segs.length === depth;
-    }).sort((a, b) => siblingOrder(a).localeCompare(siblingOrder(b), undefined, { numeric: true }));
+    // Lightweight: the parent's immediate child folders only — NOT the full
+    // parent listing (which would repeat the whole heavy /api/list call).
+    const data = await jfetch('/api/siblings?' + q.toString());
+    const folders = (data.prefixes || []);
+    siblings.list = folders
+      .slice()
+      .sort((a, b) => siblingOrder(a).localeCompare(siblingOrder(b), undefined, { numeric: true }));
     siblings.index = siblings.list.indexOf(state.prefix.replace(/\/$/, '') + '/');
     if (siblings.index === -1) {
       // tolerate missing trailing slash
