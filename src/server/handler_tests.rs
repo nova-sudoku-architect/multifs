@@ -1091,4 +1091,35 @@ mod tests {
         assert_eq!(c.get("video/0002/"), Some(&1));
         assert_eq!(c.len(), 2);
     }
+
+    // =====================================================================
+    // /api/download cache validators (ETag / If-None-Match / If-Modified-Since)
+    // =====================================================================
+
+    #[test]
+    fn test_if_none_match_hits() {
+        use crate::server::web::if_none_match_hits;
+        let etag = "\"abc123\"";
+        assert!(if_none_match_hits("\"abc123\"", etag));
+        assert!(if_none_match_hits("W/\"abc123\"", etag)); // weak form
+        assert!(if_none_match_hits("*", etag));
+        assert!(if_none_match_hits("\"other\", \"abc123\"", etag)); // list
+        assert!(!if_none_match_hits("\"nope\"", etag));
+        assert!(!if_none_match_hits("", etag));
+    }
+
+    #[test]
+    fn test_http_date() {
+        use crate::server::web::http_date;
+        assert_eq!(
+            http_date("2026-01-02T03:04:05Z").as_deref(),
+            Some("Fri, 02 Jan 2026 03:04:05 GMT")
+        );
+        // Fractional seconds + offset are accepted and normalized to UTC.
+        assert_eq!(
+            http_date("2026-01-02T11:04:05.123+08:00").as_deref(),
+            Some("Fri, 02 Jan 2026 03:04:05 GMT")
+        );
+        assert!(http_date("not-a-date").is_none());
+    }
 }
