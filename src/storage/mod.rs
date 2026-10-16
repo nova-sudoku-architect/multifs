@@ -1,7 +1,6 @@
 pub mod stream_hasher;
 pub mod engine;
 pub mod metadata;
-pub mod placement;
 pub mod backends;
 pub mod pcloud;
 

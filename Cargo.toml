@@ -2,7 +2,7 @@
 name = "multifs"
 version = "0.1.0"
 edition = "2021"
-description = "Multi-cloud storage pool with S3 API and WebDAV"
+description = "Multi-cloud storage pool with an S3-compatible API and a read-only web UI"
 authors = ["Nova Claw <novaclawhk@github.com>"]
 license = "MIT"
 

@@ -7,5 +7,12 @@
 *.env
 config.toml
 
-# deployment config backups
+# CodeGraph local index (generated)
+.codegraph/
+
+# Deployment-specific configs — describe a live instance, never commit them.
+# Use config.example.toml as the template; keep instance configs on the host
+# (e.g. /etc/multifs.toml) only.
+config.deploy.toml
+config.deploy.toml.bak
 config.deploy.toml.bak.*

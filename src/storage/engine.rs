@@ -506,7 +506,7 @@ impl StorageEngine {
 
     /// Stream an object's bytes, optionally constrained by a byte range.
     /// The range is passed directly to the pCloud CDN (via `getfilelink` +
-    /// `Range` header) — no chunk assembly, no page cache coordination.
+    /// `Range` header) — no part assembly, no local page cache.
     /// Parse a multipart upload_id from a remote_path that carries the staged
     /// multipart marker `__mp__/multipart-<upload_id>/` (or `.../<upload_id>`).
     /// Returns Some(upload_id) if the path looks like a multipart composite.
@@ -951,7 +951,7 @@ impl StorageEngine {
                     orphans_removed += 1;
                     continue;
                 }
-                // Multipart (chunked) objects store their parts folder as the
+                // Multipart objects store their parts folder as the
                 // version's `remote_path` (`.../__mp__/multipart-<id>`). Parts
                 // scatter across whichever backend each `upload_part` picked, so
                 // we group parts by account and delete each account's folder
