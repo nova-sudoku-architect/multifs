@@ -19,6 +19,7 @@ enable_web = false        # read-only web UI (GET-only browser)
 web_port = 9001
 enable_metrics = false    # Prometheus /metrics + /healthz + /readyz
 metrics_port = 9100
+access_keys = ""          # S3 SigV4 keys "AKID:SECRET,…"; empty = UNAUTHENTICATED
 
 [storage]
 meta_db_path = "/var/lib/multifs/meta.db"
@@ -72,6 +73,40 @@ To add a pCloud account:
 1. Get an OAuth token: `multifs account add <email>` (or the manual OAuth flow).
 2. Add an `[[storage.accounts]]` block to the config.
 3. Restart: `sudo systemctl restart multifs.service`.
+
+### S3 authentication (SigV4)
+
+**The S3 endpoint is unauthenticated by default.** To require AWS Signature Version 4
+on every request, set `server.access_keys` to a comma-separated `AKID:SECRET` list:
+
+```toml
+[server]
+access_keys = "AKIAEXAMPLE:secret1,AKIAEXAMPLE2:secret2"
+```
+
+Prefer supplying it from the environment (`MULTIFS_ACCESS_KEYS`) so secrets never sit in
+the config file; config still only holds values, not a path, so env-substitution or an
+`EnvironmentFile=` in the systemd unit is the way.
+
+- With keys configured, every request must carry a valid
+  `Authorization: AWS4-HMAC-SHA256 …` header signed with one of the keys. Bad/absent
+  signatures get `403 AccessDenied` / `SignatureDoesNotMatch`; `x-amz-date` outside a
+  15-minute window gets `403 RequestTimeTooSkewed`.
+- With **no** keys configured the endpoint stays open (local/dev); the daemon logs a
+  loud `S3 endpoint is UNAUTHENTICATED` warning at startup. **Never expose port `9000` to
+  an untrusted network without `access_keys`.**
+
+Client setup (any S3 tool) then uses the configured pair:
+
+```bash
+aws configure set endpoint_url http://localhost:9000
+aws configure set aws_access_key_id AKIAEXAMPLE
+aws configure set aws_secret_access_key secret1
+```
+
+> Only *header*-based SigV4 is supported (the normal path for aws-cli/rclone).
+> Presigned query-string URLs (`X-Amz-Signature=…`) and STS temporary credentials
+> are **not** yet supported.
 
 
 ## Backends

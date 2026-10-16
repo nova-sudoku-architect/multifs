@@ -24,6 +24,11 @@ web_port = 9001
 enable_metrics = false
 metrics_port = 9100
 
+# S3 SigV4 access keys as "AKID:SECRET[,AKID2:SECRET2]". Empty = UNAUTHENTICATED
+# (local/dev only — the daemon logs a warning). Prefer setting this from an env
+# var (e.g. MULTIFS_ACCESS_KEYS) so secrets never sit in the config file.
+access_keys = ""
+
 [tls]
 enabled = false
 # cert_path = "/path/to/server.crt"
