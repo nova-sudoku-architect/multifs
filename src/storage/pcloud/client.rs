@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 /// pCloud API client
 #[derive(Clone)]
 pub struct PCloudClient {
+    #[allow(dead_code)] // retained for diagnostics; token/base_url drive requests
     email: String,
     token: String,
     base_url: String,
@@ -537,6 +538,7 @@ impl PCloudClient {
     }
 
     /// Copy a file server-side using pCloud's copyfile API
+    #[allow(dead_code)] // reachable via backend `server_side_copy` (not currently called)
     pub async fn copy_file(&self, source_path: &str, dest_parent: &str, new_name: &str) -> anyhow::Result<()> {
         let resp = self
             .client
@@ -642,6 +644,7 @@ impl PCloudClient {
     }
 
     /// List files in a directory
+    #[allow(dead_code)] // reachable via the backend `list` trait method (not currently called)
     pub async fn list_folder(&self, path: &str) -> anyhow::Result<Vec<PCloudFile>> {
         let resp = self
             .client
@@ -681,6 +684,7 @@ impl PCloudClient {
     }
 }
 
+#[allow(dead_code)] // return type of `list_folder`; kept for the backend `list` path
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PCloudFile {
     pub file_id: i64,

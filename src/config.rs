@@ -29,11 +29,6 @@ impl std::fmt::Display for PlacementStrategy {
     }
 }
 
-impl PlacementStrategy {
-    /// All known strategy names (for help text)
-    pub const VARIANTS: &'static [&'static str] = &["round-robin", "utilization"];
-}
-
 fn default_placement_strategy() -> PlacementStrategy {
     PlacementStrategy::Utilization
 }

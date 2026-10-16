@@ -8,6 +8,7 @@ use crate::config::AccountConfig;
 /// pCloud storage backend
 #[derive(Clone)]
 pub struct PCloudBackend {
+    #[allow(dead_code)] // retained for reference; token/quota read via the client
     config: AccountConfig,
     client: crate::storage::pcloud::client::PCloudClient,
 }

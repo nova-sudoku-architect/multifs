@@ -10,7 +10,6 @@ use crate::config::{Config, PlacementStrategy};
 
 use super::backends::StorageBackend;
 use super::metadata::{MetadataDb, BucketRecord, SymlinkRecord, ObjectVersionRecord};
-use rusqlite::params;
 
 #[derive(Debug, Clone)]
 pub struct ObjectInfo {
@@ -22,6 +21,7 @@ pub struct ObjectInfo {
     pub charset: Option<String>,
     pub account_email: String,
     pub remote_path: String,
+    #[allow(dead_code)] // carried for callers that inspect the version; not always read
     pub version: i64,
 }
 
@@ -155,6 +155,8 @@ impl StorageEngine {
         }
     }
 
+    /// Construct an engine with the default (`Utilization`) placement strategy.
+    #[allow(dead_code)] // convenience constructor; production uses from_backends_with_strategy
     pub fn from_backends(handles: Vec<BackendHandle>, meta: MetadataDb) -> Self {
         Self::from_backends_with_strategy(handles, meta, PlacementStrategy::Utilization)
     }
@@ -572,7 +574,7 @@ impl StorageEngine {
     /// requested global window (correct across part boundaries).
     async fn get_multipart_object_stream(
         &self,
-        bucket: &str,
+        _bucket: &str,
         _key: &str,
         upload_id: &str,
         range: Option<(usize, usize)>,
@@ -687,6 +689,7 @@ impl StorageEngine {
     /// Delete a blob from its backend (best-effort). Used by `fsck --fix` to
     /// reclaim orphaned multipart parts. The caller is responsible for deciding
     /// the blob is safe to delete.
+    #[allow(dead_code)] // engine API kept for fsck/ops; not all callers in-tree yet
     pub async fn delete_blob(&self, account_email: &str, remote_path: &str) -> anyhow::Result<()> {
         let backend = self.find_backend(account_email)?;
         backend.backend.delete(remote_path).await
@@ -695,6 +698,7 @@ impl StorageEngine {
     /// Delete a folder and all its contents recursively on a backend
     /// (best-effort). Returns `Ok(Some(files_deleted))` if the backend
     /// performed the deletion, `Ok(None)` if the backend does not support it.
+    #[allow(dead_code)] // engine API kept for ops; not all callers in-tree yet
     pub async fn delete_folder_recursive(
         &self,
         account_email: &str,
@@ -1115,6 +1119,7 @@ impl StorageEngine {
     /// (cover/summary/gif), keeping only fields whose object still exists.
     /// Returns a map of prefix -> FolderMeta; prefixes with no valid metadata
     /// are omitted, so the UI degrades gracefully.
+    #[allow(dead_code)] // non-batched folder metadata lookup; superseded by folder_meta_batch
     pub fn folder_meta_map(
         &self,
         bucket: &str,
@@ -1148,6 +1153,7 @@ impl StorageEngine {
 
     /// Count the direct children (immediate files + subfolders) of a folder
     /// prefix. Delegates to the metadata layer's prefix scan.
+    #[allow(dead_code)] // single-prefix count; superseded by count_children_batch
     pub fn count_direct_children(&self, bucket: &str, prefix: &str) -> anyhow::Result<i64> {
         self.meta.count_direct_children(bucket, prefix)
     }
@@ -1204,6 +1210,7 @@ impl StorageEngine {
     // -----------------------------------------------------------------
 
     /// Create (or replace) a symlink. v1: same-bucket only.
+    #[allow(dead_code)] // engine API kept for ops; not all callers in-tree yet
     pub fn create_symlink(
         &self,
         bucket: &str,
@@ -1224,11 +1231,13 @@ impl StorageEngine {
     }
 
     /// Remove a symlink row (never the target).
+    #[allow(dead_code)] // engine API kept for ops; not all callers in-tree yet
     pub fn delete_symlink(&self, bucket: &str, key: &str) -> anyhow::Result<()> {
         self.meta.delete_symlink(bucket, key)
     }
 
     /// All symlinks across all buckets (for fsck).
+    #[allow(dead_code)] // engine API kept for ops; not all callers in-tree yet
     pub fn list_all_symlinks(&self) -> anyhow::Result<Vec<SymlinkRecord>> {
         self.meta.list_all_symlinks()
     }
@@ -1372,6 +1381,7 @@ impl StorageEngine {
     /// If `prefix` is a symlink (exact), return its target prefix (trailing
     /// slash); otherwise return the prefix unchanged. Used so tag folders reuse
     /// their target's folder metadata / child counts in the UI.
+    #[allow(dead_code)] // symlink-resolution helper; used by callers outside the bin path
     pub fn effective_prefix(&self, bucket: &str, prefix: &str) -> anyhow::Result<String> {
         match self.meta.resolve_symlink(bucket, prefix)? {
             Some((tb, tk, rem)) if tb == bucket && rem.is_empty() => {

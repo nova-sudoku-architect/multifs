@@ -62,6 +62,7 @@ pub struct ObjectRecord {
 /// A symlink (tag folder) — a link path that points at a real folder prefix in
 /// the same bucket. Links are exposed as normal folders over S3/Web; deleting a
 /// link removes only the row, never the target.
+#[allow(dead_code)] // row mirrors the DB schema; not every column is read in-tree
 #[derive(Debug, Clone)]
 pub struct SymlinkRecord {
     pub bucket_name: String,
@@ -72,6 +73,7 @@ pub struct SymlinkRecord {
 }
 
 /// A row in the `versions` table (one version = one blob in the single-blob model).
+#[allow(dead_code)] // row mirrors the DB schema; not every column is read in-tree
 #[derive(Debug, Clone)]
 pub struct VersionRecord {
     pub bucket_name: String,
@@ -90,6 +92,7 @@ pub struct VersionRecord {
 
 /// A single object version for the S3 ListObjectVersions view (one committed
 /// version row, with an `is_latest` flag derived from the `files` pointer).
+#[allow(dead_code)] // row mirrors the DB schema; not every column is read in-tree
 #[derive(Debug, Clone)]
 pub struct ObjectVersionRecord {
     pub key: String,
@@ -1557,6 +1560,7 @@ impl MetadataDb {
         })
     }
 
+    #[allow(dead_code)] // utility kept for operators; currently no in-tree caller
     pub fn delete_all_objects(&self, bucket: &str) -> anyhow::Result<()> {
         self.with_conn(|conn| {
             conn.execute("DELETE FROM files WHERE bucket_name = ?1", params![bucket])?;
@@ -2054,7 +2058,6 @@ impl MetadataDb {
         } else {
             format!("{}/", prefix)
         };
-        let pattern = format!("{}%", p);
         // `substr()` is 1-indexed; this skips the prefix characters so the
         // remainder can be inspected for a `/` (which would mark a subfolder).
         let skip = (p.len() + 1) as i64;

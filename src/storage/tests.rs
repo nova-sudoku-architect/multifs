@@ -1194,7 +1194,7 @@ mod tests {
             .unwrap();
 
         // created = now, so it must NOT be swept.
-        let (pending, orphans, multipart) = engine.vacuum(false).await.unwrap();
+        let (_pending, _orphans, multipart) = engine.vacuum(false).await.unwrap();
         assert_eq!(multipart, 0);
         assert!(engine.get_multipart_upload(upload_id).await.unwrap().is_some());
         assert_eq!(engine.list_multipart_parts(upload_id).await.unwrap().len(), 1);

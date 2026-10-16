@@ -30,7 +30,7 @@ const WEBDAV_BASE: &str = "http://127.0.0.1:8080";
 
 /// Generate a unique test prefix: itest-20260803-215800
 fn test_prefix() -> String {
-    let ts = SystemTime::now()
+    let _ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
@@ -400,8 +400,8 @@ fn test_multiple_files_concurrent_upload() {
 #[test]
 #[ignore = "Requires running MultiFS server with pCloud backends. Set PCLOUD_INTEGRATION_TEST=1"]
 fn test_s3_multipart_part_not_stored() {
-    /// Documents the known issue: S3 multipart upload parts are NOT persisted.
-    /// Initiating, uploading parts, and completing returns 200 but no file exists.
+    // Documents the known issue: S3 multipart upload parts are NOT persisted.
+    // Initiating, uploading parts, and completing returns 200 but no file exists.
     let prefix = test_prefix();
     let bucket = format!("{}-mp", prefix);
     let _cleanup = BucketCleanup::new(bucket.clone());
@@ -429,7 +429,7 @@ fn test_s3_multipart_part_not_stored() {
     assert!(!upload_id.is_empty(), "Should have UploadId");
 
     // 2. Upload a part
-    let part_data = test_data(1024 * 1024); // 1 MB
+    let _part_data = test_data(1024 * 1024); // 1 MB
     let output = Command::new("curl")
         .args(["-s", "-w", "%{http_code}", "-X", "PUT",
             &format!("{}/{}/{}?partNumber=1&uploadId={}", S3_BASE, bucket, key, upload_id),

@@ -1,4 +1,3 @@
-pub mod stream_hasher;
 pub mod engine;
 pub mod metadata;
 pub mod backends;

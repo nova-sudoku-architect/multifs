@@ -1,3 +1,8 @@
+// Test-only helpers: MockBackend (in-memory, range-aware) and TrackedBackend
+// (call-tracking + latency + missing-path simulation). Not all helpers are used
+// by every test, so dead-code analysis is relaxed for the whole module.
+#![allow(dead_code)]
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
@@ -180,7 +185,7 @@ pub fn make_test_engine() -> (crate::storage::engine::StorageEngine, tempfile::T
 // Used by streaming performance tests to verify which chunks were accessed
 // and to simulate realistic network conditions.
 
-use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::atomic::AtomicI64;
 
 /// A record of a backend access via download or download_stream.
 #[derive(Debug, Clone)]
