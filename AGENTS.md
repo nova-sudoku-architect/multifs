@@ -42,6 +42,49 @@ Whenever you change code, update the docs in the **same commit** (or a follow-up
 
 If a reviewer can't tell what the code does by reading the docs, the change isn't done.
 
+## Issues & PRs — every enhancement is tracked — non-negotiable
+
+Any **enhancement** (new feature, behavior change, refactor, perf work) must be
+tracked as a **GitHub issue** and land via a **pull request** into `main` — never a
+direct push. The issue/PR is the durable record of *what* changed and *why*, so a
+future reader can see the reasoning and what was evaluated, not just the diff.
+
+### Issue first
+
+Open an issue describing the enhancement **before** implementing. It must capture:
+
+- **Problem / motivation** — what hurts today, with observed evidence (numbers,
+  failing case, user report).
+- **Proposed change** — the intended approach.
+- **Options evaluated** — alternatives considered (other algorithms, existing
+  libraries/plugins/services per the preflight rule) and why the chosen one wins,
+  including trade-offs and rejected options.
+- **Acceptance criteria** — definition of done.
+
+### Then a PR
+
+1. Branch off `main`: `feat/…`, `perf/…`, `refactor/…`, `fix/…`, or `docs/…` (one
+   branch per issue).
+2. Commit with a conventional-commit message; keep docs in sync (above).
+3. Open a PR that links the issue (`Closes #N` where it completes it). The PR body
+   must state:
+   - **what changed and why**,
+   - **what was evaluated** — alternatives considered and why rejected (design,
+     perf, security trade-offs),
+   - **verification evidence** — `cargo test --lib` count, `cargo clippy`,
+     and any manual/live check,
+   - **docs updated** + any CLI / config / data-model impact.
+   - For security-sensitive work (auth, quotas, exposure), document the threat
+     model and the safe-default decision.
+4. Merge (`--no-ff` merge or squash) keeping the issue reference so history is
+   traceable, then delete the branch.
+
+**Exempt:** pure typo/comment fixes and doc-only nits may go straight to `main`.
+When in doubt, open an issue.
+
+Every issue/PR must be **self-contained**: someone reading only it should understand
+the change and its rationale without reading the code.
+
 ## Secrets
 
 Passwords, API keys, and OAuth tokens live in env vars (`~/.openclaw/.env` / `/etc/multifs.env`), never in code, config, or docs. Config files reference them by env-var name only (`token_env = "PCLOUD_TOKEN_VIDEO_01"`).
