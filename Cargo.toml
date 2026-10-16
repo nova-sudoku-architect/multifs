@@ -10,6 +10,11 @@ license = "MIT"
 name = "multifs"
 path = "src/main.rs"
 
+[features]
+# Gates the integration test crates (tests/s3_tests.rs, tests/webdav_tests.rs).
+# Run with: cargo test --features integration_tests
+integration_tests = []
+
 [dependencies]
 futures = "0.3"
 sha2 = "0.10"

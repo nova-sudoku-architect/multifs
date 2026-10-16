@@ -5,6 +5,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     /// Commit a version directly (reserve + commit) for metadata tests.
+    #[allow(clippy::too_many_arguments)] // test helper; positional args are clearest
     fn put_committed(
         db: &MetadataDb,
         bucket: &str,
@@ -348,7 +349,7 @@ mod tests {
 
     #[test]
     fn test_s3_list_buckets_xml() {
-        let buckets = vec![
+        let buckets = [
             ("bucket-a".to_string(), "2026-01-01".to_string()),
             ("bucket-b".to_string(), "2026-01-02".to_string()),
         ];
@@ -1016,17 +1017,15 @@ mod tests {
                         .unwrap();
                     let mut got = false;
                     while let Some(res) = rx.recv().await {
-                        if let Ok(_) = res {
-                            if !got {
-                                got = true;
-                                let elapsed = start.elapsed();
-                                assert!(
-                                    elapsed.as_millis() < 3000,
-                                    "Concurrent TTFB for {} exceeded 3s: {}ms",
-                                    key,
-                                    elapsed.as_millis()
-                                );
-                            }
+                        if res.is_ok() && !got {
+                            got = true;
+                            let elapsed = start.elapsed();
+                            assert!(
+                                elapsed.as_millis() < 3000,
+                                "Concurrent TTFB for {} exceeded 3s: {}ms",
+                                key,
+                                elapsed.as_millis()
+                            );
                         }
                     }
                 })

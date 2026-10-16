@@ -1,26 +1,25 @@
-/// pCloud Integration Tests
-///
-/// Tests the full MultiFS → pCloud pipeline end-to-end using real pCloud accounts.
-/// These tests are IGNORED by default and require explicit opt-in:
-///
-///   PCLOUD_INTEGRATION_TEST=1 cargo test --test pcloud_integration -- --nocapture
-///
-/// SAFETY DESIGN:
-/// - All objects go under `/multifs-itest/YYYYMMDD-HHMMSS/` on pCloud
-/// - Each test run uses a unique subfolder (timestamped)
-/// - All test data is deleted after each test (even on failure, via Drop guard)
-/// - Files are small (<1 MB) to minimize quota impact
-/// - Matches exactly one pCloud account (nova-video) to avoid spreading test data
-///
-/// WHAT'S TESTED:
-/// 1. upload/download roundtrip (small file, whole-file path)
-/// 2. upload/download roundtrip (chunked file, >32MB)
-/// 3. object metadata (HEAD)
-/// 4. bucket CRUD
-/// 5. object listing
-/// 6. deletion and idempotent delete
-/// 7. error handling (non-existent object)
-/// 8. concurrent uploads to different accounts
+//! pCloud integration tests — full MultiFS → pCloud pipeline, end-to-end.
+//!
+//! These tests are IGNORED by default and require explicit opt-in:
+//!
+//!   PCLOUD_INTEGRATION_TEST=1 cargo test --test pcloud_integration -- --nocapture
+//!
+//! SAFETY DESIGN:
+//! - All objects go under `/multifs-itest/YYYYMMDD-HHMMSS/` on pCloud
+//! - Each test run uses a unique subfolder (timestamped)
+//! - All test data is deleted after each test (even on failure, via Drop guard)
+//! - Files are small (<1 MB) to minimize quota impact
+//! - Matches exactly one pCloud account (nova-video) to avoid spreading test data
+//!
+//! WHAT'S TESTED:
+//! 1. upload/download roundtrip (small file, whole-file path)
+//! 2. multipart upload (large file)
+//! 3. object metadata (HEAD)
+//! 4. bucket CRUD
+//! 5. object listing
+//! 6. deletion and idempotent delete
+//! 7. error handling (non-existent object)
+//! 8. concurrent uploads to different accounts
 
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -440,7 +439,7 @@ fn test_s3_multipart_part_not_stored() {
     // For this test, with 1 MB, the body fits in TCP buffer so it succeeds
     // but the data is discarded.
     let code: u16 = String::from_utf8_lossy(&output.stdout)
-        .chars().filter(|c| c.is_digit(10)).collect::<String>()
+        .chars().filter(|c| c.is_ascii_digit()).collect::<String>()
         .parse().unwrap_or(0);
     // KNOWN ISSUE: this returns 200 but the body is NOT stored.
     // The assert documents the current (broken) behavior.

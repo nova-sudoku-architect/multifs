@@ -34,7 +34,7 @@ fn default_placement_strategy() -> PlacementStrategy {
 }
 
 /// Top-level configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -69,7 +69,7 @@ pub struct ServerConfig {
     pub web_port: u16,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsConfig {
     /// Whether to enable TLS
     #[serde(default)]
@@ -82,24 +82,13 @@ pub struct TlsConfig {
     pub domain: Option<String>,
 }
 
-impl Default for TlsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            cert_path: None,
-            key_path: None,
-            domain: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
     /// Path to SQLite metadata database
     #[serde(default = "default_meta_db")]
     pub meta_db_path: String,
     /// Placement strategy for distributing uploads across backends.
-    /// Options: "round-robin" (default), "utilization" (picks least-full account).
+    /// Options: "Utilization" (default; least-full account) or "RoundRobin".
     #[serde(default = "default_placement_strategy")]
     pub placement_strategy: PlacementStrategy,
     /// List of pCloud accounts
@@ -176,16 +165,6 @@ impl Default for StorageConfig {
             meta_db_path: default_meta_db(),
             placement_strategy: default_placement_strategy(),
             accounts: Vec::new(),
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            storage: StorageConfig::default(),
-            tls: TlsConfig::default(),
         }
     }
 }

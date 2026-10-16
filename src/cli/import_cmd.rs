@@ -288,6 +288,7 @@ fn resolve_content_type(path: &str, provided: Option<&str>) -> Option<String> {
 }
 
 /// Register one remote file into the DB (creating the bucket if needed).
+#[allow(clippy::too_many_arguments)] // internal helper; positional args are clearest
 fn register(
     meta: &crate::storage::metadata::MetadataDb,
     email: &str,

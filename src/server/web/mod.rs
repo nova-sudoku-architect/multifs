@@ -191,7 +191,7 @@ async fn list_objects(
             let norm = if p.ends_with('/') { p.to_string() } else { format!("{}/", p) };
             state
                 .engine
-                .folder_meta_batch(&bucket, &[norm.clone()])
+                .folder_meta_batch(&bucket, std::slice::from_ref(&norm))
                 .ok()
                 .and_then(|m| m.get(&norm).cloned())
                 .map(|m| {

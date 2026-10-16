@@ -27,7 +27,7 @@ enabled = false
 
 [storage]
 meta_db_path = "/var/lib/multifs/meta.db"
-# "utilization" (default; tiered, least-full wins) or "round-robin"
+# "Utilization" (default; tiered, least-full wins) or "RoundRobin" (PascalCase)
 placement_strategy = "Utilization"
 
 # ---------------------------------------------------------------------------

@@ -42,8 +42,7 @@ pub fn token_env_name(email: &str) -> String {
     let suffix = email
         .to_uppercase()
         .replace('@', "_AT_")
-        .replace('.', "_")
-        .replace('-', "_");
+        .replace(['.', '-'], "_");
     format!("PCLOUD_TOKEN_{}", suffix)
 }
 
@@ -102,7 +101,7 @@ pub async fn run(args: AccountArgs) -> Result<()> {
             let used_gb = used as f64 / 1_073_741_824.0;
 
             match quota_gb {
-                Some(q) => println!("✅ Token valid — Quota: {} GB ({} GB used)", q, format!("{:.1}", used_gb)),
+                Some(q) => println!("✅ Token valid — Quota: {} GB ({:.1} GB used)", q, used_gb),
                 None => println!("✅ Token valid — Used: {:.1} GB", used_gb),
             }
             println!();
