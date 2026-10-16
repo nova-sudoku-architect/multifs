@@ -127,6 +127,55 @@ mod tests {
         );
     }
 
+    /// The prefix filter is an indexed range scan `[p, prefix_succ(p))`, which
+    /// must select exactly the keys under a folder and NOT leak siblings whose
+    /// names share the prefix as a string prefix (`dir1/` must not match
+    /// `dir10/`). Guards the `LIKE 'p%'` → range-scan rewrite.
+    #[test]
+    fn test_list_objects_prefix_range_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = MetadataDb::open(db_path.to_str().unwrap()).unwrap();
+        db.create_bucket("b").unwrap();
+        // Sibling folders sharing a string prefix, plus an exact-prefix object.
+        for k in [
+            "dir1/a", "dir1/b", "dir10/c", "dir1/../weird", "dir1", "dir1x/d",
+        ] {
+            put_committed(&db, "b", k, 1, "e", "2026-01-01", "a1", "/r");
+        }
+
+        let get = |p: &str| -> Vec<String> {
+            db.list_objects("b", Some(p), None, 100)
+                .unwrap()
+                .into_iter()
+                .map(|o| o.key)
+                .collect()
+        };
+
+        // `dir1/` selects exactly the two keys directly under it (and the
+        // odd-but-legal `dir1/../weird`, which is genuinely under `dir1/`).
+        let under = get("dir1/");
+        assert_eq!(under.len(), 3, "keys under dir1/: {:?}", under);
+        assert!(under.contains(&"dir1/a".to_string()));
+        assert!(under.contains(&"dir1/b".to_string()));
+        assert!(under.contains(&"dir1/../weird".to_string()));
+        assert!(!under.contains(&"dir10/c".to_string()), "dir10 leaked into dir1/");
+        assert!(!under.contains(&"dir1x/d".to_string()), "dir1x leaked into dir1/");
+        assert!(!under.contains(&"dir1".to_string()), "bare dir1 is a sibling, not a child");
+
+        // S3 `prefix` is a *string* prefix: "dir1" matches dir1, dir1/…, and
+        // also dir10/c + dir1x/d (exactly as the old `LIKE 'dir1%'` did).
+        let str_prefix = get("dir1");
+        assert_eq!(str_prefix.len(), 6, "string-prefix semantics changed: {:?}", str_prefix);
+        assert!(str_prefix.contains(&"dir10/c".to_string()));
+        assert!(str_prefix.contains(&"dir1x/d".to_string()));
+
+        // Whole-bucket listing (empty prefix) still returns everything.
+        assert_eq!(get("").len(), 6);
+        // A trailing-slash folder prefix excludes string-prefix siblings.
+        assert!(!get("dir1/").contains(&"dir10/c".to_string()));
+    }
+
     #[test]
     fn test_list_objects_includes_all() {
         let dir = tempfile::tempdir().unwrap();
