@@ -78,7 +78,8 @@ live backlog).
   errors, and **automatic failover** to another account when a backend is
   quota-full or unauthorized.
 - **CLI config management.** Implement `config set`, and account add/remove/token
-  rotation without leaking secrets via argv. *(issue)*
+  rotation without leaking secrets via argv. *(stage 1 shipped — `config get/set`,
+  `account add/update-token/set` with env/stdin tokens; see the CLI reference)*
 - **Packaging.** Ship MultiFS as an installable unit (deb + systemd) with a clean
   upgrade path. *(issue)*
 - **S3 `StorageBackend`.** Add an S3-compatible backend for providers that speak

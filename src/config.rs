@@ -205,6 +205,159 @@ pub fn save(path: &str, config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Save configuration **atomically**: serialize, validate that it round-trips,
+/// keep a `.bak` of the previous file, then write to a temp file in the same
+/// directory and `rename` it into place (rename is atomic on POSIX). A crash
+/// mid-write therefore never leaves a truncated/half-written config.
+pub fn save_atomic(path: &str, config: &Config) -> anyhow::Result<()> {
+    let contents = toml::ser::to_string_pretty(config)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize config: {}", e))?;
+    // Validate: the serialized config must parse back cleanly before we touch
+    // the real file. Refuse to write something we can't reload.
+    toml::de::from_str::<Config>(&contents)
+        .map_err(|e| anyhow::anyhow!("refusing to write an invalid config: {}", e))?;
+
+    let p = std::path::Path::new(path);
+    if let Some(parent) = p.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    // Keep a backup of the previous config (best-effort).
+    if p.exists() {
+        let bak = format!("{}.bak", path);
+        let _ = std::fs::copy(p, &bak);
+    }
+    let tmp = format!("{}.tmp.{}", path, std::process::id());
+    std::fs::write(&tmp, &contents)?;
+    std::fs::rename(&tmp, p)?;
+    Ok(())
+}
+
+/// Upsert `KEY=value` in an env file (`/etc/multifs.env` style), preserving all
+/// other lines, creating the file with mode **0600** (secrets must not be
+/// world-readable). Returns the (possibly created) path.
+pub fn upsert_env_file(path: &str, key: &str, value: &str) -> anyhow::Result<()> {
+    let mut lines: Vec<String> = match std::fs::read_to_string(path) {
+        Ok(s) => s.lines().map(|l| l.to_string()).collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(anyhow::anyhow!("reading {}: {}", path, e)),
+    };
+    let prefix = format!("{}=", key);
+    let new_line = format!("{}={}", key, value);
+    let mut replaced = false;
+    for line in lines.iter_mut() {
+        if line.trim_start().starts_with(&prefix) {
+            *line = new_line.clone();
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        lines.push(new_line);
+    }
+    let mut body = lines.join("\n");
+    body.push('\n');
+
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(path, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+impl Config {
+    /// Set a scalar config value by dot-notation key (e.g. `server.s3_port`).
+    /// Only a curated allow-list of scalar keys is settable — list/account edits
+    /// go through the `account`/`link`/`folder` commands.
+    pub fn set_key(&mut self, key: &str, value: &str) -> anyhow::Result<()> {
+        use std::str::FromStr;
+        let parse_bool = |v: &str| match v.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(true),
+            "false" | "0" | "no" | "off" => Ok(false),
+            other => anyhow::bail!("expected a boolean, got '{}'", other),
+        };
+        let parse_u16 = |v: &str| -> anyhow::Result<u16> {
+            v.parse::<u16>().map_err(|_| anyhow::anyhow!("expected a port number, got '{}'", v))
+        };
+        let opt_str = |v: &str| -> Option<String> {
+            if v.is_empty() || v == "none" || v == "null" { None } else { Some(v.to_string()) }
+        };
+
+        match key {
+            "server.bind" => self.server.bind = value.to_string(),
+            "server.s3_port" => self.server.s3_port = parse_u16(value)?,
+            "server.nfs_port" => self.server.nfs_port = parse_u16(value)?,
+            "server.enable_s3" => self.server.enable_s3 = parse_bool(value)?,
+            "server.enable_nfs" => self.server.enable_nfs = parse_bool(value)?,
+            "server.enable_web" => self.server.enable_web = parse_bool(value)?,
+            "server.web_port" => self.server.web_port = parse_u16(value)?,
+            "server.enable_metrics" => self.server.enable_metrics = parse_bool(value)?,
+            "server.metrics_port" => self.server.metrics_port = parse_u16(value)?,
+            "server.access_keys" => self.server.access_keys = value.to_string(),
+            "tls.enabled" => self.tls.enabled = parse_bool(value)?,
+            "tls.cert_path" => self.tls.cert_path = opt_str(value),
+            "tls.key_path" => self.tls.key_path = opt_str(value),
+            "tls.domain" => self.tls.domain = opt_str(value),
+            "storage.meta_db_path" => self.storage.meta_db_path = value.to_string(),
+            "storage.placement_strategy" => {
+                self.storage.placement_strategy = PlacementStrategy::from_str(value)?
+            }
+            "storage.auto_coalesce_multipart" => {
+                self.storage.auto_coalesce_multipart = parse_bool(value)?
+            }
+            other => anyhow::bail!(
+                "unknown or non-scalar config key '{}'. Settable scalar keys: \
+                 server.bind, server.s3_port, server.nfs_port, server.enable_s3, \
+                 server.enable_nfs, server.enable_web, server.web_port, \
+                 server.enable_metrics, server.metrics_port, server.access_keys, \
+                 tls.enabled, tls.cert_path, tls.key_path, tls.domain, \
+                 storage.meta_db_path, storage.placement_strategy, \
+                 storage.auto_coalesce_multipart",
+                other
+            ),
+        }
+        Ok(())
+    }
+
+    /// Read a scalar config value by dot-notation key (for `config get`).
+    pub fn get_key(&self, key: &str) -> Option<String> {
+        Some(match key {
+            "server.bind" => self.server.bind.clone(),
+            "server.s3_port" => self.server.s3_port.to_string(),
+            "server.nfs_port" => self.server.nfs_port.to_string(),
+            "server.enable_s3" => self.server.enable_s3.to_string(),
+            "server.enable_nfs" => self.server.enable_nfs.to_string(),
+            "server.enable_web" => self.server.enable_web.to_string(),
+            "server.web_port" => self.server.web_port.to_string(),
+            "server.enable_metrics" => self.server.enable_metrics.to_string(),
+            "server.metrics_port" => self.server.metrics_port.to_string(),
+            "server.access_keys" => {
+                // Never print key material — report only how many are configured.
+                let n = self.server.access_keys.split(',').filter(|s| !s.trim().is_empty()).count();
+                return Some(format!("<{} key(s) configured (redacted)>", n));
+            }
+            "tls.enabled" => self.tls.enabled.to_string(),
+            "tls.cert_path" => self.tls.cert_path.clone().unwrap_or_default(),
+            "tls.key_path" => self.tls.key_path.clone().unwrap_or_default(),
+            "tls.domain" => self.tls.domain.clone().unwrap_or_default(),
+            "storage.meta_db_path" => self.storage.meta_db_path.clone(),
+            "storage.placement_strategy" => self.storage.placement_strategy.to_string(),
+            "storage.auto_coalesce_multipart" => {
+                self.storage.auto_coalesce_multipart.to_string()
+            }
+            _ => return None,
+        })
+    }
+}
+
 /// Load configuration from a TOML file
 pub fn load(path: &str) -> anyhow::Result<Config> {
     let contents = std::fs::read_to_string(path)

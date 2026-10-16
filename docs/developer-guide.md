@@ -199,7 +199,7 @@ docs/
 ## Running tests
 
 ```bash
-cargo test --lib            # unit tests (141 passing) — count must match docs/architecture.md
+cargo test --lib            # unit tests (157 passing) — count must match docs/architecture.md
 cargo test                  # unit + integration tests
 cargo test -- --nocapture   # with output
 cargo clippy                # lints

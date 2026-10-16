@@ -11,15 +11,23 @@ multifs init [--config <path>] [--force]
 multifs check [--config <path>]   Validate config, test all accounts
 multifs status                    Daemon health + account stats
 multifs config show               Show current configuration
-multifs config set <key> <value>  Set a config value (dot notation) — ⚠️ stub, not
-                                  yet implemented (edit the config file directly)
+multifs config get <key>          Read one scalar config value (dot notation)
+multifs config set <key> <value>  Set a scalar config value (dot notation)
+                                  (atomic write + .bak; secrets via env, not argv)
 
 multifs account list              List configured accounts
-multifs account add <email> [--token <t>]
-                                  Add an account (validates token, auto quota)
+multifs account add <email> [--token-env <VAR> | --token-stdin] [--env-file <path>]
+                                  Add an account (token from env/stdin, never argv;
+                                  validates + auto-detects quota; stores the token in
+                                  the env file (0600), only token_env in config)
+multifs account update-token <email> [--token-env <VAR> | --token-stdin]
+                                  [--env-file <path>] [--no-verify]
+                                  Rotate an account's token (validates by default)
+multifs account set <email> [--quota-gb N] [--priority P] [--mount-prefix /p]
+                                  Update an account's non-secret fields
 multifs account remove <email>    Remove an account from rotation
 multifs account check <email>     Test token + show quota
-multifs account refresh <email>   Refresh OAuth token
+multifs account refresh <email>   Refresh OAuth token (OAuth flow; writes to env file)
 
 multifs bucket list               List buckets
 multifs bucket create <name>      Create a bucket
