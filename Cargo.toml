@@ -62,6 +62,10 @@ walkdir = "2"
 bytes = "1"
 mime_guess = "2"
 
+# Image downscaling for server-side thumbnails (decode + resize + JPEG encode).
+# Only the formats the web UI serves are enabled to keep the build lean.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+
 # WebDAV
 http = "1"
 http-body-util = "0.1"

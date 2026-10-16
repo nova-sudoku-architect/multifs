@@ -101,6 +101,27 @@ const MULTIPART_TIMEOUT_SECS: i64 = 24 * 60 * 60;
 /// for tiered placement. 1.0 = any free space counts as available.
 const FULL_FILL_RATIO: f64 = 1.0;
 
+/// Directory for cached image thumbnails. Overridable via `MULTIFS_THUMB_CACHE`.
+fn thumb_cache_dir() -> std::path::PathBuf {
+    std::env::var("MULTIFS_THUMB_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/var/cache/multifs/thumbs"))
+}
+
+/// Parse a `"WIDTHxHEIGHT"` thumbnail size. Returns `None` for anything
+/// malformed or out of the sane range (16..=4096), so callers fall back to a
+/// default bounding box.
+fn parse_thumb_size(size: &str) -> Option<(u32, u32)> {
+    let (w, h) = size.split_once('x')?;
+    let w: u32 = w.parse().ok()?;
+    let h: u32 = h.parse().ok()?;
+    if (16..=4096).contains(&w) && (16..=4096).contains(&h) {
+        Some((w, h))
+    } else {
+        None
+    }
+}
+
 impl StorageEngine {
     pub fn new(cfg: &Config, meta: MetadataDb) -> anyhow::Result<Self> {
         let handles = Self::build_backends(cfg)?;
@@ -285,6 +306,68 @@ impl StorageEngine {
             .iter()
             .find(|b| b.label == label)
             .ok_or_else(|| anyhow::anyhow!("Backend not found: {}", label))
+    }
+
+    /// Fetch a small thumbnail of an image object, generated locally and cached
+    /// on disk.
+    ///
+    /// pCloud can't thumbnail our blobs (they're stored as `<key>.v<n>.c1` with
+    /// an opaque content type), so we download the image once and downscale it
+    /// here with the `image` crate, then cache the JPEG under
+    /// `MULTIFS_THUMB_CACHE` (default `/var/cache/multifs/thumbs`) keyed by the
+    /// blob's content id. Repeat views — every folder listing of covers — become
+    /// a local disk read. Returns `Ok(None)` when the object isn't a decodable
+    /// image, so the caller can fall back to the full object.
+    pub async fn thumbnail(
+        &self,
+        bucket: &str,
+        key: &str,
+        size: &str,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let info = self.head_object(bucket, key).await?;
+        let (max_w, max_h) = parse_thumb_size(size).unwrap_or((320, 200));
+        let cache_dir = thumb_cache_dir();
+        // Key on the blob's content (etag) so a changed image re-fetches, plus the
+        // exact account/path/target size.
+        let mut h = Sha256::new();
+        h.update(info.account_email.as_bytes());
+        h.update(b"\0");
+        h.update(info.remote_path.as_bytes());
+        h.update(b"\0");
+        h.update(format!("{}x{}", max_w, max_h).as_bytes());
+        h.update(b"\0");
+        h.update(info.etag.as_bytes());
+        let id = hex::encode(h.finalize());
+        let path = cache_dir.join(&id[..2]).join(format!("{}.jpg", id));
+
+        if let Ok(bytes) = tokio::fs::read(&path).await {
+            return Ok(Some(bytes));
+        }
+
+        // Download the full image (get_object already handles multipart/composite).
+        let raw = self.get_object(bucket, key).await?;
+        let img = tokio::task::spawn_blocking(move || {
+            let img = image::load_from_memory(&raw).ok()?;
+            let thumb = img.thumbnail(max_w, max_h);
+            let mut buf = std::io::Cursor::new(Vec::new());
+            thumb
+                .write_to(&mut buf, image::ImageFormat::Jpeg)
+                .ok()?;
+            Some(buf.into_inner())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("thumbnail task failed: {e}"))?;
+
+        let Some(bytes) = img else {
+            return Ok(None);
+        };
+
+        // Best-effort cache write (a failed write must not fail the request).
+        if let Some(parent) = path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let _ = tokio::fs::write(&path, &bytes).await;
+        Ok(Some(bytes))
     }
 
     // -----------------------------------------------------------------

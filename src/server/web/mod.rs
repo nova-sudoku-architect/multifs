@@ -34,6 +34,7 @@ pub fn build_router(engine: Arc<StorageEngine>) -> Router {
         .route("/api/buckets", get(list_buckets))
         .route("/api/list", get(list_objects))
         .route("/api/siblings", get(list_siblings))
+        .route("/api/thumb", get(thumb))
         .route("/api/download", get(download))
         .with_state(state)
 }
@@ -280,6 +281,87 @@ async fn list_siblings(
 struct DownloadQuery {
     bucket: String,
     key: String,
+}
+
+#[derive(Deserialize)]
+struct ThumbQuery {
+    bucket: String,
+    key: String,
+    /// Requested size as `WIDTHxHEIGHT` (default 320x200). Each side must be
+    /// 16–2048 and divisible by 4 or 5 (pCloud getthumblink constraint).
+    size: Option<String>,
+}
+
+/// GET /api/thumb — a small, cached, server-side-generated preview of an image
+/// object. Falls back to the full image (302 redirect to /api/download) when no
+/// thumbnail can be produced, so `<img>` tags always resolve.
+async fn thumb(State(state): State<WebState>, Query(q): Query<ThumbQuery>) -> Response {
+    if q.bucket.is_empty() || q.key.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "missing 'bucket' or 'key' parameter");
+    }
+    let key = q.key.trim_end_matches('/');
+    let size = q.size.as_deref().filter(|s| is_valid_thumb_size(s)).unwrap_or("320x200");
+
+    match state.engine.thumbnail(&q.bucket, key, size).await {
+        Ok(Some(bytes)) => {
+            let ct = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                "image/png"
+            } else {
+                "image/jpeg"
+            };
+            Response::builder()
+                .header(header::CONTENT_TYPE, ct)
+                .header(header::CONTENT_LENGTH, bytes.len().to_string())
+                .header(header::CACHE_CONTROL, "private, max-age=86400")
+                .body(axum::body::Body::from(bytes))
+                .unwrap()
+        }
+        // No thumbnail available — redirect the browser to the full image.
+        Ok(None) => {
+            let dest = format!(
+                "/api/download?{}",
+                serde_urlencoded_lite(&[("bucket", &q.bucket), ("key", key)])
+            );
+            Response::builder()
+                .status(StatusCode::TEMPORARY_REDIRECT)
+                .header(header::LOCATION, dest)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        }
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Minimal `application/x-www-form-urlencoded` encoder for the redirect Location.
+pub(crate) fn serde_urlencoded_lite(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, urlencoding(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+pub(crate) fn urlencoding(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// `WIDTHxHEIGHT` with both sides in a sane range (16..=4096). Anything else is
+/// rejected and the handler falls back to a default size.
+pub(crate) fn is_valid_thumb_size(size: &str) -> bool {
+    let Some((w, h)) = size.split_once('x') else {
+        return false;
+    };
+    let ok = |s: &str| s.parse::<u32>().map(|n| (16..=4096).contains(&n)).unwrap_or(false);
+    ok(w) && ok(h)
 }
 
 async fn download(
