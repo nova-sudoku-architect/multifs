@@ -59,6 +59,30 @@ fn json_error(status: StatusCode, message: &str) -> Response {
     resp
 }
 
+/// Format an RFC 3339 timestamp as an HTTP-date (IMF-fixdate), if parseable.
+pub(crate) fn http_date(rfc3339: &str) -> Option<String> {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .ok()
+        .map(|dt| {
+            dt.with_timezone(&chrono::Utc)
+                .format("%a, %d %b %Y %H:%M:%S GMT")
+                .to_string()
+        })
+}
+
+/// Does an `If-None-Match` header value match `etag` (quoted) under the weak
+/// comparison HTTP requires?
+pub(crate) fn if_none_match_hits(header_value: &str, etag: &str) -> bool {
+    let v = header_value.trim();
+    if v == "*" {
+        return true;
+    }
+    v.split(',').any(|t| {
+        let t = t.trim();
+        t.strip_prefix("W/").unwrap_or(t) == etag
+    })
+}
+
 async fn list_buckets(State(state): State<WebState>) -> Response {
     match state.engine.list_all_buckets().await {
         Ok(buckets) => {
@@ -295,6 +319,36 @@ async fn download(
     let range_val = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     let parsed_range = range_val.and_then(|rv| crate::server::parse_range(rv, total_len));
 
+    // Cache validators. The stored ETag is the blob's SHA-256 (single-blob
+    // model), so it changes whenever the object changes. Revalidation (304)
+    // saves a full pCloud fetch for covers/images the browser already has.
+    let etag = format!("\"{}\"", obj_info.etag);
+    let last_modified = http_date(&obj_info.last_modified);
+
+    // Conditional GET — only for non-Range requests (Range is served as 206).
+    if parsed_range.is_none() {
+        let inm = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
+        let ims = headers
+            .get(header::IF_MODIFIED_SINCE)
+            .and_then(|v| v.to_str().ok());
+        let not_modified = match (inm, ims) {
+            // If-None-Match takes precedence over If-Modified-Since (RFC 7232).
+            (Some(inm), _) => if_none_match_hits(inm, &etag),
+            (None, Some(ims)) => last_modified.as_deref() == Some(ims),
+            (None, None) => false,
+        };
+        if not_modified {
+            let mut b = Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header(header::ETAG, &etag)
+                .header(header::CACHE_CONTROL, "private, max-age=300");
+            if let Some(lm) = &last_modified {
+                b = b.header(header::LAST_MODIFIED, lm);
+            }
+            return b.body(axum::body::Body::empty()).unwrap();
+        }
+    }
+
     let content_length = match parsed_range {
         Some((start, end)) => end.saturating_sub(start),
         None => total_len,
@@ -331,7 +385,13 @@ async fn download(
         .header(header::CONTENT_TYPE, &content_type_header)
         .header(header::CONTENT_LENGTH, content_length.to_string())
         .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::ETAG, &etag)
+        .header(header::CACHE_CONTROL, "private, max-age=300")
         .header(header::CONTENT_DISPOSITION, disposition);
+
+    if let Some(lm) = &last_modified {
+        response = response.header(header::LAST_MODIFIED, lm);
+    }
 
     if let Some((start, end)) = parsed_range {
         response = response
