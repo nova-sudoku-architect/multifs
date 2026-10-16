@@ -1,0 +1,15 @@
+#!/bin/sh
+# prerm — runs before the multifs package files are removed.
+set -e
+
+if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        # Stop the daemon but leave state/config in place (purge removes them).
+        systemctl stop multifs.service 2>/dev/null || true
+        systemctl disable multifs.service 2>/dev/null || true
+        systemctl stop multifs-vacuum.timer 2>/dev/null || true
+        systemctl disable multifs-vacuum.timer 2>/dev/null || true
+    fi
+fi
+
+exit 0

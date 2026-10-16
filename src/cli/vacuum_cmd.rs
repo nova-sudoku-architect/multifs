@@ -10,10 +10,16 @@ pub struct VacuumArgs {
     /// Dry-run: report what would be reclaimed without deleting anything
     #[arg(long)]
     pub dry_run: bool,
+    /// Path to configuration file (defaults to the standard search path)
+    #[arg(short, long)]
+    pub config: Option<String>,
 }
 
 pub async fn run(args: VacuumArgs) -> Result<()> {
-    let cfg_path = crate::config::find_config()?;
+    let cfg_path = match args.config {
+        Some(p) => p,
+        None => crate::config::find_config()?,
+    };
     let cfg = crate::config::load(&cfg_path)?;
     let meta = crate::storage::metadata::MetadataDb::open(&cfg.storage.meta_db_path)?;
     let engine = crate::storage::engine::StorageEngine::new(&cfg, meta)?;

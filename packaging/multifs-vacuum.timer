@@ -1,0 +1,11 @@
+[Unit]
+Description=Run MultiFS vacuum hourly
+Documentation=https://github.com/nova-sudoku-architect/multifs
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=MultiFS vacuum (garbage-collect superseded/abandoned object versions)
+Documentation=https://github.com/nova-sudoku-architect/multifs
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=-/etc/multifs.env
+ExecStart=/usr/local/bin/multifs vacuum --config /etc/multifs.toml
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=MultiFS S3 mount via rclone (optional)
+Documentation=https://github.com/nova-sudoku-architect/multifs
+After=network-online.target multifs.service
+Wants=multifs.service
+# Only start when explicitly enabled: systemctl enable multifs-mount.service
+ConditionPathExists=/etc/multifs/mount.conf
+
+[Service]
+Type=forking
+# Instance-specific mount settings live in /etc/multifs/mount.conf (EnvironmentFile),
+# e.g. RCLONE_REMOTE=multifs-s3:video, MOUNT_POINT=/mnt/multifs, MOUNT_UID=1000.
+EnvironmentFile=/etc/multifs/mount.conf
+ExecStart=/usr/bin/rclone mount ${RCLONE_REMOTE} ${MOUNT_POINT} \
+  --daemon --vfs-cache-mode full --dir-cache-time 5s \
+  --allow-other --uid ${MOUNT_UID} --gid ${MOUNT_GID} --umask 022
+ExecStop=/bin/fusermount -uz ${MOUNT_POINT}
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

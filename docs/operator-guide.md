@@ -132,6 +132,23 @@ tree: `PCloudBackend` (real), `LocalDiskBackend` (overflow tier), and
 
 ## Deploy
 
+### From a package (recommended)
+
+Build and install the Debian package (see [`packaging/README.md`](../packaging/README.md)):
+
+```bash
+packaging/build-deb.sh                 # -> target/deb/multifs_<version>_amd64.deb
+sudo apt install ./target/deb/multifs_0.1.0_amd64.deb
+sudo systemctl enable --now multifs.service
+```
+
+The package places the binary, the systemd units (`multifs.service`, the vacuum timer,
+and the optional mount unit), a generic `/etc/multifs.toml`, and an empty `/etc/multifs.env`
+(both conffiles, so upgrades preserve your edits), and creates the state/cache dirs.
+`apt remove` keeps config + state; `apt purge` removes them.
+
+### From source (manual)
+
 ```bash
 cargo build --release
 sudo systemctl stop multifs.service
@@ -140,8 +157,9 @@ sudo systemctl start multifs.service
 ```
 
 Deployed as systemd `multifs.service`: binary `/usr/local/bin/multifs`, config
-`/etc/multifs.toml`, env `/etc/multifs.env`, DB `/var/lib/multifs/meta.db`.
-(Host-specific values live in the instance config, not this repo.)
+`/etc/multifs.toml` (a `/etc/multifs/config.toml` symlink also works), env
+`/etc/multifs.env`, DB `/var/lib/multifs/meta.db`. (Host-specific values live in the
+instance config, not this repo.)
 
 
 ## Observability

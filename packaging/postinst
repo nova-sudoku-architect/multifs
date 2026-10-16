@@ -1,0 +1,32 @@
+#!/bin/sh
+# postinst — runs after the multifs .deb is unpacked (install or upgrade).
+set -e
+
+# systemd is the expected init; reload after unit changes (guarded for containers).
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+
+# First install only: create state/cache dirs and a default config.
+if [ "$1" = "configure" ]; then
+    install -d -m 0750 -o root -g root /var/lib/multifs
+    install -d -m 0750 -o root -g root /var/cache/multifs
+    install -d -m 0755 -o root -g root /var/cache/multifs/thumbs
+
+    # Seed an env file if missing (tokens are added by the operator).
+    if [ ! -e /etc/multifs.env ]; then
+        : > /etc/multifs.env
+        chmod 0600 /etc/multifs.env
+    fi
+
+    # Conffile semantics: dpkg installs /etc/multifs.toml only if the admin hasn't
+    # modified it, so an existing deployment's config is preserved on upgrade.
+
+    echo "MultiFS installed. Next steps:"
+    echo "  1. Edit /etc/multifs.toml (or run: multifs init --force)"
+    echo "  2. Add backend tokens to /etc/multifs.env (chmod 0600) via:"
+    echo "       multifs account add <email> --token-env <VAR>"
+    echo "  3. systemctl enable --now multifs.service"
+fi
+
+exit 0

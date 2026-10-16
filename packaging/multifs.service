@@ -1,0 +1,24 @@
+[Unit]
+Description=MultiFS — multi-cloud storage pool (S3 API)
+Documentation=https://github.com/nova-sudoku-architect/multifs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root so it can read /etc/multifs.env and write /var/lib/multifs + /var/cache/multifs.
+# Hardening: the unit only needs network + its own state/cache dirs.
+User=root
+EnvironmentFile=-/etc/multifs.env
+ExecStart=/usr/local/bin/multifs serve --config /etc/multifs.toml
+Restart=on-failure
+RestartSec=5
+# Modest hardening that does not break pCloud HTTP I/O.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/var/lib/multifs /var/cache/multifs
+
+[Install]
+WantedBy=multi-user.target
