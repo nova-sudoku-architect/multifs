@@ -10,6 +10,6 @@ pub mod init;
 pub mod link_cmd;
 pub mod object_cmd;
 pub mod serve;
-pub mod shard_cmd;
+pub mod backend_cmd;
 pub mod status;
 pub mod vacuum_cmd;

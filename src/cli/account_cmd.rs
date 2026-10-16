@@ -165,7 +165,7 @@ pub async fn run(args: AccountArgs) -> Result<()> {
             }
             crate::config::save(&cfg_path, &cfg)?;
             println!("✅ Account {} removed from config.", email);
-            println!("💡 Objects on this account are still in storage. Run 'multifs shard rebalance' to migrate.");
+            println!("💡 Objects on this account are still in storage. Run 'multifs backend rebalance' to migrate.");
         }
 
         AccountSubcommand::Check { email } => {

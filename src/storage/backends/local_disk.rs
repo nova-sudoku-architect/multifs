@@ -14,7 +14,7 @@ use crate::config::AccountConfig;
 /// so `root/video/foo` is used, keeping the on-disk layout clean.
 ///
 /// This backend is a first-class account in the storage pool: the `Utilization`
-/// placement strategy treats it like any other shard and reports the real
+/// placement strategy treats it like any other backend and reports the real
 /// filesystem free space via `statvfs`, so writes naturally spill to local disk
 /// as the pCloud accounts fill up.
 #[derive(Clone)]

@@ -1321,7 +1321,7 @@ mod tests {
             .unwrap();
 
         // Parts must have scattered across both backends (round-robin).
-        let statuses = engine.shard_status().await.unwrap();
+        let statuses = engine.backend_status().await.unwrap();
         let used: Vec<(String, i64)> = statuses
             .iter()
             .map(|s| (s.email.clone(), s.used_bytes))
@@ -1336,7 +1336,7 @@ mod tests {
         // zero leaked blobs on the non-canonical backend.
         engine.abort_multipart_upload(upload_id).await.unwrap();
 
-        let statuses = engine.shard_status().await.unwrap();
+        let statuses = engine.backend_status().await.unwrap();
         for s in &statuses {
             assert_eq!(
                 s.used_bytes, 0,

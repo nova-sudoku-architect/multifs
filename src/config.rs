@@ -106,7 +106,7 @@ pub struct AccountConfig {
     pub token_env: Option<String>,
     /// Base path prefix (e.g., "/multifs/00")
     pub mount_prefix: String,
-    /// Quota in GB (optional, for display/sharding decisions)
+    /// Quota in GB (optional, for display/placement decisions)
     pub quota_gb: Option<u64>,
     /// Local disk root directory (required for backend_type = "local")
     pub path: Option<String>,

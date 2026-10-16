@@ -1409,7 +1409,7 @@ impl MetadataDb {
         })
     }
 
-    /// Count multipart parts physically stored on a given account (for `shard
+    /// Count multipart parts physically stored on a given account (for `backend
     /// status` — a multipart object's parts are spread across accounts, so the
     /// logical object count alone under-reports an account's real footprint).
     pub fn count_parts_for_account(&self, email: &str) -> anyhow::Result<i64> {
