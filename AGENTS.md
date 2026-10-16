@@ -27,14 +27,24 @@ Whenever you change code, update the docs in the **same commit** (or a follow-up
 
 | File | What it covers | Update when you change… |
 |------|----------------|--------------------------|
-| `README.md` | Features table, CLI reference, config, GC section | features, CLI commands/flags, placement, vacuum/import behavior |
+| `README.md` | Landing page: intro, features table, quick start, docs index | features, the docs map |
+| `docs/user-guide.md` | Concepts, S3 usage, web UI, folder metadata, symlinks | user-facing behavior, terminology, web UI |
+| `docs/operator-guide.md` | Configuration, backends, deploy, observability, GC | config, placement, deploy, GC, metrics |
+| `docs/cli-reference.md` | Full CLI reference | any command/subcommand/flag |
+| `docs/planning.md` | Design goals, **caveats & limitations**, roadmap | limitations, roadmap / future work |
+| `docs/developer-guide.md` | Repo layout, data-flow diagrams, tests, adding a backend | module layout, request flows, build/test |
 | `docs/architecture.md` | Data model, MVCC read/write/delete paths, multipart, GC, placement, backend interface, known issues, **test count** | schema, engine logic, storage backends, known issues, `cargo test --lib` count |
 | `config.example.toml` | Annotated **generic** config template | `src/config.rs` fields (add/remove/rename, defaults) |
 
+> The README was split into audience pages (issue #13): read the landing README
+> for orientation, then the page for your audience. A behavior change usually
+> touches **operator-guide + cli-reference** (if CLI/config), **user-guide** (if
+> user-visible), and **architecture.md** (always, incl. the test count).
+
 ### Checklist before committing a behavior change
 
-- [ ] `README.md` features / CLI / config updated — and, before any PR merges, the
-      [README review gate](#readme-review-gate--mandatory-on-every-pr) is satisfied
+- [ ] README features / docs map updated if the feature set changed
+- [ ] the relevant audience page(s) updated — user-guide / operator-guide / cli-reference / planning
 - [ ] `docs/architecture.md` updated — **including the test count**, which must match `cargo test --lib`
 - [ ] config examples updated if `src/config.rs` changed (generic template only — no deployment values)
 - [ ] No stale claims (grep for removed features: `WebDAV`, `chunking`, `32 MB`, `erasure`, `page cache`)
@@ -67,9 +77,10 @@ Open an issue describing the enhancement **before** implementing. It must captur
 1. Branch off `main`: `feat/…`, `perf/…`, `refactor/…`, `fix/…`, or `docs/…` (one
    branch per issue).
 2. Commit with a conventional-commit message; keep docs in sync (above).
-3. **Review the README for alignment** — mandatory, on every PR (see
-   [README review gate](#readme-review-gate--mandatory-on-every-pr)). Read the
-   README top-to-bottom against your change and fix anything it now contradicts.
+3. **Review the docs for alignment** — mandatory, on every PR (see
+   [docs review gate](#docs-review-gate--mandatory-on-every-pr)). Walk the
+   README landing page **and the relevant audience page(s)** against your change
+   and fix anything they now contradict.
 4. Open a PR that links the issue (`Closes #N` where it completes it). The PR body
    must state:
    - **what changed and why**,
@@ -77,44 +88,50 @@ Open an issue describing the enhancement **before** implementing. It must captur
      perf, security trade-offs),
    - **verification evidence** — `cargo test --lib` count, `cargo clippy`,
      and any manual/live check,
-   - **README review** — the explicit statement required by the gate below
-     (reviewed ✅ + what changed, or N/A + why the README needs no change),
+   - **docs review** — the explicit statement required by the gate below
+     (reviewed ✅ + what changed, or N/A + why no doc needs a change),
    - **docs updated** + any CLI / config / data-model impact.
    - For security-sensitive work (auth, quotas, exposure), document the threat
      model and the safe-default decision.
 5. Merge (`--no-ff` merge or squash) keeping the issue reference so history is
    traceable, then delete the branch. **A PR is not ready to merge until the
-   README review gate is satisfied.**
+   docs review gate is satisfied.**
 
-### README review gate — mandatory on every PR
+### Docs review gate — mandatory on every PR
 
-`README.md` is the front door: the features table, CLI reference, config example,
-and architecture prose. A change that alters behavior, the CLI, config, the data
+The docs are the front door, split by audience: `README.md` (landing: features
++ docs map), `docs/user-guide.md`, `docs/operator-guide.md`,
+`docs/cli-reference.md`, `docs/planning.md`, `docs/developer-guide.md`, and
+`docs/architecture.md`. A change that alters behavior, the CLI, config, the data
 model, performance characteristics, or the deployment surface can silently
-contradict it. **Every PR must explicitly review the README and confirm
-alignment — no exceptions.**
+contradict one of them. **Every PR must explicitly review the affected doc(s)
+and confirm alignment — no exceptions.**
 
-Before requesting merge, walk the README against the diff and confirm each of:
+Before requesting merge, walk the docs against the diff and confirm each that applies:
 
-- [ ] **Features table** — any new/removed/changed capability is reflected (status
-      row added, reworded, or removed).
-- [ ] **CLI reference** — every added/changed/removed command, subcommand, flag,
-      or alias appears, with accurate usage.
-- [ ] **Config example / reference** — any config field added/renamed/removed is
-      reflected in `config.example.toml` **and** the README config section.
-- [ ] **Diagrams & prose** — sequence/flow diagrams still match the code; no stale
-      claims about removed features (`WebDAV`, `chunking`, `32 MB`, `erasure`,
-      `page cache`, `shard`, …).
-- [ ] **Numbers** — any quoted count/number (accounts, test count, ports, limits)
-      is still correct.
+- [ ] **Features table** (`README.md`) — any new/removed/changed capability is reflected.
+- [ ] **CLI reference** (`docs/cli-reference.md`) — every added/changed/removed command,
+      subcommand, flag, or alias appears, with accurate usage.
+- [ ] **Config** (`docs/operator-guide.md` + `config.example.toml`) — any config field
+      added/renamed/removed is reflected in both.
+- [ ] **User guide / operator guide** — user-visible behavior and run/operate steps match.
+- [ ] **Planning** (`docs/planning.md`) — caveats/limitations and roadmap stay truthful
+      (move shipped items to *Recently shipped*, don't leave a done item "planned").
+- [ ] **Developer guide / architecture** — module layout, request flows, and diagrams match;
+      **test count** matches `cargo test --lib`.
+- [ ] **Diagrams & prose** — sequence/flow diagrams still match the code; no stale claims
+      about removed features (`WebDAV`, `chunking`, `32 MB`, `erasure`, `page cache`, `shard`, …).
+- [ ] **Links** — no dangling `#anchors` (pages were split; cross-links must point at the
+      right page).
+- [ ] **Numbers** — any quoted count/number (accounts, test count, ports, limits) is still correct.
 
-The PR body must contain a **README review** line, one of:
+The PR body must contain a **docs review** line, one of:
 
-- `README reviewed — updated: <what changed>` , or
-- `README reviewed — no change needed: <why it stays accurate>` .
+- `docs reviewed — updated: <which page(s), what changed>` , or
+- `docs reviewed — no change needed: <why they stay accurate>` .
 
-If the README genuinely needs no change, say so explicitly (and why) — an absent
-README mention is a blocking gap, not an implicit "N/A".
+If no doc genuinely needs a change, say so explicitly (and why) — an absent doc
+mention is a blocking gap, not an implicit "N/A".
 
 **Exempt:** pure typo/comment fixes and doc-only nits may go straight to `main`.
 When in doubt, open an issue.
