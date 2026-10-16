@@ -28,6 +28,7 @@ blob in place.
 | `fsck` health check | ✅ Live | DB integrity + backend presence/size + optional checksum verify |
 | Placement | ✅ Live | Tiered: cloud-first, local disk as last resort (per-account `priority`) |
 | Read-only web UI | ✅ Live | GET-only browser navigator: list buckets/objects + download (port 9001) |
+| Observability | ✅ Live | Optional Prometheus `/metrics` + `/healthz`/`/readyz` (port 9100, off by default) |
 | Symlinks (tag folders) | ✅ Live | Present one folder under multiple paths without duplicating bytes (CLI-created) |
 | Folder last-modified | ✅ Live | Every folder shows the time of the last add/remove/update in its subtree (list + preview modes) |
 | Erasure coding | ❌ Stub | Not deployed (single-blob model; each blob lives on one account) |
@@ -232,8 +233,7 @@ safe to expose to a wider audience (e.g. over Tailscale) without risking data lo
 | `/api/list?bucket=&prefix=` | GET | List a folder's direct children (prefixes + files + truncated flag) || `/api/download?bucket=&key=` | GET | Stream a file; honors HTTP Range for seeking/streaming |
 
 Enabled via `server.enable_web = true` + `server.web_port` (default 9001). Folder grouping and
-range slicing reuse `group_objects_by_prefix` and `parse_range` from the shared server module.
-Image files (`.jpg`/`.png`/`.webp`/`.gif`) in a folder are rendered inline as a thumbnail gallery
+range slicing reuse `group_objects_by_prefix` and `parse_range` from the shared server module.Image files (`.jpg`/`.png`/`.webp`/`.gif`) in a folder are rendered inline as a thumbnail gallery
 so cover art and frame captures are visible without clicking. Text files are served with
 `Content-Type; charset=utf-8` and `Content-Disposition: inline`, so UTF-8 subtitles render
 directly in the browser. Charset is detected at upload (BOM / UTF-8 validation) and stored in the
@@ -312,6 +312,35 @@ source is rendered as a small link labelled with its hostname (tooltip = note).
 
 For a non-JSON summary (`.md`/`.txt`), the UI renders Markdown via a minimal safe renderer
 (headings, tables, lists, code, blockquotes, links).
+
+---
+
+## Observability
+
+Optional Prometheus metrics and health endpoints, off by default
+(`server.enable_metrics = true`, port `server.metrics_port`, default `9100`). The
+listener is separate from the S3/web ports so a scraper can reach it without
+exposing the data plane.
+
+| Route | Method | Purpose |
+|-------|--------|---------|
+| `/metrics` | GET | Prometheus text exposition (v0.0.4) |
+| `/healthz` | GET | Liveness — 200 while the process is up |
+| `/readyz` | GET | Readiness — 200 if the metadata DB responds and ≥1 backend is configured, else 503 |
+
+Metrics are **dependency-free**: a small `AppMetrics` struct of relaxed atomics
+(no `metrics`/`prometheus` crate, no global recorder) rendered to text by hand.
+`track_metrics` is an axum middleware layered on the S3 and web routers; it counts
+each request's status class and (where `Content-Length` is known) request/response
+body bytes. `vacuum` bumps the GC counters via `record_gc`. Per-backend gauges are
+derived from the **metadata DB only** (`backend_metrics()`), so a scrape never makes
+a backend API call and stays cheap at ~77 backends.
+
+Exposed series: `multifs_requests_total{status_class}`, `multifs_errors_total`,
+`multifs_bytes_in_total`, `multifs_bytes_out_total`, `multifs_gc_runs_total`,
+`multifs_gc_reclaimed_items_total`, `multifs_backends`, and per-backend
+`multifs_backend_objects` / `_parts` / `_used_bytes` / `_quota_bytes` /
+`_fill_ratio{backend="…"}`.
 
 ---
 
@@ -513,7 +542,7 @@ multifs fsck [--checksums] [--fix] [--prune-missing] [--apply]
 
 ## Test Coverage
 
-All 132 lib tests pass (`cargo test --lib`). Highlights:
+All 137 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_copy_object_roundtrip` / `test_s3_copy_object_overwrites_existing` —
   CopyObject stores a byte-for-byte copy (size + ETag), incl. overwrite (GH #2).
 - `test_s3_binary_put_streams_with_content_length` — binary PUT with a declared
@@ -540,6 +569,12 @@ All 132 lib tests pass (`cargo test --lib`). Highlights:
   list/`*`) and RFC-3339→HTTP-date conversion for `/api/download` revalidation.
 - `test_is_valid_thumb_size` / `test_urlencoding` — `/api/thumb` size validation
   (16..=4096) and the redirect Location encoder.
+- `test_metrics_exposition_renders_counters_and_gauges` — `/metrics` renders the
+  Prometheus text format (counters, gauges, `# TYPE`/`# HELP` lines).
+- `test_readyz_ok_with_backend_and_db` / `test_readyz_503_without_backends` /
+  `test_healthz_is_ok` — readiness/liveness gate logic.
+- `test_track_metrics_counts_requests_and_status` — the request-tracking middleware
+  records status classes.
 
 ---
 

@@ -604,6 +604,14 @@ impl MetadataDb {
         })
     }
 
+    /// Cheap DB liveness probe — opens a connection and runs `SELECT 1`.
+    pub fn ping(&self) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.query_row("SELECT 1", [], |_| Ok(()))
+                .map_err(anyhow::Error::from)
+        })
+    }
+
     pub fn with_conn<F, T>(&self, f: F) -> anyhow::Result<T>
     where
         F: FnOnce(&Connection) -> anyhow::Result<T>,

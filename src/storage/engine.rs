@@ -42,6 +42,17 @@ pub struct BackendHandle {
     pub priority: u32,
 }
 
+/// Local per-backend gauge data for `/metrics` (derived from the metadata DB
+/// and configured quotas only — no backend API calls).
+#[derive(Debug, Clone)]
+pub struct BackendMetric {
+    pub label: String,
+    pub object_count: i64,
+    pub part_count: i64,
+    pub used_bytes: i64,
+    pub quota_bytes: i64,
+}
+
 impl BackendHandle {
     pub fn new(
         backend: Box<dyn StorageBackend>,
@@ -1515,6 +1526,37 @@ impl StorageEngine {
             }
         }
         Ok(statuses)
+    }
+
+    // -----------------------------------------------------------------
+    //  Backend metrics (local only — no backend API calls)
+    // -----------------------------------------------------------------
+
+    /// Number of configured backends (used for health/readiness).
+    pub fn backend_count(&self) -> usize {
+        self.backends.len()
+    }
+
+    /// Cheap metadata-DB liveness probe (used for `/readyz`).
+    pub fn db_ping(&self) -> anyhow::Result<()> {
+        self.meta.ping()
+    }
+
+    /// Per-backend gauge data for `/metrics`, derived from the metadata DB and
+    /// configured quotas **only** (no backend API calls), so a Prometheus scrape
+    /// stays cheap no matter how many backends are configured.
+    pub fn backend_metrics(&self) -> anyhow::Result<Vec<BackendMetric>> {
+        let mut out = Vec::with_capacity(self.backends.len());
+        for handle in self.backends.iter() {
+            out.push(BackendMetric {
+                label: handle.label.clone(),
+                object_count: self.meta.count_objects_for_account(&handle.label)?,
+                part_count: self.meta.count_parts_for_account(&handle.label)?,
+                used_bytes: self.meta.account_total_size(&handle.label)?,
+                quota_bytes: handle.quota_gb as i64 * 1_073_741_824,
+            });
+        }
+        Ok(out)
     }
 
     fn ensure_bucket(&self, name: &str) -> anyhow::Result<()> {

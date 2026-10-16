@@ -3,7 +3,8 @@
 A MinIO/S3-compatible object storage service written in Rust that pools many
 independent storage backends — currently **77 pCloud OAuth accounts (~325 GB)**
 plus a **local disk (80 GB)** — behind a **single S3 endpoint** (port `9000`)
-and an optional **read-only web UI** (port `9001`).
+and an optional **read-only web UI** (port `9001`) and **metrics/health endpoint**
+(port `9100`).
 
 Objects are stored as **single self-contained blobs** with **copy-on-write MVCC
 versioning**: an overwrite never mutates a blob in place — it writes a new
@@ -319,6 +320,7 @@ overflow tier.
 | **Read-only web UI** — browser file navigator (GET-only: list buckets/objects, download) | ✅ |
 | **Web UI column sorting** — click any column header to sort list/preview/names + buckets (persisted) | ✅ |
 | **Web UI virtualization** — `content-visibility` skips off-screen cards; covers hydrate via `IntersectionObserver` (only visible thumbnails fetched) | ✅ |
+| **Observability** — optional Prometheus `/metrics` (requests, bytes in/out, per-backend fill, GC reclaimed) + `/healthz` / `/readyz` health endpoints | ✅ |
 | **Folder last-modified** — every folder shows the last add/remove/update in its subtree | ✅ |
 | WebDAV | ❌ Removed |
 | NFS | ❌ Removed (was a stub; code deleted) |
@@ -413,6 +415,8 @@ enable_s3 = true
 enable_nfs = false        # NFS support removed; field kept for config compatibility
 enable_web = false        # read-only web UI (GET-only browser)
 web_port = 9001
+enable_metrics = false    # Prometheus /metrics + /healthz + /readyz
+metrics_port = 9100
 
 [storage]
 meta_db_path = "/var/lib/multifs/meta.db"
@@ -585,10 +589,36 @@ Deployed as systemd `multifs.service`: binary `/usr/local/bin/multifs`, config
 
 ---
 
+## Observability
+
+Log-only by default; optionally expose metrics and health endpoints for a
+scrape/alerting stack (Prometheus, Uptime Kuma, …). Enable with
+`server.enable_metrics = true` (port `server.metrics_port`, default `9100`):
+
+| Route | Purpose |
+|-------|---------|
+| `/metrics` | Prometheus text exposition (see series below) |
+| `/healthz` | Liveness — `200` while the process is up |
+| `/readyz` | Readiness — `200` when the metadata DB is reachable and ≥1 backend is configured, else `503` |
+
+Exposed series (in-process counters + per-backend gauges from the metadata DB — a
+scrape makes **no** backend API calls): `multifs_requests_total{status_class}`,
+`multifs_errors_total`, `multifs_bytes_in_total` / `multifs_bytes_out_total`,
+`multifs_gc_runs_total` / `multifs_gc_reclaimed_items_total`, `multifs_backends`,
+and per-backend `multifs_backend_objects` / `_parts` / `_used_bytes` /
+`_quota_bytes` / `_fill_ratio{backend=…}`.
+
+```bash
+curl -s http://localhost:9100/metrics
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:9100/readyz
+```
+
+---
+
 ## Running tests
 
 ```bash
-cargo test --lib            # unit tests (132 passing) — count must match docs/architecture.md
+cargo test --lib            # unit tests (137 passing) — count must match docs/architecture.md
 cargo test                  # unit + integration tests
 cargo test -- --nocapture   # with output
 cargo clippy                # lints

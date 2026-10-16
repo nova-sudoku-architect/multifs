@@ -1,9 +1,11 @@
+pub mod metrics;
 pub mod s3;
 pub mod web;
 
 #[cfg(test)]
 mod handler_tests;
 
+use axum::middleware;
 use crate::config::Config;
 
 /// Parse HTTP Range header like "bytes=0-1023" or "bytes=100-"
@@ -229,9 +231,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let engine = std::sync::Arc::new(engine);
 
+    // In-process observability counters (served on `/metrics` when enabled).
+    let metrics = metrics::AppMetrics::new();
+
     // Background vacuum: periodically reclaim superseded + abandoned versions.
     {
         let vacuum_engine = engine.clone();
+        let vacuum_metrics = metrics.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
             interval.tick().await; // skip the immediate first tick
@@ -239,6 +245,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 interval.tick().await;
                 match vacuum_engine.vacuum(false).await {
                     Ok((pending, orphans, multipart)) => {
+                        vacuum_metrics.record_gc(pending + orphans + multipart);
                         if pending > 0 || orphans > 0 || multipart > 0 {
                             tracing::info!(
                                 "vacuum: reclaimed {} pending, {} superseded versions, {} abandoned multipart uploads",
@@ -258,7 +265,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
 
     if cfg.server.enable_s3 {
-        let s3_app = s3::build_router(engine.clone());
+        let s3_app = s3::build_router(engine.clone())
+            .layer(middleware::from_fn_with_state(
+                metrics.clone(),
+                metrics::track_metrics,
+            ));
         let s3_addr = format!("{}:{}", cfg.server.bind, cfg.server.s3_port);
         let listener = tokio::net::TcpListener::bind(&s3_addr).await?;
         tracing::info!("S3 API listening on {}", s3_addr);
@@ -268,12 +279,26 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     }
 
     if cfg.server.enable_web {
-        let web_app = web::build_router(engine.clone());
+        let web_app = web::build_router(engine.clone())
+            .layer(middleware::from_fn_with_state(
+                metrics.clone(),
+                metrics::track_metrics,
+            ));
         let web_addr = format!("{}:{}", cfg.server.bind, cfg.server.web_port);
         let listener = tokio::net::TcpListener::bind(&web_addr).await?;
         tracing::info!("Read-only web UI listening on {}", web_addr);
         tasks.push(tokio::spawn(async move {
             axum::serve(listener, web_app).await.map_err(anyhow::Error::from)
+        }));
+    }
+
+    if cfg.server.enable_metrics {
+        let app = metrics::build_router(engine.clone(), metrics.clone());
+        let metrics_addr = format!("{}:{}", cfg.server.bind, cfg.server.metrics_port);
+        let listener = tokio::net::TcpListener::bind(&metrics_addr).await?;
+        tracing::info!("Metrics/health listening on {}", metrics_addr);
+        tasks.push(tokio::spawn(async move {
+            axum::serve(listener, app).await.map_err(anyhow::Error::from)
         }));
     }
 

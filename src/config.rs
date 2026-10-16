@@ -67,6 +67,13 @@ pub struct ServerConfig {
     /// Web UI port (read-only browser)
     #[serde(default = "default_web_port")]
     pub web_port: u16,
+    /// Whether to enable the metrics/health endpoint listener (`/metrics`,
+    /// `/healthz`, `/readyz`). Off by default — opt in to expose them.
+    #[serde(default)]
+    pub enable_metrics: bool,
+    /// Metrics/health port (Prometheus scrape target)
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -138,6 +145,7 @@ impl AccountConfig {
 fn default_bind() -> String { "0.0.0.0".to_string() }
 fn default_s3_port() -> u16 { 9000 }
 fn default_web_port() -> u16 { 9001 }
+fn default_metrics_port() -> u16 { 9100 }
 fn default_nfs_port() -> u16 { 2049 }
 fn default_true() -> bool { true }
 fn default_meta_db() -> String {
@@ -155,6 +163,8 @@ impl Default for ServerConfig {
             enable_s3: true,
             enable_web: false,
             web_port: default_web_port(),
+            enable_metrics: false,
+            metrics_port: default_metrics_port(),
         }
     }
 }
