@@ -434,6 +434,62 @@ Each part is stored as one standalone blob under `{mount}/{bucket}/__mp__/{uploa
 
 ---
 
+## How a Backend Works (Protocol)
+
+MultiFS is **S3 on the front, provider-native on the back.** The S3 API is only the
+*ingress* clients speak. Behind it, MultiFS talks to each storage provider in that
+provider's **own protocol**, hidden behind the [`StorageBackend` trait](#backend-interface-storagebackend-trait).
+The engine, S3 server, web UI and CLI never see provider-specific details — they only
+call trait methods.
+
+### The two protocols
+
+| Leg | Protocol | Notes |
+|-----|----------|-------|
+| **Client → MultiFS** | **S3** (REST, XML, SigV4) | What `aws-cli`/`rclone`/`s3cmd` speak: `GET /{bucket}`, `PUT /{bucket}/{key}`, ListObjectsV2, multipart, HTTP `Range`, `versionId`, … |
+| **MultiFS → pCloud** | **pCloud native HTTP API** (`eapi.pcloud.com`) | Provider-specific JSON/`result`-code REST. **Not S3.** |
+
+So the answer to *"does MultiFS use S3 to talk to pCloud?"* is **no**. pCloud exposes
+no S3 endpoint; MultiFS uses pCloud's own API. (A new provider that *does* speak S3
+would be a new backend type implementing the same trait — not a change to this path.)
+
+### pCloud backend — how a read/write actually works
+
+`PCloudBackend` wraps a `PCloudClient` (OAuth bearer token, EU endpoint
+`eapi.pcloud.com`). Every op maps to pCloud REST calls:
+
+- **Write** (`upload` / `upload_stream`) → `POST /uploadfile` with a multipart form
+  (`access_token`, `path`, `filename`, `nopartial=1`, `file`). Parent directories are
+  ensured first via `ensure_path` (`listfolder`, then `createfolder` on a miss), cached
+  in-memory so repeat uploads skip the round-trip.
+- **Read** (`download` / `download_stream`) → a **two-step** flow: `POST /getfilelink`
+  returns a CDN `hosts[]` + `path`; MultiFS then issues a plain HTTPS `GET` to that CDN
+  (`https://{host}{path}`), streaming chunks. Ranged reads pass `Range` to the CDN.
+- **List** → `listfolder` (path-based). **Delete** → `deletefile` / `deletefolder`.
+- **Quota** (`check_quota`) → `userinfo`-style call returning used/total bytes.
+
+err/handling: a pCloud `result != 0` becomes a Rust error carrying pCloud's `error`
+string; specific codes (quota-full `2008`, rate-limit `429`, auth `2094`) are recognised
+by callers.
+
+### Consequences of a native (non-S3) backend
+
+Because pCloud is a general file host, not an object store, MultiFS works around it:
+
+- **Opaque blob names.** Blobs are stored as `<key>.v<n>.c1` with an opaque content type
+  because pCloud's own metadata/`getthumblink` can't see them as images (`thumb=false`,
+  result 1014) — hence server-side thumbnails are decoded + resized *locally*.
+- **Two-step reads** add a `getfilelink` round-trip before any bytes move (S3 providers
+  would allow a direct ranged `GET`).
+- **No server-side copy/range primitives** at the object level; CopyObject/UploadPartCopy
+  are assembled by MultiFS.
+
+A provider that *does* speak S3 (Backblaze B2, Wasabi, R2, MinIO, AWS) would implement
+the same trait with direct `GET`/`PUT`/`Range`/`CopyObject` and need none of these
+workarounds. See the design-record issue on S3-backend feasibility and costs.
+
+---
+
 ## Backend Interface (StorageBackend Trait)
 
 ```rust
