@@ -1321,24 +1321,19 @@ impl StorageEngine {
         }
         let mut current = trimmed.to_string();
         let mut hops = 0;
-        loop {
-            match self.meta.resolve_symlink(bucket, &current)? {
-                Some((tb, tk, rem)) => {
-                    if tb != bucket {
-                        return Ok(None); // same-bucket only
-                    }
-                    let mut target = tk.trim_end_matches('/').to_string();
-                    if !rem.is_empty() {
-                        target.push('/');
-                        target.push_str(&rem);
-                    }
-                    current = target;
-                    hops += 1;
-                    if hops >= 8 {
-                        break;
-                    }
-                }
-                None => break,
+        while let Some((tb, tk, rem)) = self.meta.resolve_symlink(bucket, &current)? {
+            if tb != bucket {
+                return Ok(None); // same-bucket only
+            }
+            let mut target = tk.trim_end_matches('/').to_string();
+            if !rem.is_empty() {
+                target.push('/');
+                target.push_str(&rem);
+            }
+            current = target;
+            hops += 1;
+            if hops >= 8 {
+                break;
             }
         }
         if hops == 0 {
@@ -1763,7 +1758,7 @@ impl StorageEngine {
             total_size,
             &etag,
             &now,
-            content_type.as_deref().or(ct.as_deref()),
+            content_type.or(ct.as_deref()),
             &canonical_path,
         )?;
         // A completed multipart upload is an object add/update — refresh the
@@ -1930,7 +1925,7 @@ impl StorageEngine {
                 let _ = self.meta.delete_version(&obj.bucket_name, &obj.key, obj.version);
                 migrated += 1;
                 total_bytes += obj.size;
-                if migrated % 10 == 0 {
+                if migrated.is_multiple_of(10) {
                     println!("  Progress: {} objects migrated", migrated);
                 }
             }

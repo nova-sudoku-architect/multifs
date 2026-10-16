@@ -154,24 +154,21 @@ fn backfill(meta: &MetadataDb, bucket: Option<&str>, dry_run: bool) -> Result<()
         let key = (obj.bucket_name.clone(), prefix);
         let entry = best.entry(key).or_default();
 
-        if is_cover_image_key(&obj.key) {
-            if entry.cover_key.is_none()
-                || cover_rank(name) > cover_rank(entry.cover_key.as_deref().unwrap_or(""))
-            {
-                entry.cover_key = Some(obj.key.clone());
-            }
-        } else if is_summary_key(&obj.key) {
-            if entry.summary_key.is_none()
-                || summary_rank(name) > summary_rank(entry.summary_key.as_deref().unwrap_or(""))
-            {
-                entry.summary_key = Some(obj.key.clone());
-            }
-        } else if is_preview_gif_key(&obj.key) {
-            if entry.preview_gif_key.is_none()
-                || gif_rank(name) > gif_rank(entry.preview_gif_key.as_deref().unwrap_or(""))
-            {
-                entry.preview_gif_key = Some(obj.key.clone());
-            }
+        if is_cover_image_key(&obj.key)
+            && (entry.cover_key.is_none()
+                || cover_rank(name) > cover_rank(entry.cover_key.as_deref().unwrap_or("")))
+        {
+            entry.cover_key = Some(obj.key.clone());
+        } else if is_summary_key(&obj.key)
+            && (entry.summary_key.is_none()
+                || summary_rank(name) > summary_rank(entry.summary_key.as_deref().unwrap_or("")))
+        {
+            entry.summary_key = Some(obj.key.clone());
+        } else if is_preview_gif_key(&obj.key)
+            && (entry.preview_gif_key.is_none()
+                || gif_rank(name) > gif_rank(entry.preview_gif_key.as_deref().unwrap_or("")))
+        {
+            entry.preview_gif_key = Some(obj.key.clone());
         }
     }
 

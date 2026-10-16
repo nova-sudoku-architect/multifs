@@ -470,9 +470,7 @@ impl PCloudClient {
         let part = if let Some(len) = content_length {
             let hasher = hasher.clone();
             let hashed = stream.map(move |item| {
-                let chunk = item.map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                })?;
+                let chunk = item.map_err(|e| std::io::Error::other(e.to_string()))?;
                 hasher.lock().unwrap().update(&chunk);
                 Ok::<Bytes, std::io::Error>(chunk)
             });
@@ -669,7 +667,7 @@ impl PCloudClient {
 
         let files: Vec<PCloudFile> = contents
             .iter()
-            .filter(|f| f["isfolder"].as_bool().unwrap_or(false) == false)
+            .filter(|f| !f["isfolder"].as_bool().unwrap_or(false))
             .map(|f| PCloudFile {
                 file_id: f["fileid"].as_i64().unwrap_or(0),
                 name: f["name"].as_str().unwrap_or("").to_string(),

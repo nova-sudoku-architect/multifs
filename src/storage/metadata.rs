@@ -3,6 +3,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+/// One persisted multipart part row: `(part_number, size, etag, account, path)`.
+pub type MultipartPartRow = (u64, i64, String, String, String);
+
 /// Normalize a folder prefix to canonical form: the bucket root is the empty
 /// string; every other prefix ends in `/`. Mirrors the normalization used by
 /// [`MetadataDb::count_direct_children`] and the batch listing helpers.
@@ -1857,14 +1860,14 @@ impl MetadataDb {
                     pcloud_path
                 ],
             )?;
-            Ok(prev.map(|(a, p)| (a, p)))
+            Ok(prev)
         })
     }
 
     pub fn list_multipart_parts(
         &self,
         upload_id: &str,
-    ) -> anyhow::Result<Vec<(u64, i64, String, String, String)>> {
+    ) -> anyhow::Result<Vec<MultipartPartRow>> {
         // Returns: (part_number, size, part_etag, pcloud_account, pcloud_path)
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -2376,10 +2379,9 @@ impl MetadataDb {
             if q.len() > lk.len() + 1
                 && q.starts_with(lk)
                 && q.as_bytes().get(lk.len()) == Some(&b'/')
+                && best.is_none_or(|b| lk.len() > b.key.trim_end_matches('/').len())
             {
-                if best.map_or(true, |b| lk.len() > b.key.trim_end_matches('/').len()) {
-                    best = Some(l);
-                }
+                best = Some(l);
             }
         }
         if let Some(l) = best {
@@ -2498,9 +2500,7 @@ pub fn gif_rank(name: &str) -> u8 {
     let n = name.to_ascii_lowercase();
     if n == "preview.gif" {
         3
-    } else if n == "keyframes.gif" {
-        2
-    } else if n.ends_with(".preview.gif") {
+    } else if n == "keyframes.gif" || n.ends_with(".preview.gif") {
         2
     } else if n.ends_with(".keyframes.gif") {
         1

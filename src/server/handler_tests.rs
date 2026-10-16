@@ -1,10 +1,10 @@
-/// Tests for HTTP handler-level logic: Range parsing, content-type resolution,
-/// S3 multipart body consumption (regression test for the TCP-stall bug),
-/// and engine error paths (put_chunked_file failure recovery).
-/// These fill the gap between format-only tests and full integration tests.
+//! Tests for HTTP handler-level logic: Range parsing, content-type resolution,
+//! S3 multipart body consumption (regression test for the TCP-stall bug),
+//! and engine error paths (put_chunked_file failure recovery).
+//! These fill the gap between format-only tests and full integration tests.
 
 #[cfg(test)]
-mod handler_tests {
+mod tests {
     use tower::ServiceExt;
     use crate::server::{parse_range, resolve_content_type};
     use crate::storage::metadata::MetadataDb;
@@ -373,8 +373,7 @@ mod handler_tests {
             "mock-a".to_string(),
             10,
         )];
-        let engine = std::sync::Arc::new(StorageEngine::from_backends(backends, db));
-        engine
+        std::sync::Arc::new(StorageEngine::from_backends(backends, db))
     }
 
     /// Full multipart round-trip: initiate -> two parts -> complete -> verify
