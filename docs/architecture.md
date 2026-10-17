@@ -414,6 +414,12 @@ by account and deletes each account's `__mp__/multipart-<id>` folder (with a per
 fallback). A failed delete keeps the DB rows so a later vacuum retries rather than silently
 leaking bytes.
 
+Deletes are **idempotent**: pCloud answers a delete for an already-absent target with
+`2009` ("File not found.") / `2055` ("File or folder not found."), which the client treats
+as success. Without that, the orphan sweep would keep those rows "for retry" forever — the
+blob was already gone, so no retry could ever succeed, and the same dead rows were re-tried
+on every 10-minute cycle.
+
 ---
 
 ## S3 Request Authentication (SigV4)
@@ -647,7 +653,7 @@ multifs fsck [--checksums] [--fix] [--prune-missing] [--apply]
 
 ## Test Coverage
 
-All 157 lib tests pass (`cargo test --lib`). Highlights:
+All 159 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_copy_object_roundtrip` / `test_s3_copy_object_overwrites_existing` —
   CopyObject stores a byte-for-byte copy (size + ETag), incl. overwrite (GH #2).
 - `test_s3_binary_put_streams_with_content_length` — binary PUT with a declared
