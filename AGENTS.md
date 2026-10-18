@@ -161,10 +161,15 @@ key it skips (fail-open) rather than blocking.
 
 #### Two triggers — the PR one cannot be missed
 
-| Trigger | Can be bypassed | Comments on the PR |
-|---|---|---|
-| Pre-push hook (local) | yes — `--no-verify`, `AI_REVIEW_SKIP=1` | no |
-| GitHub workflow (`.github/workflows/ai-review.yml`) | only by not opening a PR | **yes** |
+| Trigger | Can be bypassed | Blocks | Comments on the PR |
+|---|---|---|---|
+| Pre-push hook (local) | yes — `--no-verify`, `AI_REVIEW_SKIP=1` | **yes** | no |
+| GitHub workflow (`.github/workflows/ai-review.yml`) | only by not opening a PR | **no** — reports only | **yes** |
+
+The workflow runs the engine with `--no-block`, so a `fail` verdict is posted as a
+comment and the check still goes green. That is deliberate: this repo has no
+branch protection, so a red check would not stop a merge — only add noise. **Only
+the pre-push hook blocks a push.** Revisit if branch protection is enabled.
 
 The workflow runs on `pull_request: opened / synchronize / reopened`, so the
 review is attached to the **PR**, not to a push. That matters: a client-side hook

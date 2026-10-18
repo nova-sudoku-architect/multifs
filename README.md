@@ -121,8 +121,8 @@ bash .githooks/install.sh
 ```
 
 It reviews a diff against this repo's own docs (terminology, doc alignment,
-deployment-config/secret safety) and blocks on a `fail` verdict. Bypass a single
-push with `AI_REVIEW_SKIP=1` or `git push --no-verify`. See
+deployment-config/secret safety) and blocks a push on a `fail` verdict. Bypass a
+single push with `AI_REVIEW_SKIP=1` or `git push --no-verify`. See
 [`AGENTS.md`](AGENTS.md#pre-push-review-hook--automated-but-not-a-substitute).
 
 Requires `pip install openai` and a DeepSeek API key (`DEEPSEEK_API_KEY`).
@@ -132,6 +132,11 @@ The same review also runs **on every pull request** via
 its verdict as a PR comment — so a branch's first push is reviewed too, and a
 contributor who never ran `install.sh` still gets reviewed. Each comment records
 the reviewed commit, so the next run reviews only what changed since.
+
+**The CI trigger reports; it does not block.** The workflow runs the engine with
+`--no-block`, so a `fail` verdict is posted as a comment and the check still goes
+green. That is deliberate — this repo has no branch protection, so a red check
+would not stop a merge, only add noise. **Only the pre-push hook blocks a push.**
 
 ```bash
 # Initialize config and database
