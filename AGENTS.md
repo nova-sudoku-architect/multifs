@@ -139,6 +139,32 @@ When in doubt, open an issue.
 Every issue/PR must be **self-contained**: someone reading only it should understand
 the change and its rationale without reading the code.
 
+### Pre-push review hook — automated, but not a substitute
+
+`.githooks/` holds a client-side hook that runs before a push. It sends the
+diff plus this repo's own authority files (`README.md` docs map/features,
+`AGENTS.md` deployment-config + docs-sync + issues/PRs + docs review gate) to an
+LLM and blocks on a `fail` verdict. Axes: terminology, doc alignment,
+deployment-config & secret safety, architecture & correctness.
+
+```bash
+bash .githooks/install.sh            # enable for this clone (core.hooksPath)
+git config --unset core.hooksPath    # disable
+python3 .githooks/ai_review.py --range main..HEAD --no-block   # dry run
+python3 .githooks/ai_review.py --print-conventions            # see the authority
+AI_REVIEW_SKIP=1 git push            # skip the review
+```
+
+The engine (`.githooks/ai_review.py`) is **portable** — the same file is used in
+sibling repos. Everything repo-specific lives in `.githooks/review.json`
+(reviewed paths, authority files, axes). **Edit the config, never fork the
+engine**; two copies of logic drift, two copies of config cannot.
+
+What it does **not** do: it cannot verify that an issue exists, it cannot read
+the PR body, and it can be bypassed with `--no-verify`. The **docs review gate
+above stays mandatory** — the hook catches stale docs in the diff, but the
+`docs reviewed — …` line in the PR body is still yours to write.
+
 ## Secrets
 
 Passwords, API keys, and OAuth tokens live in env vars (`~/.openclaw/.env` / `/etc/multifs.env`), never in code, config, or docs. Config files reference them by env-var name only (`token_env = "PCLOUD_TOKEN_VIDEO_01"`).
