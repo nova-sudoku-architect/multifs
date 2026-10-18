@@ -1,0 +1,55 @@
+# PR-triggered AI review.
+#
+# The pre-push hook is client-side: it can be bypassed, and a contributor who
+# never ran `install.sh` has no hook at all. This workflow is the trigger that
+# cannot be missed — the PR is the event, so a branch's first push is reviewed
+# too, and the verdict is posted as a comment on the PR.
+#
+# The comment carries a hidden machine-readable state block. The next run diffs
+# only the commits added since, and feeds the previous findings back to the
+# reviewer, so unchanged code is not re-analysed.
+#
+# Setup: add DEEPSEEK_API_KEY as a repository secret. GITHUB_TOKEN is automatic
+# (permissions below).
+
+name: ai-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write   # needed to post the verdict comment
+
+concurrency:
+  # A new push supersedes the review of the previous one.
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the diff needs history, incl. the base branch
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install reviewer dependency
+        run: pip install --quiet openai
+
+      - name: Review the change set
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AI_REVIEW_REPO: ${{ github.repository }}
+          AI_REVIEW_PR: ${{ github.event.pull_request.number }}
+        run: |
+          git fetch --quiet origin "${{ github.base_ref }}"
+          python3 .githooks/ai_review.py \
+            --range "origin/${{ github.base_ref }}...${{ github.event.pull_request.head.sha }}" \
+            --post-comment --no-block

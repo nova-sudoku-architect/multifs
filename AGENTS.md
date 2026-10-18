@@ -155,6 +155,44 @@ python3 .githooks/ai_review.py --print-conventions            # see the authorit
 AI_REVIEW_SKIP=1 git push            # skip the review
 ```
 
+Requires `pip install openai` and an API key (`DEEPSEEK_API_KEY` or
+`DEEPSEEK_CODING_API_KEY`, from the environment or `~/.openclaw/.env`). With no
+key it skips (fail-open) rather than blocking.
+
+#### Two triggers — the PR one cannot be missed
+
+| Trigger | Can be bypassed | Comments on the PR |
+|---|---|---|
+| Pre-push hook (local) | yes — `--no-verify`, `AI_REVIEW_SKIP=1` | no |
+| GitHub workflow (`.github/workflows/ai-review.yml`) | only by not opening a PR | **yes** |
+
+The workflow runs on `pull_request: opened / synchronize / reopened`, so the
+review is attached to the **PR**, not to a push. That matters: a client-side hook
+misses a branch's first push if the guard is wrong, and misses everything for a
+contributor who never ran `install.sh`.
+
+#### Incremental reviews
+
+The posted comment carries a hidden state block with the reviewed commit:
+
+```html
+<!-- ai-review-state: {"sha":"<40-hex>","verdict":"pass",...} -->
+```
+
+The next run reviews only `previous_sha..head` and feeds the earlier findings
+back to the reviewer, so fixed issues are not re-reported and unchanged code is
+not re-analysed. It falls back to a **full** review when there is no earlier
+comment, when disabled (`--no-incremental`), or when the previous commit is no
+longer an ancestor of the head (force-push — a rewrite can reintroduce anything).
+
+```bash
+git fetch origin main
+python3 .githooks/ai_review.py --range origin/main...HEAD \
+  --repo OWNER/REPO --pr 12 --post-comment
+```
+
+A triple-dot range is resolved through `git merge-base`.
+
 The engine (`.githooks/ai_review.py`) is **portable** — the same file is used in
 sibling repos. Everything repo-specific lives in `.githooks/review.json`
 (reviewed paths, authority files, axes). **Edit the config, never fork the
@@ -164,6 +202,9 @@ What it does **not** do: it cannot verify that an issue exists, it cannot read
 the PR body, and it can be bypassed with `--no-verify`. The **docs review gate
 above stays mandatory** — the hook catches stale docs in the diff, but the
 `docs reviewed — …` line in the PR body is still yours to write.
+
+A review can also be wrong. When it is, say so **on the PR, with evidence** —
+a false HIGH teaches reviewers to ignore the hook, which is worse than no review.
 
 ## Secrets
 

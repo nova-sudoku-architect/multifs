@@ -125,6 +125,14 @@ deployment-config/secret safety) and blocks on a `fail` verdict. Bypass a single
 push with `AI_REVIEW_SKIP=1` or `git push --no-verify`. See
 [`AGENTS.md`](AGENTS.md#pre-push-review-hook--automated-but-not-a-substitute).
 
+Requires `pip install openai` and a DeepSeek API key (`DEEPSEEK_API_KEY`).
+
+The same review also runs **on every pull request** via
+[`.github/workflows/ai-review.yml`](.github/workflows/ai-review.yml) and posts
+its verdict as a PR comment — so a branch's first push is reviewed too, and a
+contributor who never ran `install.sh` still gets reviewed. Each comment records
+the reviewed commit, so the next run reviews only what changed since.
+
 ```bash
 # Initialize config and database
 multifs init

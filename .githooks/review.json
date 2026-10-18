@@ -10,14 +10,28 @@
     "README.md",
     "AGENTS.md",
     "Cargo.toml",
-    "config.example.toml"
+    "config.example.toml",
+    ".github"
   ],
-  "exclude_substrings": ["target/", "dist/", ".venv/", "node_modules/"],
+  "exclude_substrings": [
+    "target/",
+    "dist/",
+    ".venv/",
+    "node_modules/"
+  ],
   "authority": [
-    {"path": "README.md", "start": "## Documentation map", "end": "## Quick start",
-     "label": "README.md (docs map, architecture at a glance, features)"},
-    {"path": "AGENTS.md", "start": "## Never commit deployment configs", "end": "## Secrets",
-     "label": "AGENTS.md (deployment-config, docs-sync, issues & PRs, docs review gate)"}
+    {
+      "path": "README.md",
+      "start": "## Documentation map",
+      "end": "## Quick start",
+      "label": "README.md (docs map, architecture at a glance, features)"
+    },
+    {
+      "path": "AGENTS.md",
+      "start": "## Never commit deployment configs",
+      "end": "## Secrets",
+      "label": "AGENTS.md (deployment-config, docs-sync, issues & PRs, docs review gate)"
+    }
   ],
   "axes": [
     {
