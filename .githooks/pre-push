@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# pre-push hook — DeepSeek review of the change set before it reaches the remote.
+#
+# Installed via:  git config core.hooksPath .githooks
+# Bypass:         git push --no-verify   (or)   NOVA_SKIP_AI_REVIEW=1 git push
+#
+# git passes the remote name + URL as $1/$2 and the ref lines on stdin; the
+# reviewer reads both. It exits non-zero to block the push.
+set -uo pipefail
+
+# Resolve the repo root so the hook works regardless of cwd.
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+exec python3 "$ROOT/.githooks/ai_review.py" "${1:-}" "${2:-}"

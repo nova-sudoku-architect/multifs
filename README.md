@@ -112,6 +112,19 @@ implementing the `StorageBackend` trait.
 
 ## Quick start
 
+### For contributors: enable the review hook
+
+The pre-push review is opt-in per clone:
+
+```bash
+bash .githooks/install.sh
+```
+
+It reviews a diff against this repo's own docs (terminology, doc alignment,
+deployment-config/secret safety) and blocks on a `fail` verdict. Bypass a single
+push with `AI_REVIEW_SKIP=1` or `git push --no-verify`. See
+[`AGENTS.md`](AGENTS.md#pre-push-review-hook--automated-but-not-a-substitute).
+
 ```bash
 # Initialize config and database
 multifs init

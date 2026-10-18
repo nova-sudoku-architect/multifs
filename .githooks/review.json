@@ -1,0 +1,44 @@
+{
+  "repo": "multifs",
+  "description": "a Rust multi-cloud storage pool daemon exposing an S3-compatible API over many provider accounts",
+  "include_paths": [
+    "src",
+    "tests",
+    "packaging",
+    "docs",
+    ".githooks",
+    "README.md",
+    "AGENTS.md",
+    "Cargo.toml",
+    "config.example.toml"
+  ],
+  "exclude_substrings": ["target/", "dist/", ".venv/", "node_modules/"],
+  "authority": [
+    {"path": "README.md", "start": "## Documentation map", "end": "## Quick start",
+     "label": "README.md (docs map, architecture at a glance, features)"},
+    {"path": "AGENTS.md", "start": "## Never commit deployment configs", "end": "## Secrets",
+     "label": "AGENTS.md (deployment-config, docs-sync, issues & PRs, docs review gate)"}
+  ],
+  "axes": [
+    {
+      "name": "TERMINOLOGY",
+      "detail": "Does the change use this repo's vocabulary — backend, account, placement, tier, mount prefix, MVCC, vacuum, GC, sidecar, multipart, shard, bucket, key? Flag drift such as calling a backend a 'provider' inconsistently, a vacuum a 'cleanup', or placement a 'balancer'."
+    },
+    {
+      "name": "DOC ALIGNMENT",
+      "detail": "AGENTS.md requires code and docs to move in the SAME commit, and names the owning doc for each area: README (features/docs map), docs/user-guide.md, docs/operator-guide.md, docs/cli-reference.md, docs/planning.md, docs/developer-guide.md, docs/architecture.md (including the test count, which must match `cargo test --lib`), and config.example.toml (generic template only) for src/config.rs changes. If the diff alters behaviour, a CLI command/flag, a config field, the data model, placement or GC, and does not update the owning doc, that is a finding. A hardcoded test count that no longer matches is a finding."
+    },
+    {
+      "name": "DEPLOYMENT-CONFIG AND SECRET SAFETY",
+      "detail": "These are violations: adding or restoring a real config.deploy.toml or any instance config (real emails, bind addresses, TLS domains, quotas, host paths); committing a token, password or API key; hardcoding a secret instead of reading an env var; logging a token."
+    },
+    {
+      "name": "ARCHITECTURE AND CORRECTNESS",
+      "detail": "Does the change respect the documented design (StorageBackend trait boundary, MVCC read/write/delete paths, multipart lifecycle, flat peak memory for multi-GB objects, GC and vacuum semantics)? Also flag clear correctness bugs in the diff, especially unsafe blocks, lock ordering, integer overflow in offset/length math, and error paths that silently succeed."
+    }
+  ],
+  "fail_guidance": "Use 'fail' for genuine rule violations, a documented behaviour left stale with no doc edit, deployment-config/secret safety breaches, or real bugs. Use 'warn' for minor drift; 'pass' when there is nothing to report.",
+  "model": "deepseek-v4-flash",
+  "max_patch": 120000,
+  "max_authority_chars": 7000
+}

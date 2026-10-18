@@ -608,7 +608,7 @@ impl PCloudClient {
         let body: serde_json::Value = resp.json().await?;
         let result = body["result"].as_i64().unwrap_or(-1);
 
-        if result != 0 {
+        if !delete_result_ok(result) {
             anyhow::bail!("Delete error {}: {}", result, body["error"]);
         }
 
@@ -634,11 +634,12 @@ impl PCloudClient {
         let body: serde_json::Value = resp.json().await?;
         let result = body["result"].as_i64().unwrap_or(-1);
 
-        if result != 0 {
-            anyhow::bail!("Delete folder error {}: {}", result, body["error"]);
+        // Already-absent folder is a success: the caller wanted it gone.
+        if delete_result_ok(result) {
+            return Ok(body["deletedfiles"].as_u64().unwrap_or(0));
         }
 
-        Ok(body["deletedfiles"].as_u64().unwrap_or(0))
+        anyhow::bail!("Delete folder error {}: {}", result, body["error"]);
     }
 
     /// List files in a directory
@@ -691,4 +692,38 @@ pub struct PCloudFile {
     pub size: i64,
     pub modified: String,
     pub is_folder: bool,
+}
+
+/// Whether a pCloud delete response means "the file/folder is gone now".
+///
+/// pCloud returns a non-zero `result` for a *missing* target — `2009`
+/// ("File not found.") from `deletefile`, and `2055` ("File or folder not
+/// found.") from path-based calls. Delete is meant to be idempotent: a target
+/// that is already absent already satisfies the caller's intent.
+///
+/// Treating these as errors made `vacuum` keep the version row "for retry" on
+/// every cycle: the blob was already gone, so the retry could never succeed.
+/// That produced endless log spam and metadata that never converged.
+fn delete_result_ok(result: i64) -> bool {
+    matches!(result, 0 | 2009 | 2055)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::delete_result_ok;
+
+    #[test]
+    fn test_delete_result_ok_treats_missing_target_as_success() {
+        assert!(delete_result_ok(0)); // deleted
+        assert!(delete_result_ok(2009)); // "File not found." (deletefile)
+        assert!(delete_result_ok(2055)); // "File or folder not found."
+    }
+
+    #[test]
+    fn test_delete_result_ok_rejects_real_errors() {
+        assert!(!delete_result_ok(-1)); // malformed / missing `result`
+        assert!(!delete_result_ok(2000)); // log-in required
+        assert!(!delete_result_ok(2008)); // quota / permission errors
+        assert!(!delete_result_ok(1000)); // generic error
+    }
 }

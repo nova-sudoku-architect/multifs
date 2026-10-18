@@ -16,3 +16,6 @@ config.toml
 config.deploy.toml
 config.deploy.toml.bak
 config.deploy.toml.bak.*
+
+# pre-push review hook bytecode
+.githooks/__pycache__/
