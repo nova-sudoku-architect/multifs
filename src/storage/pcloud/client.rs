@@ -5,10 +5,34 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex as StdMutex};
 
+/// The download receiver was dropped: the S3/HTTP client disconnected or
+/// cancelled the read.
+///
+/// This is *not* a backend fault. Reporting it as one (previously it fell
+/// through to the "stream truncated" check, because the chunk had already been
+/// counted as delivered) caused bogus `S3 stream error` ERRORs plus two useless
+/// pCloud retries per disconnect — 46 of 63 "truncated" errors in one day were
+/// this, all with the tell-tale `got 4096B`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiverClosed;
+
+impl std::fmt::Display for ReceiverClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "client disconnected (stream receiver dropped)")
+    }
+}
+
+impl std::error::Error for ReceiverClosed {}
+
+/// Whether an error from the download path is a client disconnect rather than a
+/// backend fault (and therefore must not be retried or logged as an error).
+pub fn is_receiver_closed(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ReceiverClosed>().is_some()
+}
+
 /// pCloud API client
 #[derive(Clone)]
-pub struct PCloudClient {
-    #[allow(dead_code)] // retained for diagnostics; token/base_url drive requests
+pub struct PCloudClient {    #[allow(dead_code)] // retained for diagnostics; token/base_url drive requests
     email: String,
     token: String,
     base_url: String,
@@ -313,6 +337,12 @@ impl PCloudClient {
             {
                 Ok(()) => return Ok(()),
                 Err(e) => {
+                    // The client hung up — retrying would be pointless (the
+                    // receiver is gone for good) and would only burn pCloud
+                    // getfilelink calls. Surface it immediately.
+                    if is_receiver_closed(&e) {
+                        return Err(e);
+                    }
                     if attempt + 1 >= MAX_ATTEMPTS {
                         return Err(e);
                     }
@@ -404,10 +434,17 @@ impl PCloudClient {
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    *delivered = delivered.saturating_add(bytes.len() as u64);
+                    let len = bytes.len() as u64;
                     if tx.send(Ok(bytes)).await.is_err() {
-                        break; // Receiver dropped (client disconnected)
+                        // Receiver dropped: the client went away (aborted read,
+                        // disconnect, or a seek that cancelled the request).
+                        // This is NOT a backend fault, so report it distinctly —
+                        // the caller must not retry and must not log an error.
+                        // NOTE: `delivered` is only advanced after a successful
+                        // send, so it stays a truthful resume offset.
+                        return Err(anyhow::Error::new(ReceiverClosed));
                     }
+                    *delivered = delivered.saturating_add(len);
                 }
                 Err(e) => {
                     let _ = tx.send(Err(anyhow::anyhow!("Download stream error: {}", e))).await;
@@ -725,5 +762,30 @@ mod tests {
         assert!(!delete_result_ok(2000)); // log-in required
         assert!(!delete_result_ok(2008)); // quota / permission errors
         assert!(!delete_result_ok(1000)); // generic error
+    }
+
+    // =================================================================
+    // Client-disconnect classification
+    // =================================================================
+    // A dropped receiver must be recognised so the download path does not
+    // retry it (the receiver is gone for good) or log it as an ERROR.
+
+    #[test]
+    fn test_receiver_closed_is_recognised() {
+        let e = anyhow::Error::new(super::ReceiverClosed);
+        assert!(super::is_receiver_closed(&e));
+        // Also true once wrapped/contextualised.
+        let wrapped = e.context("while streaming part 2");
+        assert!(super::is_receiver_closed(&wrapped));
+    }
+
+    #[test]
+    fn test_real_download_faults_are_not_receiver_closed() {
+        let truncated = anyhow::anyhow!(
+            "Download stream truncated: expected 2584576B got 4096B (had 5804032B prior)"
+        );
+        assert!(!super::is_receiver_closed(&truncated));
+        let cdn = anyhow::anyhow!("Download stream error: connection reset");
+        assert!(!super::is_receiver_closed(&cdn));
     }
 }

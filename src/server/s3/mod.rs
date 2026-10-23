@@ -1184,7 +1184,14 @@ async fn get_object(
             None => engine.get_object_stream(&b, &k, range_for_stream, tx).await,
         };
         if let Err(e) = result {
-            tracing::error!("S3 stream error for {}/{}: {}", b, k, e);
+            // A client that hung up mid-stream is routine (aborted download,
+            // seek/cancel, timeout). Log it at debug so it doesn't masquerade as
+            // a backend failure in the error log; anything else is a real fault.
+            if crate::storage::pcloud::client::is_receiver_closed(&e) {
+                tracing::debug!("S3 stream closed early by client for {}/{}: {}", b, k, e);
+            } else {
+                tracing::error!("S3 stream error for {}/{}: {}", b, k, e);
+            }
         }
     });
 

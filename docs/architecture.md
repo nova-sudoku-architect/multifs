@@ -218,6 +218,21 @@ On error/cancel, the version stays `pending` and is swept by `vacuum`.
 - Readers resolve the version **once at request start**, so an in-flight GET keeps
   streaming the old blob even after a concurrent commit flips the pointer.
 
+### Download faults vs. client disconnects
+
+`download_stream` retries a failed transfer up to 3 times, resuming from the last
+byte actually delivered (`Range: bytes=<delivered>-`) instead of re-fetching from 0,
+because pCloud's CDN intermittently EOFs mid-body.
+
+A **dropped receiver** (the S3 client disconnected, aborted the read, or cancelled a
+seek) is a distinct condition and is *not* retried: retrying cannot succeed, since
+the receiver is gone for good. It surfaces as `ReceiverClosed` and is logged at
+debug level, not as a backend error. The delivered-byte counter only advances after a
+successful send, so the resume offset stays truthful. (Previously a disconnect fell
+through to the "stream truncated" check — the chunk had already been counted — which
+produced spurious `S3 stream error` lines and two pointless pCloud round-trips per
+disconnect.)
+
 ---
 
 ## Read-Only Web UI
@@ -653,7 +668,7 @@ multifs fsck [--checksums] [--fix] [--prune-missing] [--apply]
 
 ## Test Coverage
 
-All 159 lib tests pass (`cargo test --lib`). Highlights:
+All 161 lib tests pass (`cargo test --lib`). Highlights:
 - `test_s3_copy_object_roundtrip` / `test_s3_copy_object_overwrites_existing` —
   CopyObject stores a byte-for-byte copy (size + ETag), incl. overwrite (GH #2).
 - `test_s3_binary_put_streams_with_content_length` — binary PUT with a declared
