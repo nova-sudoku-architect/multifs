@@ -444,7 +444,14 @@ async fn download(
 
     tokio::task::spawn(async move {
         if let Err(e) = engine.get_object_stream(&b, &k, parsed_range, tx).await {
-            tracing::error!("web stream error for {}/{}: {}", b, k, e);
+            // A browser that navigates away / cancels a seek drops the receiver.
+            // That is routine, so log it at debug rather than as a backend error
+            // (same classification the S3 handler uses).
+            if crate::storage::pcloud::client::is_receiver_closed(&e) {
+                tracing::debug!("web stream closed early by client for {}/{}: {}", b, k, e);
+            } else {
+                tracing::error!("web stream error for {}/{}: {}", b, k, e);
+            }
         }
     });
 
