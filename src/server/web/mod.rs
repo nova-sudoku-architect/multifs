@@ -1,8 +1,10 @@
-//! Read-only web UI — a browser-friendly file navigator over the storage pool.
+//! Web UI — a browser-friendly file navigator over the storage pool.
 //!
-//! Deliberately exposes **only** GET endpoints (list buckets, list objects,
-//! download). There is no write/delete/upload path here, so the page is safe to
-//! expose to a wider audience (e.g. over Tailscale) without risking data loss.
+//! Exposes GET endpoints (list buckets, list objects, download) plus, **only
+//! when `server.enable_web_write = true`, and only through the POST mutating
+//! routes below** (delete object / delete folder / delete bucket), the ability
+//! to remove data. With the flag off the router is byte-for-byte read-only, so
+//! the page stays safe to expose to a wider audience (e.g. over Tailscale).
 
 use std::sync::Arc;
 
@@ -10,7 +12,7 @@ use axum::{
     extract::{Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use bytes::Bytes;
@@ -19,16 +21,25 @@ use serde_json::json;
 
 use crate::storage::engine::{ObjectInfo, StorageEngine};
 
+mod delete_routes;
+mod rename_routes;
+use delete_routes::{delete_bucket_handler, delete_object_handler, delete_prefix_handler};
+use rename_routes::{move_object_handler, rename_object_handler, rename_prefix_handler};
+
 /// Embedded single-file UI (vanilla HTML+JS, no build step).
 const INDEX_HTML: &str = include_str!("index.html");
 
 #[derive(Clone)]
 pub struct WebState {
     pub engine: Arc<StorageEngine>,
+    /// When false every mutating route answers 403, and the UI hides the
+    /// delete controls (it reads the flag from `/api/buckets`).
+    pub write_enabled: bool,
 }
 
-pub fn build_router(engine: Arc<StorageEngine>) -> Router {
-    let state = WebState { engine };
+/// Build the web router. `write_enabled` comes from `server.enable_web_write`.
+pub fn build_router(engine: Arc<StorageEngine>, write_enabled: bool) -> Router {
+    let state = WebState { engine, write_enabled };
     Router::new()
         .route("/", get(index))
         .route("/api/buckets", get(list_buckets))
@@ -36,6 +47,13 @@ pub fn build_router(engine: Arc<StorageEngine>) -> Router {
         .route("/api/siblings", get(list_siblings))
         .route("/api/thumb", get(thumb))
         .route("/api/download", get(download))
+        // Mutating routes: POST only (never GET), all gated on the flag.
+        .route("/api/delete-object", post(delete_object_handler))
+        .route("/api/delete-prefix", post(delete_prefix_handler))
+        .route("/api/delete-bucket", post(delete_bucket_handler))
+        .route("/api/rename-object", post(rename_object_handler))
+        .route("/api/move-object", post(move_object_handler))
+        .route("/api/rename-prefix", post(rename_prefix_handler))
         .with_state(state)
 }
 
@@ -91,7 +109,11 @@ async fn list_buckets(State(state): State<WebState>) -> Response {
                 .into_iter()
                 .map(|b| json!({ "name": b.name, "created_at": b.created_at }))
                 .collect();
-            json_response(json!({ "buckets": arr }))
+            json_response(json!({
+                "buckets": arr,
+                // The UI uses this to show/hide delete controls.
+                "write_enabled": state.write_enabled,
+            }))
         }
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }

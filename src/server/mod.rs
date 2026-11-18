@@ -307,14 +307,21 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     }
 
     if cfg.server.enable_web {
-        let web_app = web::build_router(engine.clone())
+        let web_app = web::build_router(engine.clone(), cfg.server.enable_web_write)
             .layer(middleware::from_fn_with_state(
                 metrics.clone(),
                 metrics::track_metrics,
             ));
         let web_addr = format!("{}:{}", cfg.server.bind, cfg.server.web_port);
         let listener = tokio::net::TcpListener::bind(&web_addr).await?;
-        tracing::info!("Read-only web UI listening on {}", web_addr);
+        if cfg.server.enable_web_write {
+            tracing::warn!(
+                "Web UI listening on {} — WRITES ENABLED (delete endpoints active)",
+                web_addr
+            );
+        } else {
+            tracing::info!("Read-only web UI listening on {}", web_addr);
+        }
         tasks.push(tokio::spawn(async move {
             axum::serve(listener, web_app).await.map_err(anyhow::Error::from)
         }));

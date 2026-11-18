@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MultiFS — Read-only Browser</title>
+<title>MultiFS — Browser</title>
 <style>
   :root {
     --bg: #0f1117; --panel: #161a24; --panel2: #1d2330;
@@ -26,6 +26,16 @@
   .cols-picker select { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; font-size: 13px; cursor: pointer; }
   header h1 { margin: 0; font-size: 16px; font-weight: 600; }
   header h1 span { color: var(--accent2); }
+  .tag {
+    display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+    padding: 2px 10px; border: 1px solid var(--border); border-radius: 999px;
+    font-size: 12px; font-weight: 500; user-select: none;
+  }
+  .tag .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+  .tag.read-only { color: var(--muted); }
+  .tag.read-write { color: #ff9b6b; border-color: #6d3a2a; }
+  .tag.read-write .dot { background: #ff6b3d; box-shadow: 0 0 6px #ff6b3d; }
+  .tag.disabled { opacity: .45; cursor: not-allowed; }
   .mode-switch { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
   .mode-switch button {
     background: transparent; color: var(--muted); border: none; cursor: pointer;
@@ -51,6 +61,17 @@
   .table th.sortable:hover { color: var(--text); }
   .table th.sortable.active { color: var(--accent2); }
   .table td { padding: 9px 10px; border-bottom: 1px solid var(--border); }
+  .table td.actions { text-align: right; white-space: nowrap; }
+  .table td.actions button {
+    background: transparent; color: var(--muted); border: 1px solid var(--border);
+    border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer; margin-left: 4px;
+  }
+  .table td.actions button:hover { color: var(--text); border-color: var(--accent2); }
+  button.danger {
+    background: transparent; color: #ff6b6b; border: 1px solid #6d2a2a;
+    border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer;
+  }
+  button.danger:hover { background: #3a1717; border-color: #ff6b6b; color: #fff; }
   .table tr:hover td { background: var(--panel2); }
   .row-link { cursor: pointer; }
   .name { display: flex; align-items: center; gap: 9px; }
@@ -175,7 +196,7 @@
 <body>
 <header>
   <div class="toprow">
-    <h1>MultiFS <span>· read-only</span></h1>
+    <h1>MultiFS <span id="modeTag" class="tag">· read-only</span></h1>
     <div class="toprow-right">
       <label class="cols-picker">Cols
         <select id="colsSelect" title="Images per row in preview mode">
@@ -215,7 +236,10 @@ const btnNext = document.getElementById('btnNext');
 const slidePos = document.getElementById('slidePos');
 
 // View state — survives navigation so the chosen mode persists.
-const state = { bucket: '', prefix: '', mode: 'list', cols: loadCols(), sort: loadSort() };
+const state = { bucket: '', prefix: '', mode: 'list', cols: loadCols(), sort: loadSort(),
+  // writeEnabled: the server allows writes (server.enable_web_write).
+  // write: the user's toggle says "I want write mode right now".
+  writeEnabled: false, write: false };
 
 // Sibling-folder slide state (for prev/next folder navigation).
 const siblings = { list: [], index: -1 };
@@ -300,6 +324,129 @@ function setSort(key) {
   saveSort();
   if (state.bucket) loadList(state.bucket, state.prefix);
   else loadBuckets();
+}
+
+// --- read-only / read-write mode switch ---
+// The server flag (state.writeEnabled) is authoritative: when writes are off in
+// the config, the tag is disabled rather than pretending to toggle something
+// the API would reject with 403.
+function syncModeTag() {
+  const tag = document.getElementById('modeTag');
+  if (!tag) return;
+  tag.classList.toggle('disabled', !state.writeEnabled);
+  tag.classList.toggle('read-write', state.writeEnabled && state.write);
+  tag.classList.toggle('read-only', !(state.writeEnabled && state.write));
+  if (!state.writeEnabled) {
+    tag.innerHTML = '<span class="dot"></span>· writes disabled';
+    tag.title = 'Set server.enable_web_write = true to allow deleting, renaming or moving.';
+  } else if (state.write) {
+    tag.innerHTML = '<span class="dot"></span>· read-write';
+    tag.title = 'Click to return to read-only (hides all write actions).';
+  } else {
+    tag.innerHTML = '<span class="dot"></span>· read-only';
+    tag.title = 'Click to enable write mode (delete / rename / move).';
+  }
+}
+
+function toggleWriteMode() {
+  if (!state.writeEnabled) return;
+  state.write = !state.write;
+  syncModeTag();
+  // Re-render so action buttons appear or disappear immediately.
+  if (state.bucket) loadList(state.bucket, state.prefix);
+  else loadBuckets();
+}
+
+// --- deletion (only offered when the server reports write_enabled) ---
+async function apiPost(url, body) {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+  return data;
+}
+
+async function deleteObject(bucket, key) {
+  if (!confirm('Delete this file permanently?\n\n' + key)) return;
+  try {
+    await apiPost('/api/delete-object', { bucket, key });
+    await loadList(state.bucket, state.prefix);
+  } catch (e) {
+    alert('Delete failed: ' + e.message);
+  }
+}
+
+async function deletePrefix(bucket, prefix) {
+  const name = prefix.replace(/\/$/, '').split('/').pop();
+  if (!confirm('Delete folder "' + name + '" and everything inside it?\n\nThis cannot be undone.')) return;
+  try {
+    const r = await apiPost('/api/delete-prefix', { bucket, prefix });
+    if (r.errors && r.errors.length) alert('Deleted ' + r.deleted + ', errors: ' + r.errors.length + '\n' + r.errors.slice(0, 5).join('\n'));
+    await loadList(state.bucket, state.prefix);
+  } catch (e) {
+    alert('Delete failed: ' + e.message);
+  }
+}
+
+async function deleteBucket(name) {
+  const typed = prompt('Delete bucket "' + name + '" and ALL its contents?\n\nType the bucket name to confirm:');
+  if (typed === null) return;
+  if (typed.trim() !== name) { alert('Name did not match — nothing deleted.'); return; }
+  try {
+    await apiPost('/api/delete-bucket', { name, confirm: typed.trim() });
+    await loadBuckets();
+  } catch (e) {
+    alert('Delete failed: ' + e.message);
+  }
+}
+
+async function renameObject(bucket, key) {
+  const name = key.split('/').pop();
+  const dir = key.slice(0, key.length - name.length);
+  const next = prompt('Rename file\n\nCurrent: ' + name + '\nNew name:', name);
+  if (next === null) return;
+  const clean = next.trim();
+  if (!clean || clean.includes('/')) { alert('Enter a plain file name (no slashes).'); return; }
+  if (clean === name) return;
+  try {
+    await apiPost('/api/rename-object', { bucket, key, new_key: dir + clean });
+    await loadList(state.bucket, state.prefix);
+  } catch (e) { alert('Rename failed: ' + e.message); }
+}
+
+async function moveObject(bucket, key) {
+  const dest = prompt('Move file\n\nCurrent key: ' + key + '\n\nNew full path (bucket/key):', bucket + '/' + key);
+  if (dest === null) return;
+  const clean = dest.trim().replace(/^\/+/, '');
+  const slash = clean.indexOf('/');
+  if (slash < 1) { alert('Use the form bucket/path/to/file.'); return; }
+  const dstBucket = clean.slice(0, slash);
+  const dstKey = clean.slice(slash + 1);
+  if (!dstKey) { alert('Destination path is empty.'); return; }
+  if (dstBucket === bucket && dstKey === key) return;
+  try {
+    await apiPost('/api/move-object', { bucket, key, dst_bucket: dstBucket, dst_key: dstKey });
+    await loadList(state.bucket, state.prefix);
+  } catch (e) { alert('Move failed: ' + e.message); }
+}
+
+async function renamePrefix(bucket, prefix) {
+  const trimmed = prefix.replace(/\/$/, '');
+  const name = trimmed.split('/').pop();
+  const dir = trimmed.slice(0, trimmed.length - name.length);
+  const next = prompt('Rename folder\n\nCurrent: ' + name + '\nNew name:', name);
+  if (next === null) return;
+  const clean = next.trim();
+  if (!clean || clean.includes('/')) { alert('Enter a plain folder name (no slashes).'); return; }
+  if (clean === name) return;
+  try {
+    const r = await apiPost('/api/rename-prefix', { bucket, prefix: trimmed, new_name: clean });
+    await loadList(state.bucket, state.prefix);
+    return r;
+  } catch (e) { alert('Rename failed: ' + e.message); }
 }
 
 function esc(s) {
@@ -539,23 +686,29 @@ async function loadBuckets() {
   main.innerHTML = '<div class="spinner">Loading buckets…</div>';
   try {
     const data = await jfetch('/api/buckets');
+    state.writeEnabled = !!data.write_enabled;
+    syncModeTag();
     const buckets = data.buckets || [];
     if (!buckets.length) {
       main.innerHTML = '<div class="empty">No buckets yet.</div>';
       return;
     }
     const sorted = sortRows(buckets, 'bucket');
-    let html = '<table class="table"><thead><tr>' + sortTh('Name', 'name') + sortTh('Created', 'mtime') + '</tr></thead><tbody>';
+    let html = '<table class="table"><thead><tr>' + sortTh('Name', 'name') + sortTh('Created', 'mtime') + (state.write ? '<th>Action</th>' : '') + '</tr></thead><tbody>';
     for (const b of sorted) {
       html += `<tr class="row-link" data-bucket="${esc(b.name)}">
         <td><div class="name"><span class="ico icon-bucket">🗂</span><a>${esc(b.name)}</a></div></td>
         <td class="mtime">${esc(fmtDate(b.created_at))}</td>
+        ${state.write ? `<td class="actions"><button class="danger" data-del-bucket="${esc(b.name)}" title="Delete bucket and all contents">Delete</button></td>` : ''}
       </tr>`;
     }
     html += '</tbody></table>';
     main.innerHTML = html;
     main.querySelectorAll('th[data-sort]').forEach(th => {
       th.onclick = () => setSort(th.dataset.sort);
+    });
+    main.querySelectorAll('button[data-del-bucket]').forEach(btn => {
+      btn.onclick = (ev) => { ev.stopPropagation(); deleteBucket(btn.dataset.delBucket); };
     });
     main.querySelectorAll('tr.row-link').forEach(tr => {
       tr.onclick = () => navigate(tr.dataset.bucket, '');
@@ -577,9 +730,16 @@ function folderRowHtml(bucket, f, showThumb) {
   } else {
     ico = '<span class="ico icon-folder">📁</span>';
   }
+  const del = state.write
+    ? `<td class="actions">
+         <button data-ren-prefix="${esc(prefix)}" title="Rename this folder">Rename</button>
+         <button class="danger" data-del-prefix="${esc(prefix)}" title="Delete this folder and everything in it">Delete</button>
+       </td>`
+    : '';
   return `<tr class="row-link" data-prefix="${esc(prefix)}">
     <td><div class="name">${ico}<a>${esc(name)}/</a>${childBadge(f)}${symlinkBadge(f)}</div></td>
     <td class="size"></td><td class="mtime">${esc(fmtMtime(f && f.last_modified))}</td><td class="ctype"></td>
+    ${del}
   </tr>`;
 }
 
@@ -607,17 +767,25 @@ function fileRowHtml(bucket, f, showPreviewCol) {
   if (isVideo(f.key)) {
     vlc = `<a class="vlc-link" href="${esc(vlcStreamUrl(bucket, f.key))}" title="Open in VLC">▶ VLC</a>`;
   }
+  const del = state.write
+    ? `<td class="actions">
+         <button data-ren-key="${esc(f.key)}" title="Rename this file">Rename</button>
+         <button data-mov-key="${esc(f.key)}" title="Move this file">Move</button>
+         <button class="danger" data-del-key="${esc(f.key)}" title="Delete this file">Delete</button>
+       </td>`
+    : '';
   let row = `<tr>
     <td><div class="name">${ico}<a class="file-link" href="${esc(durl)}">${esc(name)}</a>${vlc}</div></td>
     <td class="size">${esc(fmtSize(f.size))}</td>
     <td class="mtime">${esc(fmtDate(f.last_modified))}</td>
     <td class="ctype">${esc(ctype)}</td>
+    ${del}
   </tr>`;
   return row;
 }
 
 function renderListMode(bucket, folders, files) {
-  let html = '<table class="table"><thead><tr>' + sortTh('Name', 'name') + sortTh('Size', 'size') + sortTh('Modified', 'mtime') + sortTh('Type', 'type') + '</tr></thead><tbody>';
+  let html = '<table class="table"><thead><tr>' + sortTh('Name', 'name') + sortTh('Size', 'size') + sortTh('Modified', 'mtime') + sortTh('Type', 'type') + (state.write ? '<th>Action</th>' : '') + '</tr></thead><tbody>';
   for (const f of sortRows(folders, 'folder')) html += folderRowHtml(bucket, f, false);
   for (const f of sortRows(files, 'file')) html += fileRowHtml(bucket, f);
   html += '</tbody></table>';
@@ -1085,7 +1253,7 @@ async function loadList(bucket, prefix) {
         : renderListMode(bucket, folders, files));
 
     if (data.truncated) html += '<div class="note">⚠ Listing truncated (very large folder).</div>';
-    html += '<div class="note">Read-only — downloads only. Range requests supported for streaming.</div>';
+    html += '<div class="note">' + (state.write ? 'Write mode ON — deletes are permanent.' : 'Read-only — downloads only.') + ' Range requests supported for streaming.</div>';
     main.innerHTML = html;
     if (state.mode === 'preview') loadSummaryText(bucket, data.folder);
     hydrateLazyImages();
@@ -1101,12 +1269,28 @@ async function loadList(bucket, prefix) {
     main.querySelectorAll('.name-item[data-prefix]').forEach(el => {
       el.onclick = () => navigate(bucket, el.dataset.prefix);
     });
+    main.querySelectorAll('button[data-del-key]').forEach(btn => {
+      btn.onclick = (ev) => { ev.stopPropagation(); deleteObject(bucket, btn.dataset.delKey); };
+    });
+    main.querySelectorAll('button[data-del-prefix]').forEach(btn => {
+      btn.onclick = (ev) => { ev.stopPropagation(); deletePrefix(bucket, btn.dataset.delPrefix); };
+    });
+    main.querySelectorAll('button[data-ren-key]').forEach(btn => {
+      btn.onclick = (ev) => { ev.stopPropagation(); renameObject(bucket, btn.dataset.renKey); };
+    });
+    main.querySelectorAll('button[data-mov-key]').forEach(btn => {
+      btn.onclick = (ev) => { ev.stopPropagation(); moveObject(bucket, btn.dataset.movKey); };
+    });
+    main.querySelectorAll('button[data-ren-prefix]').forEach(btn => {
+      btn.onclick = (ev) => { ev.stopPropagation(); renamePrefix(bucket, btn.dataset.renPrefix); };
+    });
     resolveSiblings();
   } catch (e) {
     main.innerHTML = `<div class="empty">Error: ${esc(e.message)}</div>`;
   }
 }
 
+document.getElementById('modeTag').onclick = toggleWriteMode;
 document.getElementById('colsSelect').value = state.cols;
 applyCols();
 loadFromHash();

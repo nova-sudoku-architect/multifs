@@ -67,6 +67,10 @@ pub struct ServerConfig {
     /// Web UI port (read-only browser)
     #[serde(default = "default_web_port")]
     pub web_port: u16,
+    /// Whether the web UI may mutate data (delete objects / buckets). Off by
+    /// default so the browser stays read-only unless explicitly opted in.
+    #[serde(default)]
+    pub enable_web_write: bool,
     /// Whether to enable the metrics/health endpoint listener (`/metrics`,
     /// `/healthz`, `/readyz`). Off by default — opt in to expose them.
     #[serde(default)]
@@ -176,6 +180,7 @@ impl Default for ServerConfig {
             enable_s3: true,
             enable_web: false,
             web_port: default_web_port(),
+            enable_web_write: false,
             enable_metrics: false,
             metrics_port: default_metrics_port(),
             access_keys: String::new(),
@@ -301,6 +306,7 @@ impl Config {
             "server.web_port" => self.server.web_port = parse_u16(value)?,
             "server.enable_metrics" => self.server.enable_metrics = parse_bool(value)?,
             "server.metrics_port" => self.server.metrics_port = parse_u16(value)?,
+            "server.enable_web_write" => self.server.enable_web_write = parse_bool(value)?,
             "server.access_keys" => self.server.access_keys = value.to_string(),
             "tls.enabled" => self.tls.enabled = parse_bool(value)?,
             "tls.cert_path" => self.tls.cert_path = opt_str(value),
@@ -317,7 +323,8 @@ impl Config {
                 "unknown or non-scalar config key '{}'. Settable scalar keys: \
                  server.bind, server.s3_port, server.nfs_port, server.enable_s3, \
                  server.enable_nfs, server.enable_web, server.web_port, \
-                 server.enable_metrics, server.metrics_port, server.access_keys, \
+                 server.enable_metrics, server.metrics_port, server.enable_web_write, \
+                 server.access_keys, \
                  tls.enabled, tls.cert_path, tls.key_path, tls.domain, \
                  storage.meta_db_path, storage.placement_strategy, \
                  storage.auto_coalesce_multipart",
@@ -339,6 +346,7 @@ impl Config {
             "server.web_port" => self.server.web_port.to_string(),
             "server.enable_metrics" => self.server.enable_metrics.to_string(),
             "server.metrics_port" => self.server.metrics_port.to_string(),
+            "server.enable_web_write" => self.server.enable_web_write.to_string(),
             "server.access_keys" => {
                 // Never print key material — report only how many are configured.
                 let n = self.server.access_keys.split(',').filter(|s| !s.trim().is_empty()).count();
