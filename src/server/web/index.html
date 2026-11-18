@@ -1224,11 +1224,29 @@ function hydrateLazyImages() {
   imgs.forEach(im => _lazyObserver.observe(im));
 }
 
+// The write capability is server-wide, so fetch it once and cache it. A folder
+// page loaded directly (bookmark, back button, reload) never runs loadBuckets(),
+// so it must not depend on that having happened.
+let _writeCapability = null;
+async function ensureWriteCapability() {
+  if (_writeCapability !== null) return _writeCapability;
+  try {
+    const r = await jfetch('/api/buckets');
+    _writeCapability = !!r.write_enabled;
+  } catch (_) {
+    _writeCapability = false;
+  }
+  state.writeEnabled = _writeCapability;
+  syncModeTag();
+  return _writeCapability;
+}
+
 async function loadList(bucket, prefix) {
   state.bucket = bucket; state.prefix = prefix;
   renderCrumb(bucket, prefix);
   main.innerHTML = '<div class="spinner">Loading…</div>';
   try {
+    await ensureWriteCapability();
     const q = new URLSearchParams({ bucket });
     if (prefix) q.set('prefix', prefix);
     const data = await jfetch('/api/list?' + q.toString());
