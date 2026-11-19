@@ -46,7 +46,7 @@ async fn rename_object(
 /// POST /api/rename-object
 pub(super) async fn rename_object_handler(
     State(state): State<WebState>,
-    axum::Json(body): axum::Json<RenameObjectBody>,
+    super::WebJson(body): super::WebJson<RenameObjectBody>,
 ) -> Response {
     if let Some(resp) = write_guard(&state) {
         return resp;
@@ -68,102 +68,10 @@ pub(super) struct MoveObjectBody {
 }
 
 
-#[derive(Deserialize)]
-pub(super) struct RenamePrefixBody {
-    pub(super) bucket: String,
-    /// Existing folder prefix, without a trailing slash.
-    pub(super) prefix: String,
-    /// New leaf name (no slashes).
-    pub(super) new_name: String,
-}
-
-/// POST /api/rename-prefix — rename a folder by copying every object under the
-/// old prefix to the new one, then deleting the originals.
-async fn rename_prefix(
-    state: &WebState,
-    bucket: &str,
-    prefix: &str,
-    new_name: &str,
-) -> Response {
-    const MAX_FOLDER_MOVE: usize = 10_000;
-    let trimmed = prefix.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "refusing to rename the bucket root");
-    }
-    if new_name.is_empty() || new_name.contains('/') {
-        return json_error(StatusCode::BAD_REQUEST, "new_name must be a plain name with no slashes");
-    }
-    let parent = match trimmed.rfind('/') {
-        Some(i) => &trimmed[..=i],
-        None => "",
-    };
-    let dst_prefix = format!("{}{}/", parent, new_name);
-    if dst_prefix == format!("{}/", trimmed) {
-        return json_error(StatusCode::BAD_REQUEST, "source and destination are identical");
-    }
-    let src_prefix = format!("{}/", trimmed);
-
-    let (objects, truncated) = match state
-        .engine
-        .list_objects_symlink_aware(bucket, Some(&src_prefix), None, MAX_FOLDER_MOVE as i64 + 1)
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => return server_error(e),
-    };
-    if truncated || objects.len() > MAX_FOLDER_MOVE {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            &format!("folder has more than {} objects; move it in smaller batches", MAX_FOLDER_MOVE),
-        );
-    }
-    if objects.is_empty() {
-        return json_error(StatusCode::NOT_FOUND, "folder is empty or does not exist");
-    }
-
-    let mut moved = 0usize;
-    let mut errors: Vec<String> = Vec::new();
-    for obj in &objects {
-        let rest = obj.key.strip_prefix(&src_prefix).unwrap_or(&obj.key);
-        let dst_key = format!("{}{}", dst_prefix, rest);
-        if let Err(e) = state.engine.copy_object(bucket, &obj.key, bucket, &dst_key).await {
-            errors.push(format!("copy {}: {}", obj.key, e));
-            continue;
-        }
-        if let Err(e) = state.engine.delete_object(bucket, &obj.key).await {
-            errors.push(format!("delete {}: {}", obj.key, e));
-            continue;
-        }
-        moved += 1;
-    }
-    json_response(json!({
-        "ok": errors.is_empty(),
-        "bucket": bucket,
-        "from": src_prefix,
-        "to": dst_prefix,
-        "moved": moved,
-        "errors": errors,
-    }))
-}
-
-/// POST /api/rename-prefix
-pub(super) async fn rename_prefix_handler(
-    State(state): State<WebState>,
-    axum::Json(body): axum::Json<RenamePrefixBody>,
-) -> Response {
-    if let Some(resp) = write_guard(&state) {
-        return resp;
-    }
-    if body.bucket.is_empty() || body.prefix.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "missing 'bucket' or 'prefix'");
-    }
-    rename_prefix(&state, &body.bucket, &body.prefix, &body.new_name).await
-}
-
 /// POST /api/move-object
 pub(super) async fn move_object_handler(
     State(state): State<WebState>,
-    axum::Json(body): axum::Json<MoveObjectBody>,
+    super::WebJson(body): super::WebJson<MoveObjectBody>,
 ) -> Response {
     if let Some(resp) = write_guard(&state) {
         return resp;

@@ -1375,6 +1375,25 @@ impl StorageEngine {
         self.meta.touch_folder(bucket, key)
     }
 
+    /// Rename or move a whole folder by rewriting metadata keys in place.
+    ///
+    /// MultiFS stores the blob location (account + remote_path) in `versions`
+    /// and treats `key` purely as an index, so a prefix rename does not have to
+    /// touch any bytes on the backend — it is a single transaction over the
+    /// metadata DB. Contrast with the copy-then-delete approach, which costs two
+    /// backend round-trips per object.
+    ///
+    /// Returns counts of the rows rewritten (useful for the UI/CLI to report).
+    pub fn rekey_prefix(
+        &self,
+        bucket: &str,
+        src_prefix: &str,
+        dst_prefix: &str,
+    ) -> anyhow::Result<crate::storage::metadata::RekeyStats> {
+        self.meta.rekey_prefix(bucket, src_prefix, dst_prefix)
+    }
+
+
     /// Count the direct children (immediate files + subfolders) of a folder
     /// prefix. Delegates to the metadata layer's prefix scan.
     #[allow(dead_code)] // single-prefix count; superseded by count_children_batch

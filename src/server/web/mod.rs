@@ -22,9 +22,11 @@ use serde_json::json;
 use crate::storage::engine::{ObjectInfo, StorageEngine};
 
 mod delete_routes;
+mod prefix_move_routes;
 mod rename_routes;
 use delete_routes::{delete_bucket_handler, delete_object_handler, delete_prefix_handler};
-use rename_routes::{move_object_handler, rename_object_handler, rename_prefix_handler};
+use prefix_move_routes::{move_prefix_handler, rename_prefix_handler};
+use rename_routes::{move_object_handler, rename_object_handler};
 
 /// Embedded single-file UI (vanilla HTML+JS, no build step).
 const INDEX_HTML: &str = include_str!("index.html");
@@ -54,6 +56,7 @@ pub fn build_router(engine: Arc<StorageEngine>, write_enabled: bool) -> Router {
         .route("/api/rename-object", post(rename_object_handler))
         .route("/api/move-object", post(move_object_handler))
         .route("/api/rename-prefix", post(rename_prefix_handler))
+        .route("/api/move-prefix", post(move_prefix_handler))
         .with_state(state)
 }
 
@@ -70,6 +73,36 @@ fn json_response(value: serde_json::Value) -> Response {
         .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
         .body(axum::body::Body::from(value.to_string()))
         .unwrap()
+}
+
+
+/// Custom JSON extractor for the web write routes.
+///
+/// axum's default `Json` rejection returns a bare 422 with a plain-text body,
+/// which is inconsistent with every other error on these routes (a JSON
+/// `{"error": ...}` object) and confusing to the UI. This maps any body
+/// parse failure to a 400 with the same envelope the handlers use.
+pub(super) struct WebJson<T>(pub T);
+
+impl<S, T> axum::extract::FromRequest<S> for WebJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(
+        req: axum::extract::Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match axum::Json::<T>::from_request(req, state).await {
+            Ok(axum::Json(value)) => Ok(WebJson(value)),
+            Err(rejection) => {
+                let msg = rejection.body_text();
+                Err(json_error(StatusCode::BAD_REQUEST, &msg))
+            }
+        }
+    }
 }
 
 fn json_error(status: StatusCode, message: &str) -> Response {

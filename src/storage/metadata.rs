@@ -185,6 +185,46 @@ const OBJECT_SELECT: &str = "v.key, v.size, v.etag, v.last_modified, v.content_t
 const VERSION_SELECT: &str = "bucket_name, key, version, size, etag, last_modified, \
      content_type, account_email, remote_path, status, created_at, superseded_at";
 
+/// Counts of rows rewritten by [:rekey_prefix].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RekeyStats {
+    pub files: u64,
+    pub versions: u64,
+    pub symlinks: u64,
+    pub folder_meta: u64,
+}
+
+/// Signature for the key-rewrite SQL shared by every table that is keyed on
+/// (bucket_name, key): files, versions and symlinks all get the same treatment.
+fn rekey_sql(table: &str, has_symlink_target: bool) -> String {
+    if has_symlink_target {
+        format!(
+            "UPDATE {table} SET
+                 key = ?3 || substr(key, length(?2) + 1),
+                 target_key = CASE
+                     WHEN target_key LIKE ?2 || '%'
+                     THEN ?3 || substr(target_key, length(?2) + 1)
+                     ELSE target_key END
+             WHERE bucket_name = ?1 AND key LIKE ?2 || '%'"
+        )
+    } else {
+        format!(
+            "UPDATE {table} SET key = ?3 || substr(key, length(?2) + 1)
+             WHERE bucket_name = ?1 AND key LIKE ?2 || '%'"
+        )
+    }
+}
+
+    /// Rewrite every key under `src_prefix` to `dst_prefix` in one transaction.
+    ///
+    /// The blob location (`account_email` + `remote_path`) is untouched: only the
+    /// index keys change, so no backend traffic occurs. `files`, `versions`,
+    /// `symlinks` (including `target_key` for links inside the moved subtree)
+    /// and `folder_meta` prefixes are all rewritten together.
+    ///
+    /// Refuses (with an error) when the source prefix is empty, when the
+    /// destination is inside the source, or when the destination prefix already
+    /// holds objects — a rename must never silently merge two folders.
 impl MetadataDb {
     fn table_exists(conn: &Connection, name: &str) -> anyhow::Result<bool> {
         let n: i64 = conn.query_row(
@@ -1243,6 +1283,125 @@ impl MetadataDb {
                 out.push(r?);
             }
             Ok(out)
+        })
+    }
+
+
+    pub fn rekey_prefix(
+        &self,
+        bucket: &str,
+        src_prefix: &str,
+        dst_prefix: &str,
+    ) -> anyhow::Result<RekeyStats> {
+        if src_prefix.is_empty() || !src_prefix.ends_with('/') {
+            anyhow::bail!("source prefix must be a non-empty folder prefix ending in '/'");
+        }
+        if dst_prefix.is_empty() || !dst_prefix.ends_with('/') {
+            anyhow::bail!("destination prefix must be a non-empty folder prefix ending in '/'");
+        }
+        if dst_prefix.starts_with(src_prefix) {
+            anyhow::bail!("destination is inside the source prefix");
+        }
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let result = (|| -> anyhow::Result<RekeyStats> {
+                let src_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM files WHERE bucket_name = ?1 AND key LIKE ?2 || '%'",
+                    params![bucket, src_prefix],
+                    |r| r.get(0),
+                )?;
+                if src_count == 0 {
+                    anyhow::bail!("no objects under {}", src_prefix);
+                }
+                let dst_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM files WHERE bucket_name = ?1 AND key LIKE ?2 || '%'",
+                    params![bucket, dst_prefix],
+                    |r| r.get(0),
+                )?;
+                if dst_count > 0 {
+                    anyhow::bail!("destination already has {} object(s)", dst_count);
+                }
+
+                let mut stats = RekeyStats::default();
+                for (table, has_target) in
+                    [("files", false), ("versions", false), ("symlinks", true)]
+                {
+                    let n = conn.execute(
+                        &rekey_sql(table, has_target),
+                        params![bucket, src_prefix, dst_prefix],
+                    )? as u64;
+                    match table {
+                        "files" => stats.files = n,
+                        "versions" => stats.versions = n,
+                        _ => stats.symlinks = n,
+                    }
+                }
+
+                // Folder metadata rows: rewrite prefixes under the moved subtree.
+                let metas: Vec<(String, Option<String>, Option<String>, Option<String>)> = {
+                    let mut stmt = conn.prepare(
+                        "SELECT prefix, cover_key, summary_key, preview_gif_key
+                         FROM folder_meta WHERE bucket_name = ?1 AND prefix LIKE ?2 || '%'",
+                    )?;
+                    let rows = stmt.query_map(params![bucket, src_prefix], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+                for (prefix, cover, summary, gif) in metas {
+                    let new_prefix = format!(
+                        "{}{}",
+                        dst_prefix,
+                        prefix.strip_prefix(src_prefix).unwrap_or("")
+                    );
+                    let rekey_artifact = |k: Option<String>| -> Option<String> {
+                        k.map(|key| {
+                            if key.starts_with(src_prefix) {
+                                format!(
+                                    "{}{}",
+                                    dst_prefix,
+                                    key.strip_prefix(src_prefix).unwrap_or("")
+                                )
+                            } else {
+                                key
+                            }
+                        })
+                    };
+                    // A previous destination row may exist from an earlier move;
+                    // REPLACE keeps the operation idempotent.
+                    conn.execute(
+                        "INSERT OR REPLACE INTO folder_meta
+                            (bucket_name, prefix, cover_key, summary_key, preview_gif_key, updated_at)
+                         SELECT bucket_name, ?3, ?4, ?5, ?6, updated_at
+                         FROM folder_meta WHERE bucket_name = ?1 AND prefix = ?2",
+                        params![
+                            bucket,
+                            prefix,
+                            new_prefix,
+                            rekey_artifact(cover),
+                            rekey_artifact(summary),
+                            rekey_artifact(gif)
+                        ],
+                    )?;
+                    conn.execute(
+                        "DELETE FROM folder_meta WHERE bucket_name = ?1 AND prefix = ?2",
+                        params![bucket, prefix],
+                    )?;
+                    stats.folder_meta += 1;
+                }
+
+                Ok(stats)
+            })();
+            match result {
+                Ok(stats) => {
+                    conn.execute_batch("COMMIT;")?;
+                    Ok(stats)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(e)
+                }
+            }
         })
     }
 

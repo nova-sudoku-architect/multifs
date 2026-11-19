@@ -40,7 +40,7 @@ pub(super) struct DeleteObjectBody {
 /// the link row, never the target).
 pub(super) async fn delete_object_handler(
     State(state): State<WebState>,
-    axum::Json(body): axum::Json<DeleteObjectBody>,
+    super::WebJson(body): super::WebJson<DeleteObjectBody>,
 ) -> Response {
     if let Some(resp) = write_guard(&state) {
         return resp;
@@ -68,7 +68,7 @@ pub(super) struct DeletePrefixBody {
 /// `prefix` (i.e. delete a folder). An empty prefix is always rejected.
 pub(super) async fn delete_prefix_handler(
     State(state): State<WebState>,
-    axum::Json(body): axum::Json<DeletePrefixBody>,
+    super::WebJson(body): super::WebJson<DeletePrefixBody>,
 ) -> Response {
     if let Some(resp) = write_guard(&state) {
         return resp;
@@ -131,7 +131,7 @@ pub(super) struct DeleteBucketBody {
 /// POST /api/delete-bucket — drop a bucket and every object in it.
 pub(super) async fn delete_bucket_handler(
     State(state): State<WebState>,
-    axum::Json(body): axum::Json<DeleteBucketBody>,
+    super::WebJson(body): super::WebJson<DeleteBucketBody>,
 ) -> Response {
     if let Some(resp) = write_guard(&state) {
         return resp;
