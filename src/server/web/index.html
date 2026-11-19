@@ -67,6 +67,18 @@
     border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer; margin-left: 4px;
   }
   .table td.actions button:hover { color: var(--text); border-color: var(--accent2); }
+  .gal-item, .folder-card { position: relative; }
+  .tile-del, .tile-ren {
+    position: absolute; top: 6px; z-index: 2;
+    padding: 2px 8px; font-size: 11px; border-radius: 5px; cursor: pointer;
+    background: rgba(12,14,20,.78); border: 1px solid var(--border); color: var(--muted);
+  }
+  .tile-ren { right: 6px; }
+  .tile-del { right: 6px; }
+  .folder-card .tile-ren + .tile-del { right: 6px; top: 32px; }
+  .tile-ren:hover { color: var(--text); border-color: var(--accent2); }
+  .tile-del { color: #ff6b6b; border-color: #6d2a2a; }
+  .tile-del:hover { background: #3a1717; color: #fff; border-color: #ff6b6b; }
   button.danger {
     background: transparent; color: #ff6b6b; border: 1px solid #6d2a2a;
     border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer;
@@ -821,8 +833,12 @@ function renderPreviewMode(bucket, folders, files) {
     for (const f of images) {
       const name = f.key.split('/').pop();
       const durl = '/api/download?' + new URLSearchParams({ bucket, key: f.key });
+      const gdel = state.write
+        ? `<button class="danger tile-del" data-del-key="${esc(f.key)}" title="Delete this file">Delete</button>`
+        : '';
       html += `<div class="gal-item">
         <a href="${esc(durl)}" target="_blank"><img class="lazy" data-src="${esc(durl)}" alt="${esc(name)}"></a>
+        ${gdel}
         <div class="gal-label">${esc(friendlyLabel(name))}</div>
         <div class="gal-meta">${esc(fmtSize(f.size))}</div>
       </div>`;
@@ -836,8 +852,15 @@ function renderPreviewMode(bucket, folders, files) {
       const prefix = f.prefix;
       const name = prefix.replace(/\/$/, '').split('/').pop();
       const purl = '/api/thumb?' + new URLSearchParams({ bucket, key: f.cover_key, size: '320x200' });
+      const cdel = state.write
+        ? `<button class="danger tile-del" data-del-prefix="${esc(prefix)}" title="Delete this folder and everything in it">Delete</button>`
+        : '';
+      const cren = state.write
+        ? `<button class="tile-ren" data-ren-prefix="${esc(prefix)}" title="Rename this folder">Rename</button>`
+        : '';
       html += `<div class="folder-card" data-prefix="${esc(prefix)}">
         <div class="fthumb"><img class="lazy" data-src="${esc(purl)}" alt="${esc(name)}"></div>
+        ${cren}${cdel}
         <div class="fname">${esc(name)}${childBadge(f)}${symlinkBadge(f)}</div>
         <div class="fmeta">${esc(fmtMtime(f.last_modified))}</div>
       </div>`;
@@ -846,7 +869,7 @@ function renderPreviewMode(bucket, folders, files) {
   }
   // Folders without a preview image stay as rows with the folder icon.
   if (noPreview.length || others.length) {
-    html += '<table class="table"><thead><tr>' + sortTh('Name', 'name') + sortTh('Size', 'size') + sortTh('Modified', 'mtime') + sortTh('Type', 'type') + '</tr></thead><tbody>';
+    html += '<table class="table"><thead><tr>' + sortTh('Name', 'name') + sortTh('Size', 'size') + sortTh('Modified', 'mtime') + sortTh('Type', 'type') + (state.write ? '<th>Action</th>' : '') + '</tr></thead><tbody>';
     for (const f of noPreview) html += folderRowHtml(bucket, f, false);
     for (const f of others) html += fileRowHtml(bucket, f);
     html += '</tbody></table>';
@@ -1302,6 +1325,8 @@ async function loadList(bucket, prefix) {
     main.querySelectorAll('button[data-ren-prefix]').forEach(btn => {
       btn.onclick = (ev) => { ev.stopPropagation(); renamePrefix(bucket, btn.dataset.renPrefix); };
     });
+    // Gallery tiles sit inside the same container, so the handlers above already
+    // cover them; nothing extra is needed for preview-mode tile buttons.
     resolveSiblings();
   } catch (e) {
     main.innerHTML = `<div class="empty">Error: ${esc(e.message)}</div>`;
